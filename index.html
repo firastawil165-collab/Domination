@@ -44,6 +44,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // level-1 cap; each upgrade adds 10
 const MAX_LEVEL = 4;         // cap: level 4 → 40 troops
+const MAX_CASTLES = 12;      // hard cap on total towers (players + neutrals) per map
 const REGEN_RATE = 0.6;      // troops/sec at level 1 (grows with level)
 const UNIT_SPEED = 72;       // base px/sec per soldier
 const SPAWN_RATE = 9;        // soldiers marching out per second, per order
@@ -74,7 +75,7 @@ const towerFireCd = (t) => ARROW_FIRE_CD / levelMult(t);
 // Fireball special
 const FIRE_COOLDOWN = 60;    // seconds between uses
 const FIRE_RADIUS = 78;      // blast kill radius
-const FIRE_TOWER_DMG = 3;    // garrison scorched if a castle is caught in the blast
+const FIRE_TOWER_DMG = 3;    // unused now that fireball spares castle garrisons
 
 // Storm special
 const STORM_COOLDOWN = 45;   // seconds between uses
@@ -247,12 +248,22 @@ function generateMap(numPlayers, W, H, teamMode = false) {
   if (teamMode) {
     const raw = [];
     const homeF = 0.9, extraF = 0.62, spread = 0.42;
+    let pp = perPlayer;                  // player towers per owner, may shrink to fit the cap
+    let extraMid = Math.random() < 0.7;  // second symmetric neutral pair
+    let centerNeutral = Math.random() < 0.7;
+    const neutralCount = () => 2 + (extraMid ? 2 : 0) + (centerNeutral ? 1 : 0);
+    while (4 * pp + neutralCount() > MAX_CASTLES) {
+      if (centerNeutral) centerNeutral = false;
+      else if (pp > 1) pp--;
+      else if (extraMid) extraMid = false;
+      else break;
+    }
     // One side holds owners 0 and 1 (side rotated by π holds 2 and 3).
     const sideTemplate = [];
     const allyAngs = [a0 - spread, a0 + spread];
     for (let a = 0; a < 2; a++) {
       sideTemplate.push({ f: homeF, ang: allyAngs[a], owner: a });
-      for (let i = 0; i < perPlayer - 1; i++) {
+      for (let i = 0; i < pp - 1; i++) {
         sideTemplate.push({ f: extraF, ang: allyAngs[a] + (i ? -0.18 : 0.18), owner: a });
       }
     }
@@ -265,8 +276,8 @@ function generateMap(numPlayers, W, H, teamMode = false) {
     // Neutrals along the mid-axis between the two teams (>= 2, symmetric)
     const mid = [a0 + Math.PI / 2, a0 - Math.PI / 2];
     for (const ma of mid) { const p = ell(0.9, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL }); }
-    if (Math.random() < 0.7) for (const ma of mid) { const p = ell(0.44, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL }); }
-    if (Math.random() < 0.7) raw.push({ x: cx, y: cy, owner: NEUTRAL });
+    if (extraMid) for (const ma of mid) { const p = ell(0.44, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL }); }
+    if (centerNeutral) raw.push({ x: cx, y: cy, owner: NEUTRAL });
 
     const towers = raw.map((p, i) => ({ id: i, x: p.x, y: p.y, owner: p.owner, troops: START_TROOPS, level: 1, cell: [] }));
     computeCells(towers, W, H);
@@ -277,7 +288,7 @@ function generateMap(numPlayers, W, H, teamMode = false) {
 
   let buffered = Math.random() < 0.5;        // equal neutral buffers vs. touching
   let innerRing = Math.random() < 0.7;       // contested neutrals toward the middle
-  const centerNeutral = Math.random() < 0.7; // one shared middle tower
+  let centerNeutral = Math.random() < 0.7;   // one shared middle tower
   // Guarantee at least one symmetric ring → always >= numPlayers (>= 2) neutrals
   if (!buffered && !innerRing) {
     if (Math.random() < 0.5) buffered = true; else innerRing = true;
@@ -287,9 +298,18 @@ function generateMap(numPlayers, W, H, teamMode = false) {
   const homeF = 0.9;
   const da = step * 0.26;
   const extraF = 0.6 + Math.random() * 0.08;
+  let pp = perPlayer;                        // player towers per player, may shrink to fit the cap
+  const neutralCount = () => (buffered ? n : 0) + (innerRing ? n : 0) + (centerNeutral ? 1 : 0);
+  while (n * pp + neutralCount() > MAX_CASTLES) {
+    if (centerNeutral) centerNeutral = false;
+    else if (pp > 1) pp--;
+    else if (innerRing) innerRing = false;
+    else if (buffered) buffered = false;
+    else break;
+  }
   const template = [{ f: homeF, ang: 0 }];
   const extraAngs = [+da, -da, 0];
-  for (let i = 0; i < perPlayer - 1; i++) {
+  for (let i = 0; i < pp - 1; i++) {
     template.push({ f: extraF, ang: extraAngs[i % extraAngs.length] });
   }
 
@@ -381,10 +401,17 @@ function TowerConquest() {
     H: mapRef.current ? mapRef.current.clientHeight : window.innerHeight,
   });
 
-  const startGame = useCallback((players, gameMode = "ffa") => {
+  const startGame = useCallback((players, gameModeIn = "ffa") => {
+    // "random" isn't a real mode — resolve it to one of the concrete modes now.
+    let gameMode = gameModeIn;
+    let playersResolved = players;
+    if (gameModeIn === "random") {
+      gameMode = Math.random() < 0.5 ? "ffa" : "2v2";
+      playersResolved = gameMode === "ffa" ? [2, 3, 4][Math.floor(Math.random() * 3)] : players;
+    }
     const { W, H } = viewSize();
     const teamMode = gameMode === "2v2";
-    const nPlayers = teamMode ? 4 : players;
+    const nPlayers = teamMode ? 4 : playersResolved;
     // Team assignment: FFA → everyone their own team; 2v2 → {0,1} vs {2,3}
     const teams = teamMode ? [0, 0, 1, 1] : Array.from({ length: nPlayers }, (_, i) => i);
     const map = generateMap(nPlayers, W, H, teamMode);
@@ -552,11 +579,6 @@ function TowerConquest() {
     for (let i = 0; i < Math.min(killed, 14); i++) {
       const a = Math.random() * Math.PI * 2, r = Math.random() * FIRE_RADIUS;
       g.sparks.push({ x: x + Math.cos(a) * r, y: y + Math.sin(a) * r, life: 0.4, color: "#FFB43D" });
-    }
-    for (const t of g.towers) {
-      if (!sameTeam(g, t.owner, owner) && Math.hypot(t.x - x, t.y - y) <= FIRE_RADIUS) {
-        t.troops = Math.max(0, t.troops - FIRE_TOWER_DMG);
-      }
     }
     setCd(g, "fire", owner);
   }
@@ -1259,6 +1281,18 @@ function TowerConquest() {
     ctx.ellipse(x, groundY + 3, baseW * 0.72, 7, 0, 0, Math.PI * 2);
     ctx.fill();
 
+    // Team ring (2v2 only) — independent of per-player faction color, so an
+    // ally never reads as a foe just because their faction hue looks hostile.
+    if (owned && g.mode === "2v2") {
+      const myTeam = g.teams[0];
+      const ringCol = g.teams[t.owner] === myTeam ? "#FFD23F" : "#E4534A";
+      ctx.strokeStyle = ringCol;
+      ctx.lineWidth = 2.4;
+      ctx.beginPath();
+      ctx.ellipse(x, groundY + 3, baseW * 0.72 + 5, 9.5, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
     const lx = x - baseW / 2, rx = x + baseW / 2;
     const off = keepW * 0.28, blockW = keepW * 0.62;
 
@@ -1842,41 +1876,54 @@ function TowerConquest() {
               {" "}burst that hastens your own troops. Players start evenly placed; take every rival's last castle to win.
             </p>
             )}
-            <div style={{ margin: "26px 0 14px", fontSize: 13, letterSpacing: 3, color: "#8a93ab" }}>MODE</div>
-            <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
-              {[["ffa", "Free-for-all"], ["2v2", "Teams · 2v2"]].map(([m, label]) => (
-                <button key={m} onClick={() => setMode(m)}
-                  style={chip({
-                    borderColor: mode === m ? "#FFD23F" : "#46577d",
-                    color: mode === m ? "#FFD23F" : "#E8EBF2",
-                    minWidth: 140,
-                  })}>
-                  {label}
-                </button>
-              ))}
-            </div>
-
-            {mode === "ffa" ? (
-              <>
-                <div style={{ margin: "22px 0 14px", fontSize: 13, letterSpacing: 3, color: "#8a93ab" }}>COMBATANTS</div>
-                <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
-                  {[2, 3, 4].map((n) => (
-                    <button key={n} onClick={() => setNumPlayers(n)}
+            <div style={{ display: "flex", gap: 32, justifyContent: "center", marginTop: 26, flexWrap: "wrap" }}>
+              <div>
+                <div style={{ fontSize: 13, letterSpacing: 3, color: "#8a93ab", marginBottom: 14 }}>MODE</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "stretch" }}>
+                  {[["ffa", "Free-for-all"], ["2v2", "Teams · 2v2"], ["random", "Random"]].map(([m, label]) => (
+                    <button key={m} onClick={() => setMode(m)}
                       style={chip({
-                        borderColor: numPlayers === n ? "#FFD23F" : "#46577d",
-                        color: numPlayers === n ? "#FFD23F" : "#E8EBF2",
-                        minWidth: 96,
+                        borderColor: mode === m ? "#FFD23F" : "#46577d",
+                        color: mode === m ? "#FFD23F" : "#E8EBF2",
+                        minWidth: 140,
                       })}>
-                      {n} players
+                      {label}
                     </button>
                   ))}
                 </div>
-                <div style={{ fontSize: 12, color: "#5c6580", marginTop: 8 }}>you + {numPlayers - 1} AI</div>
-              </>
-            ) : (
-              <div style={{ fontSize: 12, color: "#5c6580", marginTop: 14 }}>
-                you + 1 AI ally vs 2 AI enemies
               </div>
+
+              <div>
+                <div style={{ fontSize: 13, letterSpacing: 3, color: "#8a93ab", marginBottom: 14 }}>
+                  {mode === "ffa" ? "COMBATANTS" : ""}
+                </div>
+                {mode === "ffa" ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "stretch" }}>
+                    {[2, 3, 4].map((n) => (
+                      <button key={n} onClick={() => setNumPlayers(n)}
+                        style={chip({
+                          borderColor: numPlayers === n ? "#FFD23F" : "#46577d",
+                          color: numPlayers === n ? "#FFD23F" : "#E8EBF2",
+                          minWidth: 96,
+                        })}>
+                        {n} players
+                      </button>
+                    ))}
+                  </div>
+                ) : mode === "2v2" ? (
+                  <div style={{ fontSize: 12, color: "#5c6580", maxWidth: 140 }}>
+                    you + 1 AI ally vs 2 AI enemies
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 12, color: "#5c6580", maxWidth: 140 }}>
+                    a mode is rolled for you — free-for-all or 2v2 teams
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {mode === "ffa" && (
+              <div style={{ fontSize: 12, color: "#5c6580", marginTop: 14 }}>you + {numPlayers - 1} AI</div>
             )}
 
             <button onClick={() => startGame(numPlayers, mode)}
@@ -1921,7 +1968,7 @@ function TowerConquest() {
                   </div>
                 );
 
-                if (mode !== "2v2") return hud.map(renderChip);
+                if (gameRef.current?.mode !== "2v2") return hud.map(renderChip);
 
                 const myTeam = hud.find((s) => s.pid === 0)?.team ?? 0;
                 return [myTeam, myTeam === 0 ? 1 : 0].map((teamId, idx) => (
@@ -1970,8 +2017,8 @@ function TowerConquest() {
                 </div>
                 <div style={{ color: "#8a93ab", fontSize: 12 }}>
                   {outcome === "win"
-                    ? (mode === "2v2" ? "Enemy team wiped out." : "Every rival eliminated.")
-                    : (mode === "2v2" ? "Your team has fallen." : "Your last forces have fallen.")}
+                    ? (gameRef.current?.mode === "2v2" ? "Enemy team wiped out." : "Every rival eliminated.")
+                    : (gameRef.current?.mode === "2v2" ? "Your team has fallen." : "Your last forces have fallen.")}
                 </div>
               </div>
               <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
