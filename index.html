@@ -1018,7 +1018,7 @@ function TowerConquest() {
           let nearest = null, nd = ARROW_RANGE;
           for (const u of g.units) {
             if (sameTeam(g, u.owner, t.owner)) continue;
-            const d = Math.hypot(u.x - t.def.x, u.y - t.def.y);
+            const d = Math.hypot(u.x - t.x, u.y - t.y);
             if (d < nd) { nd = d; nearest = u; }
           }
           if (nearest) {
@@ -1480,17 +1480,17 @@ function TowerConquest() {
       ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x + H, H); ctx.stroke();
     }
 
-    // Arrow-tower coverage rings, lying flat on the ground plane
+    // Arrow-tower coverage rings — a true circle centered on the castle itself
     for (const t of g.towers) {
       if (!t.def) continue;
-      const D = P(t.def.x, t.def.y);
+      const C = P(t.x, t.y);
       const lvl = t.level || 1;
       const ringA = Math.min(0x66, 0x22 + (lvl - 1) * 0x10);
       const col = t.owner === NEUTRAL ? NEUTRAL_COLOR : FACTIONS[t.owner].color;
       ctx.strokeStyle = col + ringA.toString(16).padStart(2, "0");
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.ellipse(D.x, D.y, ARROW_RANGE * D.s, ARROW_RANGE * D.s * TILT, 0, 0, Math.PI * 2);
+      ctx.arc(C.x, C.y, ARROW_RANGE * C.s, 0, Math.PI * 2);
       ctx.stroke();
     }
 
