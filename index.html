@@ -1,0 +1,2081 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#1c2942" />
+<title>Domination</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Oxanium:wght@400;600;700;800&family=IBM+Plex+Mono:wght@600;700&display=swap" rel="stylesheet" />
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #1c2942; overscroll-behavior: none; }
+  #root { height: 100%; }
+  /* Simple loading text shown until React mounts */
+  #boot { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+          color: #8a93ab; font-family: 'Oxanium', sans-serif; letter-spacing: 3px; }
+</style>
+<!-- React + Babel from CDN so this single file runs by just opening it -->
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<script>
+  // Silence Babel's "in-browser transformer" console notice; restored once our script runs.
+  window.__origConsoleWarn = console.warn;
+  window.__origConsoleError = console.error;
+  console.warn = function () {};
+  console.error = function () {};
+</script>
+</head>
+<body>
+<div id="root"><div id="boot">LOADING DOMINATION…</div></div>
+
+<script type="text/babel" data-presets="react">
+console.warn = window.__origConsoleWarn;
+console.error = window.__origConsoleError;
+const { useRef, useState, useEffect, useCallback } = React;
+
+
+
+// ================= Constants =================
+const START_TROOPS = 3;      // every castle begins with 3 troops
+const BASE_MAX = 10;         // level-1 cap; each upgrade adds 10
+const MAX_LEVEL = 4;         // cap: level 4 → 40 troops
+const REGEN_RATE = 0.6;      // troops/sec at level 1 (grows with level)
+const UNIT_SPEED = 72;       // base px/sec per soldier
+const SPAWN_RATE = 9;        // soldiers marching out per second, per order
+const UNIT_R = 3;            // legacy dot radius (soldiers now render as sprites; kept for reference)
+const COLLIDE_R = 6.5;       // kill distance between opposing soldiers
+const TOWER_HIT_R = 20;      // arrival radius
+
+// Camera — tilted pseudo-3D board + zoom. The world stays flat 2D; rendering
+// squashes Y (TILT) and widens nearer rows (PERSP); input inverts the mapping.
+const TILT = 0.74;           // ground-plane Y squash (1 = flat top-down)
+const PERSP = 0.3;           // nearer rows render slightly wider/larger
+// Fixed camera: 1/TILT is the zoom where the tilted board exactly fills the
+// viewport vertically — the "maximum zoom out" framing, locked in.
+const CAM_ZOOM = 1 / TILT;
+
+// Defensive arrow towers
+const ARROW_RANGE = 92;      // px, how far a defense tower can shoot
+const ARROW_FIRE_CD = 1.3;   // seconds between shots at level 1 (faster when upgraded)
+const ARROW_SPEED = 320;     // px/sec, arrow flight
+
+// Per-castle scaling by upgrade level (level 1→4 multipliers: 1, 1.3, 1.6, 2)
+const LEVEL_MULT = [1, 1.3, 1.6, 2];
+const levelMult = (t) => LEVEL_MULT[Math.min(t.level, MAX_LEVEL) - 1];
+const towerMax = (t) => t.level * BASE_MAX;
+const towerRegen = (t) => REGEN_RATE * levelMult(t);
+const towerFireCd = (t) => ARROW_FIRE_CD / levelMult(t);
+
+// Fireball special
+const FIRE_COOLDOWN = 60;    // seconds between uses
+const FIRE_RADIUS = 78;      // blast kill radius
+const FIRE_TOWER_DMG = 3;    // garrison scorched if a castle is caught in the blast
+
+// Storm special
+const STORM_COOLDOWN = 45;   // seconds between uses
+const STORM_RADIUS = 96;     // area of effect
+const STORM_DURATION = 6;    // seconds the storm lingers
+const STORM_SLOW = 0.4;      // enemy speed multiplier inside the storm
+
+// Speed special — buffs your team's troops caught in the radius for the rest of their trip
+const SPEED_COOLDOWN = 45;
+const SPEED_RADIUS = 112;
+const SPEED_BOOST = 1.5;     // +50% movement speed
+
+const FACTIONS = [
+  { id: 0, name: "You",        color: "#4ADE5A", dim: "#2FA83C", fill: "rgba(74,222,90,0.46)", human: true },
+  { id: 1, name: "Crimson AI", color: "#FF6B6B", dim: "#D14D4D", fill: "rgba(255,107,107,0.48)" },
+  { id: 2, name: "Teal AI",    color: "#2BD9C4", dim: "#1FA898", fill: "rgba(43,217,196,0.46)" },
+  { id: 3, name: "Violet AI",  color: "#C48BFF", dim: "#9560D6", fill: "rgba(196,139,255,0.48)" },
+];
+const NEUTRAL = -1;
+const NEUTRAL_COLOR = "#FFFFFF";
+const NEUTRAL_FILL = "rgba(255,255,255,0.34)";
+
+// ----- Soldier sprites -----
+// Units render as tiny marching soldiers instead of dots. Sprites are
+// pre-rendered once to offscreen canvases (faction × 2 walk frames × 2
+// facings = 16 tiny canvases), so each unit costs a single drawImage —
+// cheap even with hundreds on the field. Anchor: feet at bottom-center.
+const SOLDIER_W = 9;   // world px
+const SOLDIER_H = 13;  // world px
+const soldierCache = new Map();
+function soldierSprite(owner, frame, flip) {
+  const key = owner * 4 + frame * 2 + (flip ? 1 : 0);
+  let cv = soldierCache.get(key);
+  if (cv) return cv;
+  const PIX = 4; // supersample for crispness after downscale
+  cv = document.createElement("canvas");
+  cv.width = SOLDIER_W * PIX;
+  cv.height = SOLDIER_H * PIX;
+  const x = cv.getContext("2d");
+  x.scale(PIX, PIX);
+  if (flip) { x.translate(SOLDIER_W, 0); x.scale(-1, 1); }
+  const f = FACTIONS[owner];
+  const cx = SOLDIER_W / 2;
+  const footY = SOLDIER_H - 0.5;
+
+  // Ground shadow (baked into the sprite)
+  x.fillStyle = "rgba(0,0,0,0.28)";
+  x.beginPath(); x.ellipse(cx, footY, 3.3, 1.1, 0, 0, Math.PI * 2); x.fill();
+
+  // Legs — two frames of a marching step
+  x.strokeStyle = "#2b3350";
+  x.lineWidth = 1.4;
+  x.lineCap = "round";
+  x.beginPath();
+  if (frame === 0) { // stride
+    x.moveTo(cx - 0.5, footY - 4.4); x.lineTo(cx - 2.2, footY - 0.6);
+    x.moveTo(cx + 0.5, footY - 4.4); x.lineTo(cx + 2.2, footY - 0.6);
+  } else {           // legs passing
+    x.moveTo(cx - 0.8, footY - 4.4); x.lineTo(cx - 0.8, footY - 0.6);
+    x.moveTo(cx + 0.8, footY - 4.4); x.lineTo(cx + 0.8, footY - 0.6);
+  }
+  x.stroke();
+
+  // Tunic in faction color, dim border
+  x.fillStyle = f.color;
+  x.strokeStyle = f.dim;
+  x.lineWidth = 0.8;
+  x.beginPath(); x.roundRect(cx - 2.4, footY - 8.6, 4.8, 4.8, 1.2); x.fill(); x.stroke();
+  // Belt
+  x.fillStyle = "rgba(0,0,0,0.25)";
+  x.fillRect(cx - 2.4, footY - 5.2, 4.8, 0.9);
+
+  // Spear held forward (toward the direction of travel)
+  x.strokeStyle = "#C9D2E8";
+  x.lineWidth = 0.7;
+  x.beginPath(); x.moveTo(cx + 1.6, footY - 3.4); x.lineTo(cx + 3.4, footY - 11.4); x.stroke();
+  x.fillStyle = "#E8EEF9";
+  x.beginPath();
+  x.moveTo(cx + 3.5, footY - 12.3);
+  x.lineTo(cx + 4.1, footY - 10.9);
+  x.lineTo(cx + 2.8, footY - 11.1);
+  x.closePath(); x.fill();
+
+  // Head + faction helmet
+  x.fillStyle = "#F0C49C";
+  x.beginPath(); x.arc(cx, footY - 9.9, 1.7, 0, Math.PI * 2); x.fill();
+  x.fillStyle = f.dim;
+  x.beginPath(); x.arc(cx, footY - 10.6, 1.8, Math.PI, 0); x.fill();
+  x.fillRect(cx - 1.8, footY - 10.8, 3.6, 0.7);
+
+  soldierCache.set(key, cv);
+  return cv;
+}
+
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+// ================= Voronoi (half-plane clipping) =================
+function clipHalfPlane(poly, a, b) {
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  const nx = b.x - a.x, ny = b.y - a.y;
+  const side = (p) => (p.x - mx) * nx + (p.y - my) * ny;
+  const out = [];
+  for (let i = 0; i < poly.length; i++) {
+    const p = poly[i], q = poly[(i + 1) % poly.length];
+    const dp = side(p), dq = side(q);
+    if (dp <= 0) out.push(p);
+    if ((dp <= 0) !== (dq <= 0)) {
+      const t = dp / (dp - dq);
+      out.push({ x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t });
+    }
+  }
+  return out;
+}
+
+function computeCells(towers, W, H) {
+  for (const t of towers) {
+    let poly = [{ x: 0, y: 0 }, { x: W, y: 0 }, { x: W, y: H }, { x: 0, y: H }];
+    for (const o of towers) {
+      if (o.id === t.id || poly.length === 0) continue;
+      poly = clipHalfPlane(poly, t, o);
+    }
+    t.cell = poly;
+  }
+  placeDefenders(towers);
+}
+
+function polyCentroid(poly) {
+  let a = 0, cx = 0, cy = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const p = poly[i], q = poly[(i + 1) % poly.length];
+    const cross = p.x * q.y - q.x * p.y;
+    a += cross; cx += (p.x + q.x) * cross; cy += (p.y + q.y) * cross;
+  }
+  if (Math.abs(a) < 1e-6) return { x: poly[0].x, y: poly[0].y };
+  a *= 0.5;
+  return { x: cx / (6 * a), y: cy / (6 * a) };
+}
+
+// Place each region's defensive tower off to the side of its castle, inside the cell.
+function placeDefenders(towers) {
+  for (const t of towers) {
+    const c = t.cell.length >= 3 ? polyCentroid(t.cell) : { x: t.x, y: t.y };
+    let dx = c.x - t.x, dy = c.y - t.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 12) { dx = 40; dy = -18; } // degenerate/tiny cell: nudge up-right
+    else { const off = Math.min(58, Math.max(38, len * 0.85)); dx = (dx / len) * off; dy = (dy / len) * off; }
+    t.def = { x: t.x + dx, y: t.y + dy, cd: Math.random() * ARROW_FIRE_CD };
+  }
+}
+
+// ================= Map generation =================
+// Rotationally symmetric layout mapped onto an ellipse that fits the screen, so
+// the board fills the whole view instead of clumping in the middle. Home bases sit
+// out near the edges; neutrals spread across inner and outer rings. Every player is
+// the same template rotated by 360/n, so starts are even. Neutral buffers between
+// neighbors are identical for every pair.
+function generateMap(numPlayers, W, H, teamMode = false) {
+  const n = numPlayers;
+  const perPlayer = 2 + Math.floor(Math.random() * 2); // 2–3, equal for all
+  const cx = W / 2, cy = H / 2;
+  const margin = 80;
+  const rx = W / 2 - margin, ry = H / 2 - margin;
+  const step = (Math.PI * 2) / n;
+  const a0 = Math.random() * Math.PI * 2 + (n === 4 && !teamMode ? Math.PI / 4 : 0);
+
+  // Elliptical placement: fraction f of the way to the edge, at angle ang.
+  const ell = (f, ang) => ({ x: cx + Math.cos(ang) * f * rx, y: cy + Math.sin(ang) * f * ry });
+
+  // ---- 2v2: two allied pairs on opposite sides, 180°-symmetric ----
+  if (teamMode) {
+    const raw = [];
+    const homeF = 0.9, extraF = 0.62, spread = 0.42;
+    // One side holds owners 0 and 1 (side rotated by π holds 2 and 3).
+    const sideTemplate = [];
+    const allyAngs = [a0 - spread, a0 + spread];
+    for (let a = 0; a < 2; a++) {
+      sideTemplate.push({ f: homeF, ang: allyAngs[a], owner: a });
+      for (let i = 0; i < perPlayer - 1; i++) {
+        sideTemplate.push({ f: extraF, ang: allyAngs[a] + (i ? -0.18 : 0.18), owner: a });
+      }
+    }
+    for (let k = 0; k < 2; k++) {
+      for (const s of sideTemplate) {
+        const p = ell(s.f, s.ang + k * Math.PI);
+        raw.push({ x: p.x, y: p.y, owner: s.owner + k * 2 });
+      }
+    }
+    // Neutrals along the mid-axis between the two teams (>= 2, symmetric)
+    const mid = [a0 + Math.PI / 2, a0 - Math.PI / 2];
+    for (const ma of mid) { const p = ell(0.9, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL }); }
+    if (Math.random() < 0.7) for (const ma of mid) { const p = ell(0.44, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL }); }
+    if (Math.random() < 0.7) raw.push({ x: cx, y: cy, owner: NEUTRAL });
+
+    const towers = raw.map((p, i) => ({ id: i, x: p.x, y: p.y, owner: p.owner, troops: START_TROOPS, level: 1, cell: [] }));
+    computeCells(towers, W, H);
+    placeDefenders(towers);
+    const neutrals = towers.filter((t) => t.owner === NEUTRAL).length;
+    return { towers, perPlayer, neutrals };
+  }
+
+  let buffered = Math.random() < 0.5;        // equal neutral buffers vs. touching
+  let innerRing = Math.random() < 0.7;       // contested neutrals toward the middle
+  const centerNeutral = Math.random() < 0.7; // one shared middle tower
+  // Guarantee at least one symmetric ring → always >= numPlayers (>= 2) neutrals
+  if (!buffered && !innerRing) {
+    if (Math.random() < 0.5) buffered = true; else innerRing = true;
+  }
+
+  // Template for player 0 as {f, ang} offsets; rotate into every wedge.
+  const homeF = 0.9;
+  const da = step * 0.26;
+  const extraF = 0.6 + Math.random() * 0.08;
+  const template = [{ f: homeF, ang: 0 }];
+  const extraAngs = [+da, -da, 0];
+  for (let i = 0; i < perPlayer - 1; i++) {
+    template.push({ f: extraF, ang: extraAngs[i % extraAngs.length] });
+  }
+
+  const raw = [];
+  for (let k = 0; k < n; k++) {
+    for (const s of template) {
+      const p = ell(s.f, a0 + k * step + s.ang);
+      raw.push({ x: p.x, y: p.y, owner: k });
+    }
+  }
+
+  // Equal neutral buffers between adjacent players, out near the rim
+  if (buffered) {
+    for (let k = 0; k < n; k++) {
+      const p = ell(0.92, a0 + (k + 0.5) * step);
+      raw.push({ x: p.x, y: p.y, owner: NEUTRAL });
+    }
+  }
+  // Inner contested ring (one per wedge → symmetric)
+  if (innerRing) {
+    const inF = 0.4 + Math.random() * 0.1;
+    const off = buffered ? 0.5 : 0.0;
+    for (let k = 0; k < n; k++) {
+      const p = ell(inF, a0 + (k + off) * step);
+      raw.push({ x: p.x, y: p.y, owner: NEUTRAL });
+    }
+  }
+  // Shared center
+  if (centerNeutral || (!buffered && !innerRing)) {
+    raw.push({ x: cx, y: cy, owner: NEUTRAL });
+  }
+
+  const towers = raw.map((p, i) => ({
+    id: i, x: p.x, y: p.y,
+    owner: p.owner, troops: START_TROOPS, level: 1,
+    cell: [],
+  }));
+
+  computeCells(towers, W, H);
+  placeDefenders(towers);
+
+  const neutrals = towers.filter((t) => t.owner === NEUTRAL).length;
+  return { towers, perPlayer, neutrals };
+}
+
+// ================= Component =================
+function TowerConquest() {
+  const canvasRef = useRef(null);
+  const wrapRef = useRef(null);
+  const mapRef = useRef(null);
+  const gameRef = useRef(null);
+  const [screen, setScreen] = useState("menu");
+  const [numPlayers, setNumPlayers] = useState(2);
+  const [mode, setMode] = useState("ffa"); // "ffa" | "2v2"
+  const [showHelp, setShowHelp] = useState(false); // instructions collapsed by default
+  const [pct, setPct] = useState(100);
+  const pctRef = useRef(100);
+  const [hud, setHud] = useState([]);
+  const [outcome, setOutcome] = useState(null);
+  const [fireInfo, setFireInfo] = useState({
+    fireSecs: FIRE_COOLDOWN, stormSecs: STORM_COOLDOWN, speedSecs: SPEED_COOLDOWN, aiming: null,
+  });
+
+  useEffect(() => { pctRef.current = pct; }, [pct]);
+
+  // Block browser/app gestures (pull-to-refresh, swipe-to-minimize) while dragging.
+  // React's synthetic events are passive, so native non-passive listeners are required.
+  useEffect(() => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const block = (e) => { e.preventDefault(); };
+    c.addEventListener("touchstart", block, { passive: false });
+    c.addEventListener("touchmove", block, { passive: false });
+    c.addEventListener("touchend", block, { passive: false });
+    const prevOverscroll = document.documentElement.style.overscrollBehavior;
+    document.documentElement.style.overscrollBehavior = "none";
+    document.body.style.overscrollBehavior = "none";
+    return () => {
+      c.removeEventListener("touchstart", block);
+      c.removeEventListener("touchmove", block);
+      c.removeEventListener("touchend", block);
+      document.documentElement.style.overscrollBehavior = prevOverscroll;
+      document.body.style.overscrollBehavior = prevOverscroll;
+    };
+  }, [screen]);
+
+  const viewSize = () => ({
+    W: mapRef.current ? mapRef.current.clientWidth : window.innerWidth,
+    H: mapRef.current ? mapRef.current.clientHeight : window.innerHeight,
+  });
+
+  const startGame = useCallback((players, gameMode = "ffa") => {
+    const { W, H } = viewSize();
+    const teamMode = gameMode === "2v2";
+    const nPlayers = teamMode ? 4 : players;
+    // Team assignment: FFA → everyone their own team; 2v2 → {0,1} vs {2,3}
+    const teams = teamMode ? [0, 0, 1, 1] : Array.from({ length: nPlayers }, (_, i) => i);
+    const map = generateMap(nPlayers, W, H, teamMode);
+    gameRef.current = {
+      W, H,
+      towers: map.towers,
+      teams,
+      mode: gameMode,
+      orders: [],       // gradual deployments: {owner, src, dst, remaining, accum}
+      units: [],        // individual soldiers: {owner, x, y, dst, off, speed, phase}
+      arrows: [],       // defensive-tower shots: {x, y, targetUid, owner, life}
+      sparks: [],       // clash effects: {x, y, life, color}
+      blasts: [],       // fireball explosions: {x, y, life, dur}
+      storms: [],       // storm zones: {x, y, radius, life, dur}
+      rings: [],        // one-shot cast rings (speed): {x, y, life, dur, color}
+      fireCd: FIRE_COOLDOWN,       // all specials start inactive and must charge up
+      stormCd: STORM_COOLDOWN,
+      speedCd: SPEED_COOLDOWN,
+      aiming: null,     // null | "fire" | "storm" — which special is being aimed
+      pointer: { x: W / 2, y: H / 2 },
+      uidSeq: 1,
+      numPlayers: nPlayers,
+      drag: null,       // {src, x, y, sx, sy} while pointer is held down
+      lastTap: null,    // {id, time} for double-tap upgrade detection
+      hover: null,
+      eliminated: new Set(),
+      aiTimers: Array.from({ length: nPlayers }, () => 1 + Math.random() * 1.5),
+      // Specials start fully on cooldown for the AI too (a little jitter so the
+      // AIs don't all fire on the same frame), never before the timer allows.
+      aiFireCd: Array.from({ length: nPlayers }, () => FIRE_COOLDOWN * (1 + Math.random() * 0.3)),
+      aiStormCd: Array.from({ length: nPlayers }, () => STORM_COOLDOWN * (1 + Math.random() * 0.3)),
+      aiSpeedCd: Array.from({ length: nPlayers }, () => SPEED_COOLDOWN * (1 + Math.random() * 0.3)),
+      aiFxTimer: 0.6,
+      over: false,
+      pulse: 0,
+    };
+    setOutcome(null);
+    setScreen("play");
+  }, []);
+
+  // Two owners are allied if they share a team. Neutral (-1) is nobody's ally.
+  const sameTeam = (g, a, b) =>
+    a !== NEUTRAL && b !== NEUTRAL && g.teams[a] === g.teams[b];
+
+  // ----- Camera: world <-> screen (fixed) -----
+  // All game logic runs in flat world coordinates. proj() tilts the board
+  // (Y squash + mild perspective) at a fixed zoom that exactly fills the
+  // viewport; unproj() is the exact inverse used for pointer input. `s` is
+  // the local sprite scale — nearer rows draw a touch larger.
+  const proj = (g, wx, wy) => {
+    const dy = wy - g.H / 2;
+    const p = 1 + (dy / g.H) * PERSP;
+    return {
+      x: g.W / 2 + (wx - g.W / 2) * CAM_ZOOM * p,
+      y: g.H / 2 + dy * CAM_ZOOM * TILT,
+      s: CAM_ZOOM * p,
+    };
+  };
+  const unproj = (g, sx, sy) => {
+    const dy = (sy - g.H / 2) / (CAM_ZOOM * TILT);
+    const p = 1 + (dy / g.H) * PERSP;
+    return { x: g.W / 2 + (sx - g.W / 2) / (CAM_ZOOM * p), y: g.H / 2 + dy };
+  };
+
+  // ----- Resize: rescale positions, keep the battle going -----
+  useEffect(() => {
+    const onResize = () => {
+      const g = gameRef.current;
+      const c = canvasRef.current;
+      if (!c) return;
+      const { W, H } = viewSize();
+      const dpr = window.devicePixelRatio || 1;
+      c.width = W * dpr; c.height = H * dpr;
+      c.style.width = W + "px"; c.style.height = H + "px";
+      c.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+      if (g) {
+        const sx = W / g.W, sy = H / g.H;
+        if (sx !== 1 || sy !== 1) {
+          for (const t of g.towers) { t.x *= sx; t.y *= sy; if (t.def) { t.def.x *= sx; t.def.y *= sy; } }
+          for (const u of g.units) { u.x *= sx; u.y *= sy; }
+          for (const a of g.arrows) { a.x *= sx; a.y *= sy; }
+          for (const b of g.blasts) { b.x *= sx; b.y *= sy; }
+          for (const st of g.storms) { st.x *= sx; st.y *= sy; }
+          for (const rg of g.rings) { rg.x *= sx; rg.y *= sy; }
+          if (g.pointer) { g.pointer.x *= sx; g.pointer.y *= sy; }
+          for (const s of g.sparks) { s.x *= sx; s.y *= sy; }
+          g.W = W; g.H = H;
+          computeCells(g.towers, W, H);
+        }
+      }
+    };
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [screen]);
+
+  // ----- Orders -----
+  function issueOrder(g, src, dst, percent) {
+    const n = Math.floor(src.troops * (percent / 100));
+    if (n < 1) return;
+    g.orders.push({ owner: src.owner, src: src.id, dst: dst.id, remaining: n, accum: 0 });
+  }
+
+  // ----- Input: press a tower, drag to the target, release to march -----
+  const canvasPos = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  };
+
+  // Which region (Voronoi cell) contains a point — the whole region is the
+  // hit area, so you can grab/target anywhere in a territory, not just the castle.
+  const pointInPoly = (p, poly) => {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const a = poly[i], b = poly[j];
+      if ((a.y > p.y) !== (b.y > p.y) &&
+          p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+    }
+    return inside;
+  };
+  const nearestTower = (g, p, radius, mineOnly) => {
+    let best = null, bd = radius;
+    for (const t of g.towers) {
+      if (mineOnly && t.owner !== 0) continue;
+      const d = dist(p, t);
+      if (d < bd) { bd = d; best = t; }
+    }
+    return best;
+  };
+  // Region first (covers the whole map), nearest-castle as a soft fallback.
+  const regionAt = (g, p) => {
+    for (const t of g.towers) if (t.cell.length >= 3 && pointInPoly(p, t.cell)) return t;
+    return nearestTower(g, p, 60, false);
+  };
+
+  // ----- Specials -----
+  const syncSpecials = (g) =>
+    setFireInfo({
+      fireSecs: Math.ceil(g.fireCd), stormSecs: Math.ceil(g.stormCd),
+      speedSecs: Math.ceil(g.speedCd),
+      aiming: g.aiming,
+    });
+
+  // Where the cooldown for a given caster + kind lives.
+  const setCd = (g, kind, owner) => {
+    const dur = { fire: FIRE_COOLDOWN, storm: STORM_COOLDOWN, speed: SPEED_COOLDOWN }[kind];
+    if (owner === 0) {
+      if (kind === "fire") g.fireCd = dur;
+      else if (kind === "storm") g.stormCd = dur;
+      else g.speedCd = dur;
+      g.aiming = null; syncSpecials(g);
+    } else {
+      const arr = { fire: g.aiFireCd, storm: g.aiStormCd, speed: g.aiSpeedCd }[kind];
+      arr[owner] = dur;
+    }
+  };
+
+  function detonateFireball(g, x, y, owner) {
+    g.blasts.push({ x, y, life: 0, dur: 0.6, seed: Math.random() * 6.283 });
+    const before = g.units.length;
+    g.units = g.units.filter(
+      (u) => sameTeam(g, u.owner, owner) || Math.hypot(u.x - x, u.y - y) > FIRE_RADIUS
+    );
+    const killed = before - g.units.length;
+    for (let i = 0; i < Math.min(killed, 14); i++) {
+      const a = Math.random() * Math.PI * 2, r = Math.random() * FIRE_RADIUS;
+      g.sparks.push({ x: x + Math.cos(a) * r, y: y + Math.sin(a) * r, life: 0.4, color: "#FFB43D" });
+    }
+    for (const t of g.towers) {
+      if (!sameTeam(g, t.owner, owner) && Math.hypot(t.x - x, t.y - y) <= FIRE_RADIUS) {
+        t.troops = Math.max(0, t.troops - FIRE_TOWER_DMG);
+      }
+    }
+    setCd(g, "fire", owner);
+  }
+
+  function castStorm(g, x, y, owner) {
+    g.storms.push({ x, y, radius: STORM_RADIUS, life: 0, dur: STORM_DURATION, owner, seed: Math.random() * 6.283 });
+    setCd(g, "storm", owner);
+  }
+
+  function castSpeed(g, x, y, owner) {
+    // One-shot: team troops in the radius get +50% for the rest of their journey
+    for (const u of g.units) {
+      if ((sameTeam(g, u.owner, owner) || u.owner === owner) && Math.hypot(u.x - x, u.y - y) <= SPEED_RADIUS) {
+        u.speedMul = SPEED_BOOST;
+      }
+    }
+    g.rings.push({ x, y, life: 0, dur: 0.5, color: "#57E0C6" });
+    setCd(g, "speed", owner);
+  }
+
+  const cdFor = (g, kind) =>
+    kind === "fire" ? g.fireCd : kind === "storm" ? g.stormCd : g.speedCd;
+  const readyFor = (g, kind) => cdFor(g, kind) <= 0;
+
+  const toggleAim = (kind) => {
+    const g = gameRef.current;
+    if (!g || g.over) return;
+    if (g.aiming === kind) { g.aiming = null; syncSpecials(g); return; }
+    if (!readyFor(g, kind)) return;
+    g.aiming = kind;
+    g.drag = null;
+    syncSpecials(g);
+  };
+
+  const handleDown = (e) => {
+    const g = gameRef.current;
+    if (!g || g.over) return;
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    const sp = canvasPos(e);
+    const p = unproj(g, sp.x, sp.y);
+    g.pointer = p;
+    if (g.aiming === "fire") { detonateFireball(g, p.x, p.y, 0); return; }
+    if (g.aiming === "storm") { castStorm(g, p.x, p.y, 0); return; }
+    if (g.aiming === "speed") { castSpeed(g, p.x, p.y, 0); return; }
+    const region = regionAt(g, p);
+    // Drag endpoint (x, y) lives in world coords; (ssx, ssy) keeps the screen
+    // start so the tap-vs-drag threshold is measured in screen pixels.
+    if (region && region.owner === 0) g.drag = { src: region.id, x: p.x, y: p.y, ssx: sp.x, ssy: sp.y };
+  };
+
+  const handleMove = (e) => {
+    const g = gameRef.current;
+    if (!g) return;
+    const sp = canvasPos(e);
+    const p = unproj(g, sp.x, sp.y);
+    g.pointer = p;
+    const hit = regionAt(g, p);
+    g.hover = hit ? hit.id : null;
+    if (g.drag) { g.drag.x = p.x; g.drag.y = p.y; }
+  };
+
+  const handleUp = (e) => {
+    const g = gameRef.current;
+    if (!g) return;
+    const drag = g.drag;
+    g.drag = null;
+    if (!drag || g.over) return;
+    const sp = canvasPos(e);
+    const p = unproj(g, sp.x, sp.y);
+    const target = regionAt(g, p); // any region: enemy, neutral, or your own
+    const src = g.towers[drag.src];
+    const moved = Math.hypot(sp.x - drag.ssx, sp.y - drag.ssy); // screen px
+
+    // A tap (little movement) that lands back on your own castle → double-tap upgrades it
+    if (moved < 14 && target && target.id === src.id && src.owner === 0) {
+      const now = performance.now();
+      if (g.lastTap && g.lastTap.id === src.id && now - g.lastTap.time < 350) {
+        g.lastTap = null;
+        if (canStartUpgrade(src)) startUpgrade(g, src);
+      } else {
+        g.lastTap = { id: src.id, time: now };
+      }
+      return;
+    }
+
+    if (target && target.id !== src.id && src.owner === 0) {
+      issueOrder(g, src, target, pctRef.current);
+    }
+  };
+
+  const handleCancel = () => {
+    const g = gameRef.current;
+    if (g) g.drag = null;
+  };
+
+  // ----- AI -----
+  // Densest knot of troops hostile to `pid` — where an area special pays off most.
+  function bestCluster(g, pid, radius) {
+    const hostiles = g.units.filter((u) => !sameTeam(g, u.owner, pid) && u.owner !== pid);
+    if (hostiles.length === 0) return null;
+    let best = null, bestC = 0;
+    for (const c of hostiles) {
+      let count = 0, sx = 0, sy = 0;
+      for (const u of hostiles) {
+        if (Math.hypot(u.x - c.x, u.y - c.y) <= radius) { count++; sx += u.x; sy += u.y; }
+      }
+      if (count > bestC) { bestC = count; best = { x: sx / count, y: sy / count, count }; }
+    }
+    return best;
+  }
+
+  // Densest knot of the AI's OWN team troops — where a friendly buff pays off.
+  function bestFriendlyCluster(g, pid, radius) {
+    const friends = g.units.filter((u) => sameTeam(g, u.owner, pid) || u.owner === pid);
+    if (friends.length === 0) return null;
+    let best = null, bestC = 0;
+    for (const c of friends) {
+      let count = 0, sx = 0, sy = 0;
+      for (const u of friends) {
+        if (Math.hypot(u.x - c.x, u.y - c.y) <= radius) { count++; sx += u.x; sy += u.y; }
+      }
+      if (count > bestC) { bestC = count; best = { x: sx / count, y: sy / count, count }; }
+    }
+    return best;
+  }
+
+  // Each AI decides whether to spend its specials this tick.
+  function aiSpecials(g) {
+    for (let pid = 1; pid < g.numPlayers; pid++) {
+      if (g.eliminated.has(pid)) continue;
+      if (g.aiFireCd[pid] <= 0) {
+        const spot = bestCluster(g, pid, FIRE_RADIUS);
+        if (spot && spot.count >= 6) detonateFireball(g, spot.x, spot.y, pid);
+      }
+      if (g.aiStormCd[pid] <= 0) {
+        const spot = bestCluster(g, pid, STORM_RADIUS);
+        if (spot && spot.count >= 5) {
+          const nearHome = g.towers.some(
+            (t) => t.owner === pid && Math.hypot(t.x - spot.x, t.y - spot.y) < STORM_RADIUS * 1.6
+          );
+          if (spot.count >= 8 || nearHome) castStorm(g, spot.x, spot.y, pid);
+        }
+      }
+      if (g.aiSpeedCd[pid] <= 0) {
+        const spot = bestFriendlyCluster(g, pid, SPEED_RADIUS);
+        if (spot && spot.count >= 6) castSpeed(g, spot.x, spot.y, pid);
+      }
+    }
+  }
+
+  function aiAct(g, pid) {
+    const own = g.towers.filter((t) => t.owner === pid);
+    if (own.length === 0) return;
+
+    // Tally troops in flight toward every tower, split into "my team" vs "enemy".
+    const isTeam = (owner) => owner === pid || sameTeam(g, owner, pid);
+    const inc = {};
+    for (const t of g.towers) inc[t.id] = { team: 0, enemy: 0 };
+    for (const u of g.units) {
+      const rec = inc[u.dst]; if (!rec) continue;
+      if (isTeam(u.owner)) rec.team++; else rec.enemy++;
+    }
+    for (const o of g.orders) {
+      if (o.remaining <= 0) continue;
+      const rec = inc[o.dst]; if (!rec) continue;
+      if (isTeam(o.owner)) rec.team += o.remaining; else rec.enemy += o.remaining;
+    }
+
+    const diag = Math.hypot(g.W, g.H);
+    const spareFrom = (t) => Math.max(0, Math.floor(t.troops) - 2); // always keep a small garrison
+
+    // Upgrade a maxed castle when it's safe to spend half the garrison
+    const upgradable = own.filter((t) => canStartUpgrade(t) && inc[t.id].enemy < 2);
+    if (upgradable.length && Math.random() < 0.6) {
+      startUpgrade(g, upgradable.reduce((a, b) => (a.troops > b.troops ? a : b)));
+      return;
+    }
+
+    const bracket = (srcTroops, need) =>
+      [25, 50, 75, 100].find((o) => Math.floor((srcTroops * o) / 100) >= need);
+
+    // Nearest of my own towers that can spare troops, isn't itself under threat,
+    // and is close enough that help would actually arrive in time.
+    const helperFor = (target, exclude) => {
+      let best = null, bd = Infinity;
+      for (const s of own) {
+        if (s.id === target.id || (exclude && s.id === exclude.id)) continue;
+        if (spareFrom(s) < 1) continue;
+        if (inc[s.id].enemy > s.troops * 0.6) continue; // don't strip a threatened tower
+        const d = dist(s, target);
+        if (d > diag * 0.62) continue;                  // too far to matter
+        if (d < bd) { bd = d; best = s; }
+      }
+      return best;
+    };
+
+    // ---- 1) Defend a teammate (mine or an ally's, including the human) ----
+    // Consider all towers on my team; find the one most likely to fall.
+    let defend = null, worst = 0;
+    for (const t of g.towers) {
+      if (!isTeam(t.owner)) continue;
+      const defense = t.troops + inc[t.id].team;
+      const shortfall = inc[t.id].enemy - defense;   // >0 → projected to fall
+      if (shortfall > 1 && shortfall > worst) { worst = shortfall; defend = t; }
+    }
+    if (defend) {
+      const helper = helperFor(defend, defend.owner === pid ? defend : null);
+      if (helper) {
+        const canSend = spareFrom(helper);
+        const need = worst + 1;
+        // Only commit if it's not a waste: we can cover most of the shortfall.
+        if (canSend >= need * 0.6) {
+          const pct = bracket(helper.troops, Math.min(need, canSend)) || 100;
+          issueOrder(g, helper, defend, pct);
+          return;
+        }
+      }
+    }
+
+    // ---- 2) Reinforce a teammate's attack that's coming up short ----
+    let push = null, bestDeficit = 0;
+    for (const t of g.towers) {
+      if (isTeam(t.owner)) continue;                 // enemy or neutral
+      const assault = inc[t.id].team;
+      if (assault <= 0) continue;                     // nobody on my team is attacking it
+      const garrison = Math.min(towerMax(t), t.troops + towerRegen(t) * 0.5);
+      const deficit = garrison - assault;             // >0 → the assault falls short
+      if (deficit > 0.5 && deficit > bestDeficit) { bestDeficit = deficit; push = t; }
+    }
+    if (push) {
+      const helper = helperFor(push, null);
+      if (helper) {
+        const canSend = spareFrom(helper);
+        const need = bestDeficit + 1;
+        if (canSend >= Math.min(need, 2)) {
+          const pct = bracket(helper.troops, Math.min(need, canSend)) || 100;
+          issueOrder(g, helper, push, pct);
+          return;
+        }
+      }
+    }
+
+    // ---- 3) Otherwise, expand on its own ----
+    const src = own.reduce((a, b) => (a.troops > b.troops ? a : b));
+    if (src.troops < 3) return;
+    const targets = g.towers.filter((t) => !isTeam(t.owner));
+    if (targets.length === 0) return;
+
+    const evalTarget = (t) => {
+      const travel = dist(src, t) / UNIT_SPEED;
+      const garrison = Math.min(towerMax(t), t.troops + towerRegen(t) * travel);
+      return garrison - inc[t.id].team;             // don't pile onto what the team already has covered
+    };
+
+    let best = null, bestScore = Infinity;
+    for (const t of targets) {
+      const score = evalTarget(t) + dist(src, t) * 0.02;
+      if (score < bestScore) { bestScore = score; best = t; }
+    }
+    if (!best) return;
+
+    const need = evalTarget(best);
+    const choice = [25, 50, 75, 100].find(
+      (o) => Math.floor((src.troops * o) / 100) > need + 1
+    );
+
+    if (choice) issueOrder(g, src, best, choice);
+    else if (src.troops >= towerMax(src) * 0.95) issueOrder(g, src, best, 100);
+    else if (Math.random() < 0.25 && own.length > 1) {
+      const weak = own.reduce((a, b) => (a.troops < b.troops ? a : b));
+      if (weak.id !== src.id) issueOrder(g, src, weak, 25);
+    }
+  }
+
+  // ----- Castle upgrade -----
+  // Kick off a 5-second upgrade. Cost (half the max) is paid up front; the level
+  // (and its bigger cap, faster regen & arrow fire) lands when the build finishes.
+  function startUpgrade(g, t) {
+    t.troops = Math.max(0, t.troops - towerMax(t) / 2);
+    t.upgrading = { time: 0, dur: 5 };
+  }
+  const canStartUpgrade = (t) =>
+    t.level < MAX_LEVEL && !t.upgrading && t.troops >= towerMax(t);
+
+  // ----- Arrival / capture -----
+  function unitArrives(g, u, t) {
+    if (sameTeam(g, t.owner, u.owner) || t.owner === u.owner) {
+      t.troops += 1; // reinforce own or allied garrison (may exceed 100)
+    } else if (t.troops >= 1) {
+      t.troops -= 1;
+    } else {
+      t.owner = u.owner;
+      t.level = Math.max(1, t.level - 1); // a defeated castle is knocked down a level
+      t.upgrading = null;                 // cancel any build in progress
+      t.troops = 1;
+      // Any half-finished orders leaving this tower are cancelled by the capture
+      for (const o of g.orders) if (o.src === t.id && o.owner !== u.owner) o.remaining = 0;
+    }
+  }
+
+  // ================= Game loop =================
+  useEffect(() => {
+    if (screen !== "play") return;
+    let raf, last = performance.now(), hudTimer = 0;
+
+    const step = (now) => {
+      const g = gameRef.current;
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      if (!g) return;
+      g.pulse += dt;
+
+      if (!g.over) {
+        // Regeneration — every tower, neutral included, climbs back toward 100
+        for (const t of g.towers) {
+          if (t.troops < towerMax(t)) {
+            t.troops = Math.min(towerMax(t), t.troops + towerRegen(t) * dt);
+          }
+        }
+
+        // Upgrade builds finishing
+        for (const t of g.towers) {
+          if (!t.upgrading) continue;
+          t.upgrading.time += dt;
+          if (t.upgrading.time >= t.upgrading.dur) {
+            t.level += 1;
+            t.upgrading = null;
+            for (let i = 0; i < 14; i++) {
+              const a = (i / 14) * Math.PI * 2;
+              g.sparks.push({ x: t.x + Math.cos(a) * 22, y: t.y + Math.sin(a) * 22, life: 0.55, color: "#FFD86A" });
+            }
+          }
+        }
+
+        // Orders trickle soldiers out of the gate
+        for (let i = g.orders.length - 1; i >= 0; i--) {
+          const o = g.orders[i];
+          const src = g.towers[o.src];
+          if (o.remaining <= 0 || src.owner !== o.owner) { g.orders.splice(i, 1); continue; }
+          o.accum += SPAWN_RATE * dt;
+          while (o.accum >= 1 && o.remaining > 0 && src.troops >= 1) {
+            o.accum -= 1;
+            o.remaining -= 1;
+            src.troops -= 1;
+            const dstT = g.towers[o.dst];
+            const ang = Math.atan2(dstT.y - src.y, dstT.x - src.x);
+            g.units.push({
+              uid: g.uidSeq++,
+              owner: o.owner,
+              x: src.x + Math.cos(ang) * 18 + (Math.random() - 0.5) * 8,
+              y: src.y + Math.sin(ang) * 18 + (Math.random() - 0.5) * 8,
+              dst: o.dst,
+              off: (Math.random() - 0.5) * 26,   // marching-lane offset
+              speed: UNIT_SPEED * (0.85 + Math.random() * 0.3),
+              phase: Math.random() * Math.PI * 2,
+            });
+          }
+          if (o.remaining <= 0) g.orders.splice(i, 1);
+        }
+
+        // March
+        for (const u of g.units) {
+          const t = g.towers[u.dst];
+          const d = dist(u, t);
+          let tx = t.x, ty = t.y;
+          if (d > 60) { // hold formation lanes until close, then converge
+            const px = -(t.y - u.y) / d, py = (t.x - u.x) / d;
+            tx += px * u.off; ty += py * u.off;
+          }
+          // Storms slow troops that don't belong to the caster
+          let slow = 1;
+          for (const st of g.storms) {
+            if (!sameTeam(g, st.owner, u.owner) && Math.hypot(u.x - st.x, u.y - st.y) <= st.radius) {
+              slow = STORM_SLOW; break;
+            }
+          }
+          const spd = u.speed * slow * (u.speedMul || 1);
+          const dd = Math.hypot(tx - u.x, ty - u.y) || 1;
+          const wob = Math.sin(g.pulse * 9 + u.phase) * 6 * dt * slow;
+          u.x += ((tx - u.x) / dd) * spd * dt + (-(ty - u.y) / dd) * wob;
+          u.y += ((ty - u.y) / dd) * spd * dt + ((tx - u.x) / dd) * wob;
+        }
+
+        // Field clashes: opposing soldiers kill each other where they meet
+        const cell = 14, grid = new Map();
+        const key = (x, y) => ((x / cell) | 0) + "," + ((y / cell) | 0);
+        g.units.forEach((u, i) => {
+          const k = key(u.x, u.y);
+          if (!grid.has(k)) grid.set(k, []);
+          grid.get(k).push(i);
+        });
+        const dead = new Set();
+        for (let i = 0; i < g.units.length; i++) {
+          if (dead.has(i)) continue;
+          const u = g.units[i];
+          const cx = (u.x / cell) | 0, cy = (u.y / cell) | 0;
+          outer:
+          for (let gx = cx - 1; gx <= cx + 1; gx++) {
+            for (let gy = cy - 1; gy <= cy + 1; gy++) {
+              const bucket = grid.get(gx + "," + gy);
+              if (!bucket) continue;
+              for (const j of bucket) {
+                if (j <= i || dead.has(j)) continue;
+                const v = g.units[j];
+                if (sameTeam(g, v.owner, u.owner)) continue;
+                if (dist(u, v) < COLLIDE_R) {
+                  dead.add(i); dead.add(j);
+                  g.sparks.push({
+                    x: (u.x + v.x) / 2, y: (u.y + v.y) / 2,
+                    life: 0.45, color: "#FFE9C2",
+                  });
+                  break outer;
+                }
+              }
+            }
+          }
+        }
+
+        // Arrivals
+        for (let i = g.units.length - 1; i >= 0; i--) {
+          if (dead.has(i)) { g.units.splice(i, 1); continue; }
+          const u = g.units[i];
+          const t = g.towers[u.dst];
+          if (dist(u, t) <= TOWER_HIT_R) {
+            unitArrives(g, u, t);
+            g.units.splice(i, 1);
+          }
+        }
+
+        // Defensive towers: every region (including neutrals) shoots hostile troops passing through it
+        const byUid = new Map();
+        for (const u of g.units) byUid.set(u.uid, u);
+        for (const t of g.towers) {
+          if (!t.def) continue;
+          t.def.cd -= dt;
+          if (t.def.cd > 0) continue;
+          let nearest = null, nd = ARROW_RANGE;
+          for (const u of g.units) {
+            if (sameTeam(g, u.owner, t.owner)) continue;
+            const d = Math.hypot(u.x - t.def.x, u.y - t.def.y);
+            if (d < nd) { nd = d; nearest = u; }
+          }
+          if (nearest) {
+            g.arrows.push({
+              x: t.def.x, y: t.def.y,
+              targetUid: nearest.uid, owner: t.owner,
+              lx: nearest.x, ly: nearest.y, life: 1.2,
+            });
+            t.def.cd = towerFireCd(t);
+          }
+        }
+
+        // Arrow flight — homes on its target, kills on contact
+        const arrowKilled = new Set();
+        for (let i = g.arrows.length - 1; i >= 0; i--) {
+          const a = g.arrows[i];
+          a.life -= dt;
+          const tgt = byUid.get(a.targetUid);
+          if (tgt && !arrowKilled.has(tgt.uid)) { a.lx = tgt.x; a.ly = tgt.y; }
+          const d = Math.hypot(a.lx - a.x, a.ly - a.y) || 1;
+          const v = ARROW_SPEED * dt;
+          a.x += ((a.lx - a.x) / d) * v;
+          a.y += ((a.ly - a.y) / d) * v;
+          if (d <= v + 4) {
+            if (tgt && !arrowKilled.has(tgt.uid)) {
+              arrowKilled.add(tgt.uid);
+              g.sparks.push({ x: tgt.x, y: tgt.y, life: 0.35, color: "#FFD27A" });
+            }
+            g.arrows.splice(i, 1);
+          } else if (a.life <= 0) {
+            g.arrows.splice(i, 1);
+          }
+        }
+        if (arrowKilled.size) {
+          g.units = g.units.filter((u) => !arrowKilled.has(u.uid));
+        }
+
+        // Sparks fade
+        for (let i = g.sparks.length - 1; i >= 0; i--) {
+          g.sparks[i].life -= dt;
+          if (g.sparks[i].life <= 0) g.sparks.splice(i, 1);
+        }
+
+        // AI turns
+        for (let pid = 1; pid < g.numPlayers; pid++) {
+          if (g.eliminated.has(pid)) continue;
+          g.aiTimers[pid] -= dt;
+          if (g.aiTimers[pid] <= 0) {
+            aiAct(g, pid);
+            g.aiTimers[pid] = 1.1 + Math.random() * 1.6;
+          }
+          if (g.aiFireCd[pid] > 0) g.aiFireCd[pid] = Math.max(0, g.aiFireCd[pid] - dt);
+          if (g.aiStormCd[pid] > 0) g.aiStormCd[pid] = Math.max(0, g.aiStormCd[pid] - dt);
+          if (g.aiSpeedCd[pid] > 0) g.aiSpeedCd[pid] = Math.max(0, g.aiSpeedCd[pid] - dt);
+        }
+        // Evaluate AI specials a few times a second (keeps the cluster search cheap)
+        g.aiFxTimer -= dt;
+        if (g.aiFxTimer <= 0) {
+          g.aiFxTimer = 0.5;
+          aiSpecials(g);
+        }
+
+        // Eliminations & outcome (team-aware)
+        for (let pid = 0; pid < g.numPlayers; pid++) {
+          if (g.eliminated.has(pid)) continue;
+          const alive =
+            g.towers.some((t) => t.owner === pid) ||
+            g.units.some((u) => u.owner === pid) ||
+            g.orders.some((o) => o.owner === pid && o.remaining > 0);
+          if (!alive) g.eliminated.add(pid);
+        }
+        const aliveTeams = new Set();
+        for (let pid = 0; pid < g.numPlayers; pid++)
+          if (!g.eliminated.has(pid)) aliveTeams.add(g.teams[pid]);
+        const myTeam = g.teams[0];
+        if (!aliveTeams.has(myTeam)) { g.over = true; setOutcome("lose"); }
+        else if (aliveTeams.size === 1) { g.over = true; setOutcome("win"); }
+
+        // Special cooldowns + effect animations
+        if (g.fireCd > 0) g.fireCd = Math.max(0, g.fireCd - dt);
+        if (g.stormCd > 0) g.stormCd = Math.max(0, g.stormCd - dt);
+        if (g.speedCd > 0) g.speedCd = Math.max(0, g.speedCd - dt);
+        for (let i = g.blasts.length - 1; i >= 0; i--) {
+          g.blasts[i].life += dt;
+          if (g.blasts[i].life >= g.blasts[i].dur) g.blasts.splice(i, 1);
+        }
+        for (let i = g.storms.length - 1; i >= 0; i--) {
+          g.storms[i].life += dt;
+          if (g.storms[i].life >= g.storms[i].dur) g.storms.splice(i, 1);
+        }
+        for (let i = g.rings.length - 1; i >= 0; i--) {
+          g.rings[i].life += dt;
+          if (g.rings[i].life >= g.rings[i].dur) g.rings.splice(i, 1);
+        }
+      }
+
+      draw(g);
+
+      hudTimer += dt;
+      if (hudTimer > 0.35) {
+        hudTimer = 0;
+        const stats = [];
+        for (let pid = 0; pid < g.numPlayers; pid++) {
+          const mine = g.towers.filter((t) => t.owner === pid);
+          const marching =
+            g.units.filter((u) => u.owner === pid).length +
+            g.orders.filter((o) => o.owner === pid).reduce((s, o) => s + o.remaining, 0);
+          stats.push({
+            pid,
+            team: g.teams[pid],
+            towers: mine.length,
+            troops: Math.floor(mine.reduce((s, t) => s + t.troops, 0) + marching),
+            dead: g.eliminated.has(pid),
+          });
+        }
+        setHud(stats);
+        setFireInfo({
+          fireSecs: Math.ceil(g.fireCd), stormSecs: Math.ceil(g.stormCd),
+          speedSecs: Math.ceil(g.speedCd),
+          aiming: g.aiming,
+        });
+      }
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [screen]);
+
+  // ================= Rendering =================
+  // A slim arrow tower that guards each region, neutrals included.
+  // Drawn upright at the projected base — the translate/scale wrapper keeps
+  // the sprite vertical while it scales with zoom and depth.
+  function drawDefenseTower(ctx, t, g) {
+    if (!t.def) return;
+    const col = t.owner === NEUTRAL ? NEUTRAL_COLOR : FACTIONS[t.owner].color;
+    const B = proj(g, t.def.x, t.def.y);
+    ctx.save();
+    ctx.translate(B.x, B.y);
+    ctx.scale(B.s, B.s);
+    ctx.translate(-t.def.x, -t.def.y);
+    const x = t.def.x, y = t.def.y;
+    const lvl = t.level || 1;
+    const s = 1 + Math.min(lvl - 1, 6) * 0.09;
+    const w = 11 * s, h = 22 * s;
+
+    // Shadow
+    ctx.fillStyle = "rgba(0,0,0,0.3)";
+    ctx.beginPath();
+    ctx.ellipse(x, y + h / 2 + 2, w * 0.7, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Shaft
+    const grad = ctx.createLinearGradient(x - w / 2, 0, x + w / 2, 0);
+    grad.addColorStop(0, "#6E7AA0");
+    grad.addColorStop(1, "#3b4463");
+    ctx.fillStyle = grad;
+    ctx.fillRect(x - w / 2, y - h / 2, w, h);
+
+    // Crenellated top
+    ctx.fillStyle = "#6E7AA0";
+    ctx.fillRect(x - w / 2, y - h / 2 - 3, 3, 4);
+    ctx.fillRect(x - 1.5, y - h / 2 - 3, 3, 4);
+    ctx.fillRect(x + w / 2 - 3, y - h / 2 - 3, 3, 4);
+
+    // Arrow slit glows in faction color
+    ctx.fillStyle = col;
+    ctx.fillRect(x - 1.5, y - h / 2 + 4, 3, 8);
+    ctx.restore();
+  }
+
+  // The troop counter for a castle. Drawn in its own pass AFTER every building,
+  // so a tall castle in front can never paint over a counter behind it. The plate
+  // sits just below the castle base; projected and scaled like the sprite.
+  function drawGarrisonPlate(ctx, t, g) {
+    const owned = t.owner !== NEUTRAL;
+    const col = owned ? FACTIONS[t.owner].color : NEUTRAL_COLOR;
+    const groundY = t.y + 14;                 // matches the sprite's base
+    const B = proj(g, t.x, groundY + 17);     // project the plate's anchor point
+    const s = B.s;
+    ctx.save();
+    ctx.translate(B.x, B.y);
+    ctx.scale(s, s);
+    const n = Math.floor(t.troops);
+    ctx.font = "700 13px 'IBM Plex Mono', monospace";
+    const plateW = ctx.measureText(n).width + 12;
+    ctx.fillStyle = "rgba(10,14,24,0.9)";
+    ctx.beginPath();
+    ctx.roundRect(-plateW / 2, -9, plateW, 18, 5);
+    ctx.fill();
+    ctx.strokeStyle = t.troops > towerMax(t) ? col : "rgba(138,147,171,0.5)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = "#E8EBF2";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(n, 0, 0);
+    ctx.restore();
+  }
+
+  function drawTowerSprite(ctx, t, g) {
+    const owned = t.owner !== NEUTRAL;
+    const col = owned ? FACTIONS[t.owner].color : NEUTRAL_COLOR;
+    // Upright sprite at the projected base, scaled with zoom + depth
+    const B = proj(g, t.x, t.y);
+    ctx.save();
+    ctx.translate(B.x, B.y);
+    ctx.scale(B.s, B.s);
+    ctx.translate(-t.x, -t.y);
+    const x = t.x, y = t.y;
+    const lvl = t.level || 1;
+
+    // ---- Per-level castle geometry (grows more in width than height so tall
+    // castles don't hide neighbours' troops). Each level has a distinct
+    // silhouette: L1 plain · L2 roofed · L3 wide roofed gatehouse · L4 grand. ----
+    const cfg = {
+      1: { w: 34, keepH: 20, turretH: 24, roof: false, wide: false },
+      2: { w: 35, keepH: 21, turretH: 30, roof: true,  wide: false },
+      3: { w: 52, keepH: 30, turretH: 38, roof: false, wide: true },
+      4: { w: 58, keepH: 38, turretH: 46, roof: true,  wide: true, grand: true },
+    }[Math.min(lvl, 4)];
+    const baseW = cfg.w;
+    const turretW = 9;
+    const keepW = baseW - turretW * 2 + 4;
+    const groundY = y + 14;                 // fixed base; castle grows upward
+    const turretTop = groundY - cfg.turretH;
+    const keepTop = groundY - cfg.keepH;
+    const totalH = Math.max(cfg.keepH, cfg.turretH) + (cfg.grand ? 12 : 0);
+    const topY = groundY - totalH;
+    const midY = groundY - totalH / 2;
+
+    const stone = (cxx, cw, top, ht) => {
+      const grad = ctx.createLinearGradient(cxx - cw / 2, 0, cxx + cw / 2, 0);
+      grad.addColorStop(0, "#6E7AA0"); grad.addColorStop(0.55, "#525d80"); grad.addColorStop(1, "#3b4463");
+      ctx.fillStyle = grad; ctx.fillRect(cxx - cw / 2, top, cw, ht);
+    };
+    const crenellate = (cxx, cw, top) => {
+      ctx.fillStyle = "#6E7AA0"; const m = cw / 5;
+      for (let i = 0; i < 3; i++) ctx.fillRect(cxx - cw / 2 + i * 2 * m, top - 4, m, 4);
+    };
+    const roofTop = (cxx, cw, top, hh) => {
+      ctx.fillStyle = "#7d4a4a";
+      ctx.beginPath();
+      ctx.moveTo(cxx - cw / 2 - 1, top); ctx.lineTo(cxx, top - hh); ctx.lineTo(cxx + cw / 2 + 1, top);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 1; ctx.stroke();
+    };
+    const win = (wx, wy, ww, wh) => {
+      ctx.fillStyle = "#20263c"; ctx.fillRect(wx - ww / 2, wy, ww, wh);
+      ctx.fillStyle = col; ctx.globalAlpha = 0.9; ctx.fillRect(wx - ww / 2 + 0.8, wy + 0.8, ww - 1.6, wh - 1.6); ctx.globalAlpha = 1;
+    };
+    const flag = (fx, fy, dir) => {
+      ctx.strokeStyle = "#8a93ab"; ctx.lineWidth = 1.3;
+      ctx.beginPath(); ctx.moveTo(fx, fy); ctx.lineTo(fx, fy - 12); ctx.stroke();
+      ctx.fillStyle = col; ctx.beginPath();
+      ctx.moveTo(fx, fy - 12); ctx.lineTo(fx + 9 * dir, fy - 9.5); ctx.lineTo(fx, fy - 7); ctx.closePath(); ctx.fill();
+    };
+
+    // Ground shadow
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.beginPath();
+    ctx.ellipse(x, groundY + 3, baseW * 0.72, 7, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    const lx = x - baseW / 2, rx = x + baseW / 2;
+    const off = keepW * 0.28, blockW = keepW * 0.62;
+
+    // Body / keep
+    if (cfg.wide) {
+      if (cfg.grand) {
+        // L4: one solid wide body + a raised central keep with roof
+        stone(x, keepW + off * 2, keepTop, cfg.keepH);
+        crenellate(x - off, blockW, keepTop);
+        crenellate(x + off, blockW, keepTop);
+        const centTop = keepTop - 12, centW = blockW * 1.15;
+        stone(x, centW, centTop, cfg.keepH + 12);
+        roofTop(x, centW, centTop, 15);
+      } else {
+        // L3: twin-block gatehouse with a roofed raised center block
+        stone(x - off, blockW, keepTop, cfg.keepH);
+        stone(x + off, blockW, keepTop, cfg.keepH);
+        crenellate(x - off, blockW, keepTop);
+        crenellate(x + off, blockW, keepTop);
+        const centTop = keepTop - 6, centW = off * 1.7;
+        stone(x, centW, centTop, groundY - centTop);
+        roofTop(x, centW, centTop, 12);
+      }
+    } else {
+      stone(x, keepW, keepTop, cfg.keepH);
+      if (cfg.roof) roofTop(x, keepW, keepTop, 12);
+      else crenellate(x, keepW, keepTop);
+    }
+
+    // Flanking turrets
+    stone(lx, turretW, turretTop, cfg.turretH);
+    stone(rx, turretW, turretTop, cfg.turretH);
+    crenellate(lx, turretW, turretTop); crenellate(rx, turretW, turretTop);
+
+    // Windows per level
+    if (lvl === 2) win(x, keepTop + cfg.keepH * 0.34, 4, cfg.keepH * 0.32);
+    if (lvl === 3) { win(x - keepW * 0.2, keepTop + cfg.keepH * 0.34, 4, cfg.keepH * 0.3); win(x + keepW * 0.2, keepTop + cfg.keepH * 0.34, 4, cfg.keepH * 0.3); }
+    if (lvl >= 4) win(x, keepTop - 12 + cfg.keepH * 0.34, 9, cfg.keepH * 0.4);
+
+    // Arched gate in faction color
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.moveTo(x - 5, groundY); ctx.lineTo(x - 5, groundY - 11);
+    ctx.arc(x, groundY - 11, 5, Math.PI, 0);
+    ctx.lineTo(x + 5, groundY); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, groundY - 11); ctx.lineTo(x, groundY); ctx.stroke();
+
+    // Flags: one per level, planted on flat stone or a roof apex (never a slope).
+    const nFlags = Math.min(lvl, 4);
+    const flagBaseAt = (fx) => {
+      const d = Math.abs(fx - x);
+      if (cfg.grand) return d > baseW * 0.4 ? turretTop : keepTop;
+      if (cfg.wide) return d < 2 ? keepTop - 6 - 12 : keepTop;
+      if (d > baseW * 0.32) return turretTop;
+      if (cfg.roof) return keepTop - 12;
+      return keepTop;
+    };
+    let flagOffs;
+    if (cfg.grand) { const tX = baseW * 0.42, bX = baseW * 0.35; flagOffs = [-tX, -bX, bX, tX]; }
+    else if (cfg.wide) { const sX = baseW * 0.28; flagOffs = [-sX, 0, sX]; }
+    else if (nFlags === 1) flagOffs = [0];
+    else { const s = baseW * 0.4; flagOffs = Array.from({ length: nFlags }, (_, i) => -s + (i / (nFlags - 1)) * s * 2); }
+    flagOffs.forEach((ox, i) => flag(x + ox, flagBaseAt(x + ox), i % 2 === 0 ? 1 : -1));
+
+    // Build animation: while upgrading, a thick cloud of dust/smoke billows up
+    // from the base and a warm "under construction" glow sweeps up the keep
+    // (replaces the old loading ring).
+    if (t.upgrading) {
+      const bp = t.upgrading.time / t.upgrading.dur;
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x - baseW / 2 - 2, topY - 4, baseW + 4, totalH + 18); ctx.clip();
+      ctx.fillStyle = "rgba(255,214,120,0.12)";
+      ctx.fillRect(x - keepW / 2, groundY - cfg.keepH * bp, keepW, cfg.keepH * bp);
+      ctx.restore();
+      // Dust/smoke plume: a dense cloud of overlapping puffs rising high and
+      // spreading, each on its own looping life so it churns like real smoke.
+      const N = 42;
+      for (let k = 0; k < N; k++) {
+        const seed = k * 12.9898;
+        const rnd = (o) => { const s = Math.sin(seed + o) * 43758.5453; return s - Math.floor(s); };
+        const ph = (g.pulse * (0.45 + rnd(1) * 0.5) + rnd(2)) % 1;         // 0..1 life
+        const sway = Math.sin(g.pulse * 2 + k) * (5 + ph * 14);            // drift as it rises
+        const px = x + (rnd(3) - 0.5) * baseW * 1.05 + sway * (rnd(4) - 0.5) * 2;
+        const py = groundY + 4 - ph * (totalH + 40);                       // billow well above the top
+        const r = 4 + ph * (13 + rnd(5) * 10);                            // grow outward
+        const a = 0.7 * (1 - ph * 0.85) * (0.55 + rnd(6) * 0.45);          // stays thick longer
+        // warm dust near the ground, cooler grey smoke higher up
+        const g1 = 150 + (1 - ph) * 60, b1 = 118 + (1 - ph) * 34;
+        ctx.fillStyle = `rgba(${(205 - ph * 45) | 0},${g1 | 0},${b1 | 0},${a})`;
+        ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    // Drag source / drop target / hover rings (centered on the castle's height)
+    const ringR = Math.max(baseW * 0.62, totalH * 0.55) + 8;
+    const dragging = g.drag != null;
+    if (dragging && g.drag.src === t.id) {
+      const p = 2 + Math.sin(g.pulse * 5) * 1.5;
+      ctx.strokeStyle = "#FFFFFF"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, midY, ringR + p, 0, Math.PI * 2); ctx.stroke();
+    } else if (dragging && g.hover === t.id) {
+      ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.arc(x, midY, ringR, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+    } else if (!dragging && g.hover === t.id && t.owner === 0) {
+      ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(x, midY, ringR, 0, Math.PI * 2); ctx.stroke();
+    }
+
+    // Upgrade-ready hint on your castle (the build itself now shows the dust
+    // animation drawn earlier, so no loading ring while upgrading).
+    if (!t.upgrading && t.owner === 0 && canStartUpgrade(t)) {
+      const pulse = 0.5 + 0.5 * Math.sin(g.pulse * 5);
+      ctx.strokeStyle = `rgba(255,216,106,${0.5 + 0.4 * pulse})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, midY, ringR + 4 + pulse * 3, 0, Math.PI * 2); ctx.stroke();
+      const ay = topY - 26;
+      ctx.fillStyle = "#FFD86A";
+      ctx.beginPath();
+      ctx.moveTo(x, ay - 5); ctx.lineTo(x + 5, ay + 2); ctx.lineTo(x - 5, ay + 2);
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function draw(g) {
+    const c = canvasRef.current;
+    if (!c) return;
+    const ctx = c.getContext("2d");
+    const { W, H } = g;
+    const P = (wx, wy) => proj(g, wx, wy);
+
+    // The camera is clamped inside the board, so no "outside" is ever visible.
+    // A flat base fill remains only as a safety net against sub-pixel seams.
+    ctx.fillStyle = "#41547d";
+    ctx.fillRect(0, 0, W, H);
+
+    const tracePoly = (cell) => {
+      const p0 = P(cell[0].x, cell[0].y);
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      for (let i = 1; i < cell.length; i++) {
+        const pi = P(cell[i].x, cell[i].y);
+        ctx.lineTo(pi.x, pi.y);
+      }
+      ctx.closePath();
+    };
+
+    // Territory regions (the board's top face)
+    const dragSrc = g.drag ? g.drag.src : null;
+    for (const t of g.towers) {
+      if (t.cell.length < 3) continue;
+      tracePoly(t.cell);
+      ctx.fillStyle = "#41547d";
+      ctx.fill();
+      ctx.fillStyle = t.owner === NEUTRAL ? NEUTRAL_FILL : FACTIONS[t.owner].fill;
+      ctx.fill();
+
+      // Highlight the region under the pointer and the one you're dragging from
+      const isSrc = t.id === dragSrc;
+      const isHover = g.hover === t.id && t.id !== dragSrc;
+      if (isSrc) {
+        ctx.fillStyle = "rgba(255,255,255,0.16)";
+        ctx.fill();
+      } else if (isHover) {
+        ctx.fillStyle = "rgba(255,255,255,0.10)";
+        ctx.fill();
+      }
+
+      // Borders like a political map (brighter when highlighted)
+      const hot = isSrc || isHover;
+      ctx.strokeStyle = t.owner === NEUTRAL
+        ? (hot ? "rgba(255,255,255,1)" : "rgba(255,255,255,0.7)")
+        : FACTIONS[t.owner].color + (hot ? "FF" : "AA");
+      ctx.lineWidth = hot ? 3 : 2;
+      ctx.stroke();
+    }
+
+    // Subtle hatching for texture (screen-space is fine)
+    ctx.strokeStyle = "rgba(255,255,255,0.03)";
+    ctx.lineWidth = 1;
+    for (let x = -H; x < W; x += 26) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x + H, H); ctx.stroke();
+    }
+
+    // Arrow-tower coverage rings, lying flat on the ground plane
+    for (const t of g.towers) {
+      if (!t.def) continue;
+      const D = P(t.def.x, t.def.y);
+      const lvl = t.level || 1;
+      const ringA = Math.min(0x66, 0x22 + (lvl - 1) * 0x10);
+      const col = t.owner === NEUTRAL ? NEUTRAL_COLOR : FACTIONS[t.owner].color;
+      ctx.strokeStyle = col + ringA.toString(16).padStart(2, "0");
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.ellipse(D.x, D.y, ARROW_RANGE * D.s, ARROW_RANGE * D.s * TILT, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // Drag arrow from the pressed tower to the pointer
+    if (g.drag) {
+      const s = g.towers[g.drag.src];
+      const A = P(s.x, s.y);
+      const B = P(g.drag.x, g.drag.y);
+      const d = Math.hypot(B.x - A.x, B.y - A.y);
+      if (d > 8) {
+        const ux = (B.x - A.x) / d, uy = (B.y - A.y) / d;
+        ctx.setLineDash([7, 7]);
+        ctx.strokeStyle = "rgba(255,255,255,0.75)";
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+        ctx.setLineDash([]);
+        // Arrowhead
+        ctx.fillStyle = "rgba(255,255,255,0.85)";
+        ctx.beginPath();
+        ctx.moveTo(B.x, B.y);
+        ctx.lineTo(B.x - ux * 12 - uy * 6, B.y - uy * 12 + ux * 6);
+        ctx.lineTo(B.x - ux * 12 + uy * 6, B.y - uy * 12 - ux * 6);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+
+    // Soldiers — tiny marching sprites facing their direction of travel.
+    // Step frames are desynced per unit via uid/phase so the army doesn't
+    // march in lockstep; the speed-boost glow stays on the ground beneath.
+    for (const u of g.units) {
+      const Q = P(u.x, u.y);
+      if (u.speedMul && u.speedMul > 1) {
+        ctx.fillStyle = "rgba(87,224,198,0.5)";
+        ctx.beginPath();
+        ctx.ellipse(Q.x, Q.y, 5.5 * Q.s, 5.5 * Q.s * TILT, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      const tgt = g.towers[u.dst];
+      const flip = tgt ? tgt.x < u.x : false;
+      const frame = (Math.floor(g.pulse * 9 + u.phase * 3) % 2 + 2) % 2;
+      const bob = frame === 1 ? -0.5 * Q.s : 0;
+      const w = SOLDIER_W * Q.s, h = SOLDIER_H * Q.s;
+      ctx.drawImage(soldierSprite(u.owner, frame, flip), Q.x - w / 2, Q.y - h + bob, w, h);
+    }
+
+    // Arrows in flight
+    for (const a of g.arrows) {
+      const A = P(a.x, a.y);
+      const T = P(a.lx, a.ly);
+      const dx = T.x - A.x, dy = T.y - A.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const ux = dx / d, uy = dy / d;
+      ctx.strokeStyle = "#F4E4B8";
+      ctx.lineWidth = 1.5 * A.s;
+      ctx.beginPath();
+      ctx.moveTo(A.x, A.y);
+      ctx.lineTo(A.x - ux * 7 * A.s, A.y - uy * 7 * A.s);
+      ctx.stroke();
+    }
+
+    // Clash sparks
+    for (const s of g.sparks) {
+      const Q = P(s.x, s.y);
+      const a = s.life / 0.45;
+      ctx.globalAlpha = Math.max(0, a);
+      ctx.fillStyle = s.color;
+      ctx.beginPath();
+      ctx.arc(Q.x, Q.y, (3 + (1 - a) * 6) * Q.s, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // Fireball blasts — white-hot core, licking flames, rising embers
+    for (const b of g.blasts) {
+      const C = P(b.x, b.y);
+      const p = b.life / b.dur;                 // 0..1
+      const fade = 1 - p;
+      const r = FIRE_RADIUS * C.s * (0.4 + 0.6 * Math.sqrt(p));
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";  // additive glow
+
+      // Outer smoke/heat haze
+      let g0 = ctx.createRadialGradient(C.x, C.y, 0, C.x, C.y, r * 1.15);
+      g0.addColorStop(0, `rgba(255,120,30,${0.5 * fade})`);
+      g0.addColorStop(0.6, `rgba(180,40,15,${0.3 * fade})`);
+      g0.addColorStop(1, "rgba(120,20,10,0)");
+      ctx.fillStyle = g0;
+      ctx.beginPath(); ctx.arc(C.x, C.y, r * 1.15, 0, Math.PI * 2); ctx.fill();
+
+      // Flame tongues around the rim (flicker via seed)
+      const tongues = 11;
+      for (let i = 0; i < tongues; i++) {
+        const a = (i / tongues) * Math.PI * 2 + b.seed;
+        const flick = 0.75 + 0.35 * Math.sin(b.seed * 3 + i * 1.7 + p * 20);
+        const len = r * (0.85 + 0.5 * flick);
+        const tipX = C.x + Math.cos(a) * len, tipY = C.y + Math.sin(a) * len;
+        const bw = r * 0.28;
+        const bx = C.x + Math.cos(a) * r * 0.3, by = C.y + Math.sin(a) * r * 0.3;
+        const nx = -Math.sin(a), ny = Math.cos(a);
+        const fg = ctx.createLinearGradient(bx, by, tipX, tipY);
+        fg.addColorStop(0, `rgba(255,220,120,${0.9 * fade})`);
+        fg.addColorStop(0.5, `rgba(255,130,30,${0.7 * fade})`);
+        fg.addColorStop(1, "rgba(200,40,10,0)");
+        ctx.fillStyle = fg;
+        ctx.beginPath();
+        ctx.moveTo(bx + nx * bw, by + ny * bw);
+        ctx.lineTo(tipX, tipY);
+        ctx.lineTo(bx - nx * bw, by - ny * bw);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // Bright molten core
+      const core = ctx.createRadialGradient(C.x, C.y, 0, C.x, C.y, r * 0.7);
+      core.addColorStop(0, `rgba(255,255,245,${0.95 * fade})`);
+      core.addColorStop(0.4, `rgba(255,225,150,${0.9 * fade})`);
+      core.addColorStop(0.75, `rgba(255,140,40,${0.7 * fade})`);
+      core.addColorStop(1, "rgba(230,70,20,0)");
+      ctx.fillStyle = core;
+      ctx.beginPath(); ctx.arc(C.x, C.y, r * 0.7, 0, Math.PI * 2); ctx.fill();
+
+      // Rising embers
+      const embers = 10;
+      for (let i = 0; i < embers; i++) {
+        const a = b.seed + i * 2.399;
+        const er = r * (0.3 + (i / embers) * 0.9);
+        const ex = C.x + Math.cos(a) * er;
+        const ey = C.y + Math.sin(a) * er - p * 26 * C.s; // drift upward
+        ctx.fillStyle = `rgba(255,${180 - i * 6},80,${fade * 0.9})`;
+        ctx.beginPath(); ctx.arc(ex, ey, Math.max(0.5, 2.2 * fade * C.s), 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    // Storm zones — churning thundercloud; the ground shading and boundary lie
+    // flat (squashed) on the board while the cloud itself stays volumetric.
+    for (const st of g.storms) {
+      const C = P(st.x, st.y);
+      const inT = Math.min(1, st.life / 0.4);
+      const outT = Math.min(1, (st.dur - st.life) / 0.8);
+      const alpha = Math.max(0, Math.min(inT, outT));
+      const R = st.radius * C.s;
+
+      // Soft dark base so the ground reads as "under weather"
+      const base = ctx.createRadialGradient(C.x, C.y, 0, C.x, C.y, R);
+      base.addColorStop(0, `rgba(40,50,75,${0.10 * alpha})`);
+      base.addColorStop(0.7, `rgba(45,55,80,${0.26 * alpha})`);
+      base.addColorStop(1, `rgba(30,38,60,${0.05 * alpha})`);
+      ctx.fillStyle = base;
+      ctx.beginPath(); ctx.ellipse(C.x, C.y, R, R * TILT, 0, 0, Math.PI * 2); ctx.fill();
+
+      // Puffy cloud lobes, slowly rotating so it churns
+      const lobes = 9;
+      const drift = g.pulse * 0.35 + st.seed;
+      for (let i = 0; i < lobes; i++) {
+        const ang = (i / lobes) * Math.PI * 2 + drift * (i % 2 ? 1 : -1) * 0.15;
+        const rr = R * (0.45 + 0.12 * Math.sin(st.seed + i * 1.3));
+        const lx = C.x + Math.cos(ang) * rr * 0.7;
+        const ly = C.y + Math.sin(ang) * rr * 0.7 * TILT - R * 0.05;
+        const lobeR = R * (0.34 + 0.08 * Math.sin(st.seed * 2 + i));
+        const cg = ctx.createRadialGradient(lx, ly - lobeR * 0.3, lobeR * 0.2, lx, ly, lobeR);
+        cg.addColorStop(0, `rgba(150,162,190,${0.5 * alpha})`);
+        cg.addColorStop(0.6, `rgba(95,108,140,${0.42 * alpha})`);
+        cg.addColorStop(1, `rgba(70,80,110,0)`);
+        ctx.fillStyle = cg;
+        ctx.beginPath(); ctx.arc(lx, ly, lobeR, 0, Math.PI * 2); ctx.fill();
+      }
+      // A denser core puff
+      const cc = ctx.createRadialGradient(C.x, C.y - R * 0.1, R * 0.1, C.x, C.y, R * 0.6);
+      cc.addColorStop(0, `rgba(120,132,162,${0.5 * alpha})`);
+      cc.addColorStop(1, `rgba(80,92,124,0)`);
+      ctx.fillStyle = cc;
+      ctx.beginPath(); ctx.arc(C.x, C.y, R * 0.6, 0, Math.PI * 2); ctx.fill();
+
+      // Rain streaks slanting down
+      ctx.strokeStyle = `rgba(190,210,245,${0.45 * alpha})`;
+      ctx.lineWidth = 1;
+      for (let k = 0; k < 14; k++) {
+        const a = (k / 14) * Math.PI * 2 + st.seed;
+        const rr = ((g.pulse * 70 + k * 31) % R);
+        const sx = C.x + Math.cos(a) * rr, sy = C.y + Math.sin(a) * rr * 0.7;
+        ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx - 2, sy + 8); ctx.stroke();
+      }
+
+      // Periodic lightning flash + bolt
+      const strike = (g.pulse * 1.7 + st.seed) % 2.0;
+      if (strike < 0.16) {
+        const fl = 1 - strike / 0.16;
+        const flash = ctx.createRadialGradient(C.x, C.y, 0, C.x, C.y, R);
+        flash.addColorStop(0, `rgba(235,240,255,${0.5 * fl * alpha})`);
+        flash.addColorStop(1, "rgba(235,240,255,0)");
+        ctx.fillStyle = flash;
+        ctx.beginPath(); ctx.arc(C.x, C.y, R, 0, Math.PI * 2); ctx.fill();
+        // jagged bolt
+        ctx.strokeStyle = `rgba(255,255,255,${0.9 * fl})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        let bx = C.x + Math.cos(st.seed) * R * 0.2, by = C.y - R * 0.5;
+        ctx.moveTo(bx, by);
+        for (let s = 0; s < 4; s++) {
+          bx += (Math.sin(st.seed * (s + 2)) * R * 0.18);
+          by += R * 0.28;
+          ctx.lineTo(bx, by);
+        }
+        ctx.stroke();
+      }
+
+      // Faction-tinted boundary so you can tell whose storm it is
+      if (st.owner != null && FACTIONS[st.owner]) {
+        ctx.strokeStyle = FACTIONS[st.owner].color + Math.round(0.4 * alpha * 255).toString(16).padStart(2, "0");
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 6]);
+        ctx.beginPath(); ctx.ellipse(C.x, C.y, R, R * TILT, 0, 0, Math.PI * 2); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // Speed cast rings — quick expanding cyan pulse, flat on the ground
+    for (const rg of g.rings) {
+      const C = P(rg.x, rg.y);
+      const p = rg.life / rg.dur;
+      const rr = SPEED_RADIUS * C.s * (0.4 + 0.6 * p);
+      ctx.strokeStyle = `rgba(87,224,198,${0.8 * (1 - p)})`;
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.ellipse(C.x, C.y, rr, rr * TILT, 0, 0, Math.PI * 2); ctx.stroke();
+    }
+
+    // Aiming preview (kind-aware, themed) — flat radius ellipse + icon
+    if (g.aiming && !g.over) {
+      const C = P(g.pointer.x, g.pointer.y);
+      const kind = g.aiming;
+      const rad = (kind === "fire" ? FIRE_RADIUS : kind === "storm" ? STORM_RADIUS : SPEED_RADIUS) * C.s;
+      const line = kind === "fire" ? "rgba(255,140,60,0.95)" : kind === "storm" ? "rgba(150,185,255,0.95)" : "rgba(87,224,198,0.95)";
+      const fill = kind === "fire" ? "rgba(255,120,40,0.13)" : kind === "storm" ? "rgba(120,160,240,0.14)" : "rgba(87,224,198,0.12)";
+      const x = C.x, y = C.y, sc = C.s;
+      ctx.setLineDash([5, 5]);
+      ctx.strokeStyle = line;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.ellipse(x, y, rad, rad * TILT, 0, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = fill;
+      ctx.beginPath(); ctx.ellipse(x, y, rad, rad * TILT, 0, 0, Math.PI * 2); ctx.fill();
+
+      if (kind === "fire") {
+        ctx.save();
+        ctx.globalCompositeOperation = "lighter";
+        const fg = ctx.createRadialGradient(x, y, 0, x, y, 16 * sc);
+        fg.addColorStop(0, "rgba(255,240,180,0.95)");
+        fg.addColorStop(0.6, "rgba(255,140,40,0.8)");
+        fg.addColorStop(1, "rgba(220,60,20,0)");
+        ctx.fillStyle = fg;
+        ctx.beginPath(); ctx.arc(x, y, 16 * sc, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+      } else if (kind === "storm") {
+        ctx.fillStyle = "rgba(180,195,230,0.85)";
+        for (const [ox, oy, rr] of [[-9, 2, 8], [0, -3, 10], [10, 2, 8], [0, 5, 9]]) {
+          ctx.beginPath(); ctx.arc(x + ox * sc, y + oy * sc, rr * sc, 0, Math.PI * 2); ctx.fill();
+        }
+      } else {
+        // speed chevrons
+        ctx.strokeStyle = "rgba(87,224,198,0.95)"; ctx.lineWidth = 2.5;
+        for (let k = -1; k <= 1; k++) {
+          ctx.beginPath();
+          ctx.moveTo(x - 8 * sc, y + (k * 6 - 4) * sc);
+          ctx.lineTo(x, y + k * 6 * sc);
+          ctx.lineTo(x - 8 * sc, y + (k * 6 + 4) * sc);
+          ctx.stroke();
+        }
+      }
+    }
+
+    // Buildings — depth-sorted by world y so nearer sprites overlap farther ones
+    const sprites = [];
+    for (const t of g.towers) {
+      if (t.def) sprites.push({ wy: t.def.y, def: true, t });
+      sprites.push({ wy: t.y, def: false, t });
+    }
+    sprites.sort((a, b) => a.wy - b.wy);
+    for (const s of sprites) {
+      if (s.def) drawDefenseTower(ctx, s.t, g);
+      else drawTowerSprite(ctx, s.t, g);
+    }
+
+    // Troop counters last, on top of every building — a taller castle in front
+    // can never hide the counter of a castle behind it. Nearer plates (higher y)
+    // draw over farther ones so overlapping counters still resolve sensibly.
+    const plates = g.towers.slice().sort((a, b) => a.y - b.y);
+    for (const t of plates) drawGarrisonPlate(ctx, t, g);
+  }
+
+  // ================= UI =================
+  const chip = (base) => ({
+    fontFamily: "'Oxanium', sans-serif",
+    background: "rgba(34,48,77,0.85)",
+    border: "1px solid #3a4d72",
+    color: "#E8EBF2",
+    borderRadius: 8,
+    padding: "10px 18px",
+    fontSize: 15,
+    cursor: "pointer",
+    backdropFilter: "blur(4px)",
+    ...base,
+  });
+
+  return (
+    <div ref={wrapRef} style={{
+      position: "fixed", inset: 0, background: "#1c2942", color: "#EEF2FA",
+      fontFamily: "'Oxanium', sans-serif", overflow: "hidden",
+      display: "flex", flexDirection: "column",
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Oxanium:wght@400;600;800&family=IBM+Plex+Mono:wght@400;600;700&display=swap');
+        html, body {
+          overflow: hidden !important;
+          overscroll-behavior: none !important;
+          touch-action: none !important;
+          position: fixed;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+        }
+        * { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+        button:not(.special):hover { border-color: #FFD23F !important; }
+        button.special:hover { filter: brightness(1.12); }
+        button:focus-visible { outline: 2px solid #FFD23F; outline-offset: 2px; }
+      `}</style>
+
+      {/* Map area — the battlefield only; specials live in their own panel below */}
+      <div ref={mapRef} style={{ position: "relative", flex: 1, minHeight: 0, overflow: "hidden" }}>
+        <canvas
+          ref={canvasRef}
+          onPointerDown={handleDown}
+          onPointerMove={handleMove}
+          onPointerUp={handleUp}
+          onPointerCancel={handleCancel}
+          onPointerLeave={handleCancel}
+          style={{ position: "absolute", inset: 0, cursor: "crosshair", touchAction: "none" }}
+        />
+
+      {screen === "menu" && (
+        <div style={{
+          position: "absolute", inset: 0,
+          overflowY: "auto", WebkitOverflowScrolling: "touch", touchAction: "pan-y",
+          background: "rgba(24,35,58,0.94)",
+        }}>
+          <div style={{
+            minHeight: "100%", boxSizing: "border-box",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: "32px 20px",
+          }}>
+          <div style={{ maxWidth: 560, textAlign: "center" }}>
+            <h1 style={{ fontSize: 46, fontWeight: 800, margin: "0 0 10px", letterSpacing: 1 }}>
+              DOMIN<span style={{ color: "#FFD23F" }}>ATION</span>
+            </h1>
+            <button
+              onClick={() => setShowHelp((v) => !v)}
+              style={chip({
+                marginTop: 6,
+                padding: "6px 14px",
+                fontSize: 13,
+                letterSpacing: 1,
+                color: "#8a93ab",
+                borderColor: "#3a4d72",
+              })}>
+              {showHelp ? "Hide instructions ▲" : "How to play ▼"}
+            </button>
+            {showHelp && (
+            <p style={{ color: "#8a93ab", lineHeight: 1.65, fontSize: 15, marginTop: 16 }}>
+              Press anywhere in one of your regions and drag to any territory — release,
+              and your troops march out. Every region — including neutral white territory —
+              raises a defensive arrow tower that shoots any troops crossing it, so hurling
+              waves through hostile or unclaimed land bleeds you. Once a minute you
+              can call down a <span style={{ color: "#FF7A4A" }}>fireball</span> to incinerate
+              enemy troops caught on the field, or a <span style={{ color: "#9DBBFF" }}>storm</span>
+              {" "}(every 45s) to bog down enemy troops crossing it — hold them in your arrow
+              towers' fire. The enemy generals wield the same fireball and storm against you.
+              Castles start at 3 troops and fill to 10. When a castle is full, double-tap it to
+              upgrade: it costs half the garrison but raises the cap by 10 and makes the castle
+              regenerate and fire arrows faster. Keep upgrading to build fortress strongholds.
+              Three specials charge up over the match: a <span style={{ color: "#FF7A4A" }}>fireball</span>,
+              a <span style={{ color: "#9DBBFF" }}>storm</span>, and a <span style={{ color: "#57E0C6" }}>speed</span>
+              {" "}burst that hastens your own troops. Players start evenly placed; take every rival's last castle to win.
+            </p>
+            )}
+            <div style={{ margin: "26px 0 14px", fontSize: 13, letterSpacing: 3, color: "#8a93ab" }}>MODE</div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+              {[["ffa", "Free-for-all"], ["2v2", "Teams · 2v2"]].map(([m, label]) => (
+                <button key={m} onClick={() => setMode(m)}
+                  style={chip({
+                    borderColor: mode === m ? "#FFD23F" : "#46577d",
+                    color: mode === m ? "#FFD23F" : "#E8EBF2",
+                    minWidth: 140,
+                  })}>
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {mode === "ffa" ? (
+              <>
+                <div style={{ margin: "22px 0 14px", fontSize: 13, letterSpacing: 3, color: "#8a93ab" }}>COMBATANTS</div>
+                <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                  {[2, 3, 4].map((n) => (
+                    <button key={n} onClick={() => setNumPlayers(n)}
+                      style={chip({
+                        borderColor: numPlayers === n ? "#FFD23F" : "#46577d",
+                        color: numPlayers === n ? "#FFD23F" : "#E8EBF2",
+                        minWidth: 96,
+                      })}>
+                      {n} players
+                    </button>
+                  ))}
+                </div>
+                <div style={{ fontSize: 12, color: "#5c6580", marginTop: 8 }}>you + {numPlayers - 1} AI</div>
+              </>
+            ) : (
+              <div style={{ fontSize: 12, color: "#5c6580", marginTop: 14 }}>
+                you + 1 AI ally vs 2 AI enemies
+              </div>
+            )}
+
+            <button onClick={() => startGame(numPlayers, mode)}
+              style={chip({
+                marginTop: 28, background: "#FFD23F", color: "#0A0E18",
+                fontWeight: 800, fontSize: 17, padding: "14px 42px", border: "1px solid #FFD23F",
+              })}>
+              Deploy
+            </button>
+          </div>
+          </div>
+        </div>
+      )}
+
+      {screen === "play" && (
+        <>
+          {/* Top HUD */}
+          <div style={{
+            position: "absolute", top: 10, left: 12, right: 12,
+            display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center",
+            justifyContent: "space-between", pointerEvents: "none",
+          }}>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+              {(() => {
+                const renderChip = (s) => (
+                  <div key={s.pid} style={{
+                    display: "flex", alignItems: "center", gap: 7,
+                    background: "rgba(28,41,66,0.82)", backdropFilter: "blur(4px)",
+                    border: `1px solid ${s.dead ? "#232a3d" : FACTIONS[s.pid].dim}`,
+                    borderRadius: 8, padding: "5px 11px",
+                    opacity: s.dead ? 0.35 : 1,
+                    textDecoration: s.dead ? "line-through" : "none",
+                  }}>
+                    <span style={{
+                      width: 10, height: 10, borderRadius: "50%",
+                      background: FACTIONS[s.pid].color, display: "inline-block",
+                    }} />
+                    <span style={{ fontSize: 13 }}>{FACTIONS[s.pid].name}</span>
+                    <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, color: "#8a93ab" }}>
+                      {s.towers}⛫ · {s.troops}
+                    </span>
+                  </div>
+                );
+
+                if (mode !== "2v2") return hud.map(renderChip);
+
+                const myTeam = hud.find((s) => s.pid === 0)?.team ?? 0;
+                return [myTeam, myTeam === 0 ? 1 : 0].map((teamId, idx) => (
+                  <React.Fragment key={teamId}>
+                    {idx === 1 && (
+                      <span style={{ fontSize: 12, fontWeight: 800, color: "#8a93ab", letterSpacing: 1 }}>VS</span>
+                    )}
+                    <div style={{
+                      display: "flex", gap: 6, alignItems: "center",
+                      padding: "4px 6px", borderRadius: 10,
+                      border: `1px solid ${teamId === myTeam ? "rgba(255,210,63,0.4)" : "rgba(228,83,74,0.35)"}`,
+                    }}>
+                      <span style={{
+                        fontSize: 10, letterSpacing: 1, fontWeight: 700,
+                        color: teamId === myTeam ? "#FFD23F" : "#E4534A", padding: "0 2px",
+                      }}>
+                        {teamId === myTeam ? "YOUR TEAM" : "ENEMY"}
+                      </span>
+                      {hud.filter((s) => s.team === teamId).map(renderChip)}
+                    </div>
+                  </React.Fragment>
+                ));
+              })()}
+            </div>
+            <button onClick={() => setScreen("menu")}
+              style={chip({ padding: "6px 14px", fontSize: 13, pointerEvents: "auto" })}>
+              New map
+            </button>
+          </div>
+
+          {/* Outcome overlay */}
+          {outcome && (
+            <div style={{
+              position: "absolute", top: 0, left: 0, right: 0,
+              display: "flex", alignItems: "center", justifyContent: "space-between",
+              gap: 12, padding: "10px 14px",
+              background: "linear-gradient(to bottom, rgba(22,32,54,0.95), rgba(22,32,54,0.0))",
+              pointerEvents: "none",
+            }}>
+              <div style={{ pointerEvents: "auto" }}>
+                <div style={{
+                  fontSize: 22, fontWeight: 800, letterSpacing: 2,
+                  color: outcome === "win" ? "#4ADE5A" : "#E4534A",
+                }}>
+                  {outcome === "win" ? "SECTOR SECURED" : "OVERRUN"}
+                </div>
+                <div style={{ color: "#8a93ab", fontSize: 12 }}>
+                  {outcome === "win"
+                    ? (mode === "2v2" ? "Enemy team wiped out." : "Every rival eliminated.")
+                    : (mode === "2v2" ? "Your team has fallen." : "Your last forces have fallen.")}
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
+                <button onClick={() => startGame(gameRef.current.numPlayers, gameRef.current.mode)}
+                  style={chip({ background: "#FFD23F", color: "#0A0E18", fontWeight: 800, border: "1px solid #FFD23F", padding: "8px 14px" })}>
+                  Redeploy
+                </button>
+                <button onClick={() => setScreen("menu")} style={chip({ padding: "8px 14px" })}>Menu</button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+      </div>
+      {/* Map area ends here — everything below is a physically separate panel,
+          not overlaid on the battlefield. */}
+
+      {screen === "play" && (
+        <div style={{
+          flexShrink: 0,
+          background: "#1c2942",
+          borderTop: "1px solid #3a4d72",
+          boxShadow: "0 -6px 18px rgba(0,0,0,0.35)",
+          padding: "9px 12px calc(9px + env(safe-area-inset-bottom, 0px))",
+          display: "flex", flexDirection: "column", alignItems: "center", gap: 9,
+        }}>
+          {/* Specials row — in the panel, never overlapping the map */}
+          <div style={{ display: "flex", gap: 8, justifyContent: "center", width: "100%" }}>
+            {(() => {
+              const specials = [
+                { kind: "fire", icon: "🔥", name: "Fireball", secs: fireInfo.fireSecs,
+                  on: "#FF8C3C", ready: "#E4534A", readyTxt: "#FFD8B0",
+                  aimBg: "rgba(255,140,60,0.28)", readyBg: "rgba(228,83,74,0.24)", glow: "rgba(255,110,50,0.55)" },
+                { kind: "storm", icon: "🌩️", name: "Storm", secs: fireInfo.stormSecs,
+                  on: "#8FB4FF", ready: "#5C7CC4", readyTxt: "#D2E0FF",
+                  aimBg: "rgba(140,175,255,0.28)", readyBg: "rgba(92,124,196,0.26)", glow: "rgba(120,160,255,0.5)" },
+                { kind: "speed", icon: "💨", name: "Speed", secs: fireInfo.speedSecs,
+                  on: "#57E0C6", ready: "#2E9E8A", readyTxt: "#B8F5EA",
+                  aimBg: "rgba(87,224,198,0.28)", readyBg: "rgba(46,158,138,0.26)", glow: "rgba(87,224,198,0.5)" },
+              ];
+              return specials.map((s) => {
+                const ready = s.secs <= 0;
+                const aiming = fireInfo.aiming === s.kind;
+                return (
+                  <button key={s.kind} className="special" onClick={() => toggleAim(s.kind)}
+                    disabled={!ready && !aiming}
+                    style={{
+                      fontFamily: "'Oxanium', sans-serif",
+                      flex: "1 1 0", maxWidth: 150, minWidth: 0,
+                      display: "flex", alignItems: "center", gap: 7, justifyContent: "center",
+                      minHeight: 44,
+                      padding: "7px 10px",
+                      borderRadius: 12,
+                      border: `2px solid ${aiming ? s.on : ready ? s.ready : "#46577d"}`,
+                      fontSize: 14, fontWeight: 800,
+                      cursor: ready || aiming ? "pointer" : "default",
+                      color: aiming ? s.on : ready ? s.readyTxt : "#8a93ab",
+                      background: aiming ? s.aimBg : ready ? s.readyBg : "#28385a",
+                      boxShadow: ready || aiming ? `0 0 12px ${s.glow}` : "none",
+                      transition: "background 0.15s, box-shadow 0.15s, border-color 0.15s",
+                    }}>
+                    <span style={{ fontSize: 19, lineHeight: 1 }}>{aiming ? "✕" : s.icon}</span>
+                    {aiming ? (
+                      <span>Tap target</span>
+                    ) : ready ? (
+                      <span>{s.name}</span>
+                    ) : (
+                      <span style={{ display: "flex", flexDirection: "column", lineHeight: 1.15, alignItems: "flex-start" }}>
+                        <span>{s.name}</span>
+                        <span style={{ fontSize: 12, fontWeight: 600, opacity: 0.85 }}>{s.secs}s</span>
+                      </span>
+                    )}
+                  </button>
+                );
+              });
+            })()}
+          </div>
+
+          {/* Commit % row */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            <span style={{ fontSize: 12, letterSpacing: 3, color: "#8a93ab" }}>COMMIT</span>
+            {[25, 50, 75, 100].map((p) => (
+              <button key={p} onClick={() => setPct(p)}
+                style={chip({
+                  fontFamily: "'IBM Plex Mono', monospace",
+                  padding: "9px 15px", fontSize: 14,
+                  borderColor: pct === p ? "#FFD23F" : "#46577d",
+                  color: pct === p ? "#FFD23F" : "#E8EBF2",
+                  background: pct === p ? "rgba(255,210,63,0.18)" : "#28385a",
+                })}>
+                {p}%
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+const boot = document.getElementById('boot');
+if (boot) boot.remove();
+ReactDOM.createRoot(document.getElementById('root')).render(<TowerConquest />);
+</script>
+</body>
+</html>
