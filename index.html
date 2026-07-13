@@ -46,7 +46,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.101"; // bump by 0.001 each update
+const APP_VERSION = "0.121"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // level-1 cap; each upgrade adds 10
 const MAX_LEVEL = 4;         // cap: level 4 → 40 troops
@@ -57,6 +57,7 @@ const SPAWN_RATE = 9;        // soldiers marching out per second, per order
 const UNIT_R = 3;            // legacy dot radius (soldiers now render as sprites; kept for reference)
 const COLLIDE_R = 6.5;       // kill distance between opposing soldiers
 const TOWER_HIT_R = 20;      // arrival radius
+const ATTACK_SMOKE_R = 60;   // px — smoke shows once hostile troops are this close, not while still marching in from afar
 
 // Camera — tilted pseudo-3D board + zoom. The world stays flat 2D; rendering
 // squashes Y (TILT) and widens nearer rows (PERSP); input inverts the mapping.
@@ -70,6 +71,13 @@ const CAM_ZOOM = 1 / TILT;
 const ARROW_RANGE = 92;      // px, how far a defense tower can shoot
 const ARROW_FIRE_CD = 1.3;   // seconds between shots at level 1 (faster when upgraded)
 const ARROW_SPEED = 320;     // px/sec, arrow flight
+const BOULDER_SPEED = 200;   // px/sec — slower, heavier flight for Tower Defense 2.0
+
+// Battle-bed heat: tracks how hot the fighting is near the player's OWN castles,
+// decaying over time, and drives SoundEngine's ambient combat layer.
+const BATTLE_RADIUS = 140;     // px — combat within this range of a friendly castle counts
+const BATTLE_HEAT_MAX = 6;     // heat value that maps to full (1.0) intensity
+const BATTLE_HEAT_DECAY = 1.8; // heat lost per second with no new nearby kills
 
 // Per-castle scaling by upgrade level (level 1→4 multipliers: 1, 1.3, 1.6, 2)
 const LEVEL_MULT = [1, 1.6, 2.2, 3]; // level 4 = 3x level 1 regen & fire rate
@@ -79,28 +87,42 @@ const towerRegen = (t) => REGEN_RATE * levelMult(t);
 const towerFireCd = (t) => ARROW_FIRE_CD / levelMult(t);
 
 // Specials share one "train" of loading capacity instead of independent cooldowns.
-// It loads in a fixed order — Speed, then Storm, then Fireball — each stage taking
-// TRAIN_STAGE seconds, so a special isn't available until every stage before it (and
-// its own) has loaded. Casting ANY special spends TRAIN_USE_COST off the shared total,
-// which can knock later-stage specials back out of "loaded" until it recharges past
-// their threshold again.
-const TRAIN_STAGE = 30;                  // seconds to load each stage
-const TRAIN_MAX = TRAIN_STAGE * 3;       // 90s = fully loaded (all three ready)
-const TRAIN_USE_COST = 60;               // seconds of progress spent per special use
-const SPECIAL_STAGE = { speed: 1, storm: 2, fire: 3 }; // load order, 1st/2nd/3rd
+// It loads in a fixed order — Tower Defense, then Speed, then Tower Defense 2.0 — each
+// stage taking TRAIN_STAGE seconds, so a special isn't available until every stage before
+// it (and its own) has loaded. Tower Defense 2.0 is last (needs a full 60s load) because
+// it's the strongest of the three. Casting a special spends progress equal to its OWN
+// threshold — the 1st-stage special costs 20s, the 2nd costs 40s, the 3rd costs a full
+// 60s — so using anything beyond the first always drains the whole train. All three
+// trigger instantly on tap — no aiming/targeting.
+// The train actually caps at a 4th, PHANTOM stage with no special of its own — it just
+// banks an extra TRAIN_STAGE of reserve. That means fully maxing out and casting Tower
+// Defense 2.0 (60s) still leaves 20s in the tank — enough to immediately follow up with
+// Tower Defense (the 1st-stage special) instead of starting from zero.
+const TRAIN_STAGE = 20;                  // seconds to load each stage
+const TRAIN_MAX = TRAIN_STAGE * 4;       // 80s to fully max out (3 real stages + 1 reserve)
+const SPECIAL_STAGE = { storm: 1, speed: 2, fire: 3 }; // load order, 1st/2nd/3rd
 const trainThreshold = (kind) => SPECIAL_STAGE[kind] * TRAIN_STAGE;
+// Beyond the shared train, each individual special also has its own 20s cooldown per
+// caster — even with train progress to spare, you can't spam the same one back to back.
+const SPECIAL_COOLDOWN = 20;
 
-// Fireball special
-const FIRE_RADIUS = 78;      // blast kill radius
-const FIRE_TOWER_DMG = 3;    // unused now that fireball spares castle garrisons
+// Every soldier that dies anywhere on the field — yours, an ally's, or an enemy's —
+// feeds everyone's train a little, symmetrically. 10 deaths = +1s for every player.
+const TRAIN_KILL_GAIN = 0.1;             // seconds of train progress per soldier death
 
-// Storm special
-const STORM_RADIUS = 96;     // area of effect
-const STORM_DURATION = 6;    // seconds the storm lingers
-const STORM_SLOW = 0.4;      // enemy speed multiplier inside the storm
+// Tower Defense specials (replace Fireball & Storm) — no longer add extra towers.
+// "storm" slot = Tower Defense: every existing defense tower the caster (or their
+// team) owns fires 2x as fast for a limited time. "fire" slot = Tower Defense 2.0:
+// same fire rate as normal, but every tower lobs trebuchet boulders instead of
+// arrows — each impact crushes a small cluster of enemies instead of just one.
+const TOWER_DEF_DURATION = 12;     // seconds either buff lasts
+const TOWER_DEF_RATE_MULT = 2;     // fire-rate multiplier — "storm" slot
+const BOULDER_SPLASH_COUNT = 4;    // enemies destroyed per boulder impact — "fire" slot
+const BOULDER_SPLASH_RADIUS = 42;  // px, blast radius around a boulder's impact point
 
-// Speed special — buffs your team's troops caught in the radius for the rest of their trip
-const SPEED_RADIUS = 112;
+// Speed special — now the middle tier (2nd stage). Instantly buffs every marching
+// soldier on the caster's team for the rest of their trip (global, no radius/targeting
+// needed).
 const SPEED_BOOST = 1.5;     // +50% movement speed
 
 const FACTIONS = [
@@ -231,6 +253,8 @@ function polyCentroid(poly) {
 }
 
 // Place each region's defensive tower off to the side of its castle, inside the cell.
+// t.defs is an array so Tower Defense specials can bolt on extra temporary towers —
+// index 0 is always the permanent base defender.
 function placeDefenders(towers) {
   for (const t of towers) {
     const c = t.cell.length >= 3 ? polyCentroid(t.cell) : { x: t.x, y: t.y };
@@ -238,7 +262,7 @@ function placeDefenders(towers) {
     const len = Math.hypot(dx, dy);
     if (len < 12) { dx = 40; dy = -18; } // degenerate/tiny cell: nudge up-right
     else { const off = Math.min(58, Math.max(38, len * 0.85)); dx = (dx / len) * off; dy = (dy / len) * off; }
-    t.def = { x: t.x + dx, y: t.y + dy, cd: Math.random() * ARROW_FIRE_CD };
+    t.defs = [{ x: t.x + dx, y: t.y + dy, cd: Math.random() * ARROW_FIRE_CD }];
   }
 }
 
@@ -296,10 +320,19 @@ function generateMap(numPlayers, W, H, teamMode = false) {
     }
     // Neutrals along the mid-axis between the two teams (>= 2, symmetric).
     // Each ring shares one level (1–3) so both teams face the same strength;
-    // level 4 is reserved for the single true-center tower.
-    const midLevel = pick([1, 2, 3]);
-    const extraMidLevel = pick([1, 2, 3]);
-    const centerLevel = pick([1, 2, 3, 4]);
+    // level 4 is reserved for the single true-center tower. Don't let every
+    // neutral ring out-level the strongest player castle — bring the weakest
+    // roll down to match if they all rolled higher.
+    const maxPlayerLevel = Math.max(homeLevel, ...extraLevels);
+    const teamNeutralRings = [{ key: "mid", level: pick([1, 2, 3]) }];
+    if (extraMid) teamNeutralRings.push({ key: "extraMid", level: pick([1, 2, 3]) });
+    if (centerNeutral) teamNeutralRings.push({ key: "center", level: pick([1, 2, 3, 4]) });
+    if (teamNeutralRings.every((r) => r.level > maxPlayerLevel)) {
+      teamNeutralRings.reduce((min, r) => (r.level < min.level ? r : min)).level = maxPlayerLevel;
+    }
+    const midLevel = teamNeutralRings.find((r) => r.key === "mid").level;
+    const extraMidLevel = teamNeutralRings.find((r) => r.key === "extraMid")?.level;
+    const centerLevel = teamNeutralRings.find((r) => r.key === "center")?.level;
     const mid = [a0 + Math.PI / 2, a0 - Math.PI / 2];
     for (const ma of mid) { const p = ell(0.9, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: midLevel }); }
     if (extraMid) for (const ma of mid) { const p = ell(0.44, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: extraMidLevel }); }
@@ -341,6 +374,7 @@ function generateMap(numPlayers, W, H, teamMode = false) {
   // Start levels: one slot (home or extra) gets a level once, then every
   // player's wedge reuses the same per-slot level — nobody starts ahead.
   const templateLevels = template.map(() => pick([1, 2]));
+  const maxPlayerLevel = Math.max(...templateLevels);
 
   const raw = [];
   for (let k = 0; k < n; k++) {
@@ -350,10 +384,22 @@ function generateMap(numPlayers, W, H, teamMode = false) {
     });
   }
 
+  // Neutral rings: each ring shares one level so whichever players border it
+  // face the same strength; level 4 is reserved for the single center tower.
+  // Don't let every present ring out-level the strongest player castle —
+  // bring the weakest roll down to match if they all rolled higher.
+  const neutralRings = [];
+  if (buffered) neutralRings.push({ key: "buffered", level: pick([1, 2, 3]) });
+  if (innerRing) neutralRings.push({ key: "inner", level: pick([1, 2, 3]) });
+  if (centerNeutral || (!buffered && !innerRing)) neutralRings.push({ key: "center", level: pick([1, 2, 3, 4]) });
+  if (neutralRings.length && neutralRings.every((r) => r.level > maxPlayerLevel)) {
+    neutralRings.reduce((min, r) => (r.level < min.level ? r : min)).level = maxPlayerLevel;
+  }
+  const bufferedLevel = neutralRings.find((r) => r.key === "buffered")?.level;
+  const innerLevel = neutralRings.find((r) => r.key === "inner")?.level;
+  const centerLevelVal = neutralRings.find((r) => r.key === "center")?.level;
+
   // Equal neutral buffers between adjacent players, out near the rim.
-  // Every ring shares one level (1–3) so whichever players border it face
-  // the same strength; level 4 is reserved for the single center tower.
-  const bufferedLevel = pick([1, 2, 3]);
   if (buffered) {
     for (let k = 0; k < n; k++) {
       const p = ell(0.92, a0 + (k + 0.5) * step);
@@ -361,7 +407,6 @@ function generateMap(numPlayers, W, H, teamMode = false) {
     }
   }
   // Inner contested ring (one per wedge → symmetric)
-  const innerLevel = pick([1, 2, 3]);
   if (innerRing) {
     const inF = 0.4 + Math.random() * 0.1;
     const off = buffered ? 0.5 : 0.0;
@@ -372,7 +417,7 @@ function generateMap(numPlayers, W, H, teamMode = false) {
   }
   // Shared center — the only tower allowed to start at level 4
   if (centerNeutral || (!buffered && !innerRing)) {
-    raw.push({ x: cx, y: cy, owner: NEUTRAL, level: pick([1, 2, 3, 4]) });
+    raw.push({ x: cx, y: cy, owner: NEUTRAL, level: centerLevelVal });
   }
 
   const towers = raw.map((p, i) => ({
@@ -387,6 +432,147 @@ function generateMap(numPlayers, W, H, teamMode = false) {
   const neutrals = towers.filter((t) => t.owner === NEUTRAL).length;
   return { towers, perPlayer, neutrals };
 }
+
+// ================= Sound =================
+// Everything here is synthesized with the Web Audio API — no external audio files,
+// keeping this a single self-contained HTML document. AudioContext only starts on
+// first call, which always happens from a user gesture (deploy, drag, tap), so
+// browser autoplay restrictions are satisfied naturally.
+const SoundEngine = (() => {
+  let ctx = null, master = null, muted = false;
+  const lastPlayed = {};
+
+  const ensureCtx = () => {
+    if (!ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      ctx = new AC();
+      master = ctx.createGain();
+      master.gain.value = 0.5;
+      master.connect(ctx.destination);
+    }
+    if (ctx.state === "suspended") ctx.resume();
+    return ctx;
+  };
+
+  // Skip a call if the same sound name played too recently — stops dozens of
+  // simultaneous arrow/clash kills from spawning dozens of overlapping nodes.
+  const throttled = (name, minMs) => {
+    const now = performance.now();
+    if (lastPlayed[name] !== undefined && now - lastPlayed[name] < minMs) return true;
+    lastPlayed[name] = now;
+    return false;
+  };
+
+  const tone = (freq, dur, type, vol, delay = 0) => {
+    const c = ensureCtx();
+    if (!c || muted) return;
+    const t0 = c.currentTime + delay;
+    const osc = c.createOscillator(), gain = c.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(vol, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    osc.connect(gain).connect(master);
+    osc.start(t0); osc.stop(t0 + dur + 0.02);
+  };
+
+  const sweep = (f0, f1, dur, type, vol, delay = 0) => {
+    const c = ensureCtx();
+    if (!c || muted) return;
+    const t0 = c.currentTime + delay;
+    const osc = c.createOscillator(), gain = c.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(f0, t0);
+    osc.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t0 + dur);
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(vol, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    osc.connect(gain).connect(master);
+    osc.start(t0); osc.stop(t0 + dur + 0.02);
+  };
+
+  const noiseBurst = (dur, vol, filterFreq, delay = 0) => {
+    const c = ensureCtx();
+    if (!c || muted) return;
+    const t0 = c.currentTime + delay;
+    const n = Math.max(1, Math.floor(c.sampleRate * dur));
+    const buf = c.createBuffer(1, n, c.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const src = c.createBufferSource();
+    src.buffer = buf;
+    const filter = c.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = filterFreq;
+    const gain = c.createGain();
+    gain.gain.setValueAtTime(vol, t0);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    src.connect(filter).connect(gain).connect(master);
+    src.start(t0);
+  };
+
+  // ---- Battle bed: a live castle-under-attack layer built from the same clash/
+  // impact vocabulary, not a separate alarm sound. A self-rescheduling stream of
+  // small, muffled percussive taps (quieter/duller than the foreground hit sounds)
+  // whose rate and volume track how hot the fighting is near the player's own
+  // castles. Stops rescheduling itself once intensity drops back to zero.
+  let battleIntensity = 0;
+  let battleTimer = null;
+
+  const battleTap = (intensity) => {
+    const c = ensureCtx();
+    if (!c || muted) return;
+    const vol = 0.035 + 0.11 * intensity;
+    // Muffled: heavier lowpass + lower gain than the foreground arrowHit/clash
+    // sounds, so this reads as "distant fighting" rather than duplicating them.
+    noiseBurst(0.05 + Math.random() * 0.04, vol, 1400 + Math.random() * 900);
+    if (Math.random() < 0.25 + 0.35 * intensity) {
+      tone(65 + Math.random() * 35, 0.09, "sine", vol * 0.55);
+    }
+  };
+
+  const scheduleBattleTick = () => {
+    if (battleTimer !== null) return; // already running
+    const tick = () => {
+      battleTimer = null;
+      if (battleIntensity <= 0.02) return; // quiet enough — let the loop end
+      battleTap(battleIntensity);
+      const minDelay = 100, maxDelay = 460;
+      const delay = maxDelay - (maxDelay - minDelay) * battleIntensity + Math.random() * 70;
+      battleTimer = setTimeout(tick, delay);
+    };
+    tick();
+  };
+
+  return {
+    setMuted: (m) => { muted = m; },
+    isMuted: () => muted,
+    resume: () => ensureCtx(),
+
+    arrowHit: () => { if (throttled("arrowHit", 90)) return; noiseBurst(0.05, 0.1, 3200); },
+    boulderHit: () => { if (throttled("boulderHit", 90)) return; noiseBurst(0.22, 0.3, 380); tone(85, 0.2, "sine", 0.22); },
+    clash: () => { if (throttled("clash", 90)) return; noiseBurst(0.04, 0.07, 5200); },
+    towerDefense: (vol = 1) => { tone(300, 0.1, "square", 0.22 * vol); tone(450, 0.12, "square", 0.18 * vol, 0.06); },
+    towerDefense2: (vol = 1) => { noiseBurst(0.3, 0.32 * vol, 300); tone(80, 0.35, "sawtooth", 0.3 * vol); },
+    speed: (vol = 1) => sweep(300, 900, 0.25, "sine", 0.22 * vol),
+    win: () => { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.25, "triangle", 0.26, i * 0.14)); },
+    lose: () => { [392, 349, 311, 262].forEach((f, i) => tone(f, 0.3, "sawtooth", 0.2, i * 0.16)); },
+    click: () => tone(600, 0.04, "square", 0.08),
+    pause: () => tone(500, 0.06, "sine", 0.12),
+
+    // intensity: 0..1, how hot the fighting is near the player's own castles
+    setBattleIntensity: (intensity) => {
+      battleIntensity = Math.max(0, Math.min(1, intensity));
+      if (battleIntensity > 0.02) scheduleBattleTick();
+    },
+    stopBattle: () => {
+      battleIntensity = 0;
+      if (battleTimer !== null) { clearTimeout(battleTimer); battleTimer = null; }
+    },
+  };
+})();
 
 // ================= Component =================
 function TowerConquest() {
@@ -404,18 +590,30 @@ function TowerConquest() {
   const [outcome, setOutcome] = useState(null);
   const [paused, setPaused] = useState(false);
   const pausedRef = useRef(false);
-  useEffect(() => { pausedRef.current = paused; }, [paused]);
+  useEffect(() => {
+    pausedRef.current = paused;
+    if (paused) SoundEngine.stopBattle();
+  }, [paused]);
+  const [soundOn, setSoundOn] = useState(true);
+  useEffect(() => { SoundEngine.setMuted(!soundOn); }, [soundOn]);
   const [fireInfo, setFireInfo] = useState({
-    fireSecs: TRAIN_STAGE * 3, stormSecs: TRAIN_STAGE * 2, speedSecs: TRAIN_STAGE * 1,
-    trainProgress: 0, aiming: null,
+    fireSecs: TRAIN_STAGE * 3, stormSecs: TRAIN_STAGE * 1, speedSecs: TRAIN_STAGE * 2,
+    fireCd: 0, stormCd: 0, speedCd: 0,
+    trainProgress: 0,
   });
 
   // Pulse each special button once, right when it comes off cooldown.
   const [pulse, setPulse] = useState({ fire: false, storm: false, speed: false });
-  const prevSecsRef = useRef({ fire: TRAIN_STAGE * 3, storm: TRAIN_STAGE * 2, speed: TRAIN_STAGE * 1 });
+  const prevSecsRef = useRef({ fire: TRAIN_STAGE * 3, storm: TRAIN_STAGE * 1, speed: TRAIN_STAGE * 2 });
   useEffect(() => {
     const prev = prevSecsRef.current;
-    const next = { fire: fireInfo.fireSecs, storm: fireInfo.stormSecs, speed: fireInfo.speedSecs };
+    // "Ready to tap" needs BOTH the train loaded and the special's own cooldown clear —
+    // pulse should only fire once it's actually usable, not just off the loading bar.
+    const next = {
+      fire: Math.max(fireInfo.fireSecs, fireInfo.fireCd),
+      storm: Math.max(fireInfo.stormSecs, fireInfo.stormCd),
+      speed: Math.max(fireInfo.speedSecs, fireInfo.speedCd),
+    };
     const justReady = {
       fire: prev.fire > 0 && next.fire <= 0,
       storm: prev.storm > 0 && next.storm <= 0,
@@ -432,7 +630,7 @@ function TowerConquest() {
         if (justReady[k]) setTimeout(() => setPulse((p) => ({ ...p, [k]: false })), 650);
       }
     }
-  }, [fireInfo.fireSecs, fireInfo.stormSecs, fireInfo.speedSecs]);
+  }, [fireInfo.fireSecs, fireInfo.stormSecs, fireInfo.speedSecs, fireInfo.fireCd, fireInfo.stormCd, fireInfo.speedCd]);
 
   useEffect(() => { pctRef.current = pct; }, [pct]);
 
@@ -463,6 +661,8 @@ function TowerConquest() {
   });
 
   const startGame = useCallback((players, gameModeIn = "ffa") => {
+    SoundEngine.resume();
+    SoundEngine.click();
     // "random" isn't a real mode — resolve it to one of the concrete modes now.
     let gameMode = gameModeIn;
     let playersResolved = players;
@@ -485,11 +685,10 @@ function TowerConquest() {
       units: [],        // individual soldiers: {owner, x, y, dst, off, speed, phase}
       arrows: [],       // defensive-tower shots: {x, y, targetUid, owner, life}
       sparks: [],       // clash effects: {x, y, life, color}
-      blasts: [],       // fireball explosions: {x, y, life, dur}
-      storms: [],       // storm zones: {x, y, radius, life, dur}
-      rings: [],        // one-shot cast rings (speed): {x, y, life, dur, color}
+      rings: [],        // one-shot cast rings (speed + tower defense): {x, y, life, dur, color}
       trainProgress: 0,            // player's shared special "train" — must load up from 0
-      aiming: null,     // null | "fire" | "storm" — which special is being aimed
+      lastCast: {},     // "{owner}_{kind}" -> g.pulse of last successful cast, for cooldowns
+      battleHeat: 0,    // combat intensity near the player's own castles, feeds the battle bed
       pointer: { x: W / 2, y: H / 2 },
       uidSeq: 1,
       numPlayers: nPlayers,
@@ -513,6 +712,21 @@ function TowerConquest() {
   // Two owners are allied if they share a team. Neutral (-1) is nobody's ally.
   const sameTeam = (g, a, b) =>
     a !== NEUTRAL && b !== NEUTRAL && g.teams[a] === g.teams[b];
+
+  // Is (x, y) within earshot of one of the player's own (or ally's) castles? Used
+  // to decide whether a kill should feed the battle-bed ambience — fights on the
+  // far side of the map between other players stay silent.
+  const nearFriendlyCastle = (g, x, y) => {
+    for (const t of g.towers) {
+      if (!(sameTeam(g, t.owner, 0) || t.owner === 0)) continue;
+      if (Math.hypot(t.x - x, t.y - y) <= BATTLE_RADIUS) return true;
+    }
+    return false;
+  };
+  const addBattleHeat = (g, x, y, amount) => {
+    if (!nearFriendlyCastle(g, x, y)) return;
+    g.battleHeat = Math.min(BATTLE_HEAT_MAX, g.battleHeat + amount);
+  };
 
   // ----- Camera: world <-> screen (fixed) -----
   // All game logic runs in flat world coordinates. proj() tilts the board
@@ -548,11 +762,12 @@ function TowerConquest() {
       if (g) {
         const sx = W / g.W, sy = H / g.H;
         if (sx !== 1 || sy !== 1) {
-          for (const t of g.towers) { t.x *= sx; t.y *= sy; if (t.def) { t.def.x *= sx; t.def.y *= sy; } }
+          for (const t of g.towers) {
+            t.x *= sx; t.y *= sy;
+            if (t.defs) for (const d of t.defs) { d.x *= sx; d.y *= sy; }
+          }
           for (const u of g.units) { u.x *= sx; u.y *= sy; }
           for (const a of g.arrows) { a.x *= sx; a.y *= sy; }
-          for (const b of g.blasts) { b.x *= sx; b.y *= sy; }
-          for (const st of g.storms) { st.x *= sx; st.y *= sy; }
           for (const rg of g.rings) { rg.x *= sx; rg.y *= sy; }
           if (g.pointer) { g.pointer.x *= sx; g.pointer.y *= sy; }
           for (const s of g.sparks) { s.x *= sx; s.y *= sy; }
@@ -608,66 +823,106 @@ function TowerConquest() {
   // ----- Specials -----
   const trainOf = (g, owner) => (owner === 0 ? g.trainProgress : g.aiTrain[owner]);
 
+  // How much longer until `kind` comes off its own 20s per-caster cooldown (separate
+  // from train progress — this is what stops spamming the same special back to back).
+  const cooldownRemaining = (g, kind, owner = 0) => {
+    const last = g.lastCast[owner + "_" + kind];
+    if (last === undefined) return 0;
+    return Math.max(0, SPECIAL_COOLDOWN - (g.pulse - last));
+  };
+
   const syncSpecials = (g) =>
     setFireInfo({
       fireSecs: Math.ceil(Math.max(0, trainThreshold("fire") - g.trainProgress)),
       stormSecs: Math.ceil(Math.max(0, trainThreshold("storm") - g.trainProgress)),
       speedSecs: Math.ceil(Math.max(0, trainThreshold("speed") - g.trainProgress)),
+      fireCd: Math.ceil(cooldownRemaining(g, "fire")),
+      stormCd: Math.ceil(cooldownRemaining(g, "storm")),
+      speedCd: Math.ceil(cooldownRemaining(g, "speed")),
       trainProgress: g.trainProgress,
-      aiming: g.aiming,
     });
 
-  // Casting any special spends TRAIN_USE_COST off that caster's shared train —
-  // may knock later-stage specials back out of "loaded" until it recharges.
+  // Casting a special spends progress equal to its OWN threshold (20s / 40s / 60s
+  // for 1st/2nd/3rd stage) — using the top-tier special always fully drains the train.
+  // Also stamps this cast's time so the special's own 20s cooldown starts ticking.
   const setCd = (g, kind, owner) => {
+    const cost = trainThreshold(kind);
+    g.lastCast[owner + "_" + kind] = g.pulse;
     if (owner === 0) {
-      g.trainProgress = Math.max(0, g.trainProgress - TRAIN_USE_COST);
-      g.aiming = null; syncSpecials(g);
+      g.trainProgress = Math.max(0, g.trainProgress - cost);
+      syncSpecials(g);
     } else {
-      g.aiTrain[owner] = Math.max(0, g.aiTrain[owner] - TRAIN_USE_COST);
+      g.aiTrain[owner] = Math.max(0, g.aiTrain[owner] - cost);
     }
   };
 
-  function detonateFireball(g, x, y, owner) {
-    g.blasts.push({ x, y, life: 0, dur: 0.6, seed: Math.random() * 6.283 });
-    const before = g.units.length;
-    g.units = g.units.filter(
-      (u) => sameTeam(g, u.owner, owner) || Math.hypot(u.x - x, u.y - y) > FIRE_RADIUS
-    );
-    const killed = before - g.units.length;
-    for (let i = 0; i < Math.min(killed, 14); i++) {
-      const a = Math.random() * Math.PI * 2, r = Math.random() * FIRE_RADIUS;
-      g.sparks.push({ x: x + Math.cos(a) * r, y: y + Math.sin(a) * r, life: 0.4, color: "#FFB43D" });
+  // War fuels the train: every soldier that dies on the field — yours, an ally's, or
+  // an enemy's, it doesn't matter which — nudges EVERY player's train forward a
+  // little, symmetrically. Called with the number of deaths this tick.
+  const gainTrainTime = (g, deaths) => {
+    if (deaths <= 0) return;
+    const seconds = deaths * TRAIN_KILL_GAIN;
+    g.trainProgress = Math.min(TRAIN_MAX, g.trainProgress + seconds);
+    for (let pid = 1; pid < g.numPlayers; pid++) {
+      if (g.eliminated.has(pid)) continue;
+      g.aiTrain[pid] = Math.min(TRAIN_MAX, g.aiTrain[pid] + seconds);
     }
-    setCd(g, "fire", owner);
+  };
+
+  // No new towers added — "storm" slot speeds up every existing defense tower the
+  // caster's team owns (2x fire rate, TOWER_DEF_DURATION seconds). "fire" slot swaps
+  // those towers to fire splash-damage boulders instead, at their normal fire rate.
+  function castTowerDefense(g, owner, kind) {
+    const boulder = kind === "fire";
+    for (const t of g.towers) {
+      if (!(sameTeam(g, t.owner, owner) || t.owner === owner)) continue;
+      for (const d of t.defs) {
+        if (boulder) {
+          d.boulder = true;
+          d.boulderExpiresAt = g.pulse + TOWER_DEF_DURATION;
+        } else {
+          d.rateMult = TOWER_DEF_RATE_MULT;
+          d.rateExpiresAt = g.pulse + TOWER_DEF_DURATION;
+        }
+      }
+      g.rings.push({
+        x: t.x, y: t.y, life: 0,
+        dur: boulder ? 0.8 : 0.6,
+        color: boulder ? "#FF3B30" : "#FFD23F",
+      });
+    }
+    const vol = owner === 0 ? 1 : 0.4;
+    if (boulder) SoundEngine.towerDefense2(vol); else SoundEngine.towerDefense(vol);
+    setCd(g, kind, owner);
   }
 
-  function castStorm(g, x, y, owner) {
-    g.storms.push({ x, y, radius: STORM_RADIUS, life: 0, dur: STORM_DURATION, owner, seed: Math.random() * 6.283 });
-    setCd(g, "storm", owner);
-  }
-
-  function castSpeed(g, x, y, owner) {
-    // One-shot: team troops in the radius get +50% for the rest of their journey
+  function castSpeed(g, owner) {
+    // Global, instant: every currently-marching soldier on the caster's team gets
+    // +50% speed for the rest of its trip.
     for (const u of g.units) {
-      if ((sameTeam(g, u.owner, owner) || u.owner === owner) && Math.hypot(u.x - x, u.y - y) <= SPEED_RADIUS) {
-        u.speedMul = SPEED_BOOST;
+      if (sameTeam(g, u.owner, owner) || u.owner === owner) u.speedMul = SPEED_BOOST;
+    }
+    // Visual feedback: a quick pulse ring at every castle the caster owns.
+    for (const t of g.towers) {
+      if (sameTeam(g, t.owner, owner) || t.owner === owner) {
+        g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.5, color: "#57E0C6" });
       }
     }
-    g.rings.push({ x, y, life: 0, dur: 0.5, color: "#57E0C6" });
+    SoundEngine.speed(owner === 0 ? 1 : 0.4);
     setCd(g, "speed", owner);
   }
 
-  const readyFor = (g, kind, owner = 0) => trainOf(g, owner) >= trainThreshold(kind);
+  const readyFor = (g, kind, owner = 0) =>
+    trainOf(g, owner) >= trainThreshold(kind) && cooldownRemaining(g, kind, owner) <= 0;
 
-  const toggleAim = (kind) => {
+  // One-tap cast: no aiming/targeting step — the segment fires the moment it's tapped.
+  const castPlayerSpecial = (kind) => {
     const g = gameRef.current;
     if (!g || g.over || paused) return;
-    if (g.aiming === kind) { g.aiming = null; syncSpecials(g); return; }
     if (!readyFor(g, kind)) return;
-    g.aiming = kind;
-    g.drag = null;
-    syncSpecials(g);
+    if (kind === "speed") castSpeed(g, 0);
+    else if (kind === "storm") castTowerDefense(g, 0, "storm");
+    else if (kind === "fire") castTowerDefense(g, 0, "fire");
   };
 
   const handleDown = (e) => {
@@ -677,9 +932,6 @@ function TowerConquest() {
     const sp = canvasPos(e);
     const p = unproj(g, sp.x, sp.y);
     g.pointer = p;
-    if (g.aiming === "fire") { detonateFireball(g, p.x, p.y, 0); return; }
-    if (g.aiming === "storm") { castStorm(g, p.x, p.y, 0); return; }
-    if (g.aiming === "speed") { castSpeed(g, p.x, p.y, 0); return; }
     const region = regionAt(g, p);
     // Drag endpoint (x, y) lives in world coords; (ssx, ssy) keeps the screen
     // start so the tap-vs-drag threshold is measured in screen pixels.
@@ -732,56 +984,36 @@ function TowerConquest() {
   };
 
   // ----- AI -----
-  // Densest knot of troops hostile to `pid` — where an area special pays off most.
-  function bestCluster(g, pid, radius) {
-    const hostiles = g.units.filter((u) => !sameTeam(g, u.owner, pid) && u.owner !== pid);
-    if (hostiles.length === 0) return null;
-    let best = null, bestC = 0;
-    for (const c of hostiles) {
-      let count = 0, sx = 0, sy = 0;
-      for (const u of hostiles) {
-        if (Math.hypot(u.x - c.x, u.y - c.y) <= radius) { count++; sx += u.x; sy += u.y; }
-      }
-      if (count > bestC) { bestC = count; best = { x: sx / count, y: sy / count, count }; }
+  // Hostile troops currently marching toward any of pid's team's castles — how
+  // urgently Tower Defense would pay off right now.
+  function incomingThreat(g, pid, isTeam) {
+    let total = 0;
+    for (const t of g.towers) {
+      if (!isTeam(t.owner)) continue;
+      for (const u of g.units) if (u.dst === t.id && !isTeam(u.owner)) total++;
+      for (const o of g.orders) if (o.dst === t.id && !isTeam(o.owner) && o.remaining > 0) total += o.remaining;
     }
-    return best;
-  }
-
-  // Densest knot of the AI's OWN team troops — where a friendly buff pays off.
-  function bestFriendlyCluster(g, pid, radius) {
-    const friends = g.units.filter((u) => sameTeam(g, u.owner, pid) || u.owner === pid);
-    if (friends.length === 0) return null;
-    let best = null, bestC = 0;
-    for (const c of friends) {
-      let count = 0, sx = 0, sy = 0;
-      for (const u of friends) {
-        if (Math.hypot(u.x - c.x, u.y - c.y) <= radius) { count++; sx += u.x; sy += u.y; }
-      }
-      if (count > bestC) { bestC = count; best = { x: sx / count, y: sy / count, count }; }
-    }
-    return best;
+    return total;
   }
 
   // Each AI decides whether to spend its specials this tick.
   function aiSpecials(g) {
     for (let pid = 1; pid < g.numPlayers; pid++) {
       if (g.eliminated.has(pid)) continue;
-      if (g.aiTrain[pid] >= trainThreshold("fire")) {
-        const spot = bestCluster(g, pid, FIRE_RADIUS);
-        if (spot && spot.count >= 6) detonateFireball(g, spot.x, spot.y, pid);
+      const isTeam = (owner) => owner === pid || sameTeam(g, owner, pid);
+
+      // Tower Defense 2.0 — save the boulder barrage for serious incoming pressure.
+      if (readyFor(g, "fire", pid)) {
+        if (incomingThreat(g, pid, isTeam) >= 10) castTowerDefense(g, pid, "fire");
       }
-      if (g.aiTrain[pid] >= trainThreshold("storm")) {
-        const spot = bestCluster(g, pid, STORM_RADIUS);
-        if (spot && spot.count >= 5) {
-          const nearHome = g.towers.some(
-            (t) => t.owner === pid && Math.hypot(t.x - spot.x, t.y - spot.y) < STORM_RADIUS * 1.6
-          );
-          if (spot.count >= 8 || nearHome) castStorm(g, spot.x, spot.y, pid);
-        }
+      // Tower Defense — worth it against moderate pressure.
+      if (readyFor(g, "storm", pid)) {
+        if (incomingThreat(g, pid, isTeam) >= 5) castTowerDefense(g, pid, "storm");
       }
-      if (g.aiTrain[pid] >= trainThreshold("speed")) {
-        const spot = bestFriendlyCluster(g, pid, SPEED_RADIUS);
-        if (spot && spot.count >= 6) castSpeed(g, spot.x, spot.y, pid);
+      // Speed — cast whenever it has a meaningful force marching to benefit from it.
+      if (readyFor(g, "speed", pid)) {
+        const marching = g.units.reduce((n, u) => n + (isTeam(u.owner) ? 1 : 0), 0);
+        if (marching >= 5) castSpeed(g, pid);
       }
     }
   }
@@ -963,6 +1195,12 @@ function TowerConquest() {
       t.level = Math.max(1, t.level - 1); // a defeated castle is knocked down a level
       t.upgrading = null;                 // cancel any build in progress
       t.troops = 1;
+      // A captured castle loses any active Tower Defense / 2.0 buff — it doesn't
+      // carry over to benefit whoever just took it.
+      for (const d of t.defs) {
+        d.rateMult = 1; d.rateExpiresAt = 0;
+        d.boulder = false; d.boulderExpiresAt = 0;
+      }
       // Any half-finished orders leaving this tower are cancelled by the capture
       for (const o of g.orders) if (o.src === t.id && o.owner !== u.owner) o.remaining = 0;
     }
@@ -981,6 +1219,9 @@ function TowerConquest() {
       g.pulse += dt;
 
       if (!g.over && !pausedRef.current) {
+        // Battle heat decays continuously; feeds the ambient battle bed below.
+        if (g.battleHeat > 0) g.battleHeat = Math.max(0, g.battleHeat - BATTLE_HEAT_DECAY * dt);
+
         // Regeneration — every tower, neutral included, climbs back toward 100
         for (const t of g.towers) {
           if (t.troops < towerMax(t)) {
@@ -1037,16 +1278,9 @@ function TowerConquest() {
             const px = -(t.y - u.y) / d, py = (t.x - u.x) / d;
             tx += px * u.off; ty += py * u.off;
           }
-          // Storms slow troops that don't belong to the caster
-          let slow = 1;
-          for (const st of g.storms) {
-            if (!sameTeam(g, st.owner, u.owner) && Math.hypot(u.x - st.x, u.y - st.y) <= st.radius) {
-              slow = STORM_SLOW; break;
-            }
-          }
-          const spd = u.speed * slow * (u.speedMul || 1);
+          const spd = u.speed * (u.speedMul || 1);
           const dd = Math.hypot(tx - u.x, ty - u.y) || 1;
-          const wob = Math.sin(g.pulse * 9 + u.phase) * 6 * dt * slow;
+          const wob = Math.sin(g.pulse * 9 + u.phase) * 6 * dt;
           u.x += ((tx - u.x) / dd) * spd * dt + (-(ty - u.y) / dd) * wob;
           u.y += ((ty - u.y) / dd) * spd * dt + ((tx - u.x) / dd) * wob;
         }
@@ -1075,16 +1309,17 @@ function TowerConquest() {
                 if (sameTeam(g, v.owner, u.owner)) continue;
                 if (dist(u, v) < COLLIDE_R) {
                   dead.add(i); dead.add(j);
-                  g.sparks.push({
-                    x: (u.x + v.x) / 2, y: (u.y + v.y) / 2,
-                    life: 0.45, color: "#FFE9C2",
-                  });
+                  const mx = (u.x + v.x) / 2, my = (u.y + v.y) / 2;
+                  g.sparks.push({ x: mx, y: my, life: 0.45, color: "#FFE9C2" });
+                  addBattleHeat(g, mx, my, 1);
                   break outer;
                 }
               }
             }
           }
         }
+        gainTrainTime(g, dead.size);
+        if (dead.size) SoundEngine.clash();
 
         // Arrivals
         for (let i = g.units.length - 1; i >= 0; i--) {
@@ -1097,30 +1332,40 @@ function TowerConquest() {
           }
         }
 
-        // Defensive towers: every region (including neutrals) shoots hostile troops passing through it
+        // Defensive towers: every region (including neutrals) shoots hostile troops
+        // passing through it. Tower Defense speeds up firing; Tower Defense 2.0 swaps
+        // to slower, splash-killing boulders at the normal rate — neither adds towers.
         const byUid = new Map();
         for (const u of g.units) byUid.set(u.uid, u);
         for (const t of g.towers) {
-          if (!t.def) continue;
-          t.def.cd -= dt;
-          if (t.def.cd > 0) continue;
-          let nearest = null, nd = ARROW_RANGE;
-          for (const u of g.units) {
-            if (sameTeam(g, u.owner, t.owner)) continue;
-            const d = Math.hypot(u.x - t.x, u.y - t.y);
-            if (d < nd) { nd = d; nearest = u; }
-          }
-          if (nearest) {
-            g.arrows.push({
-              x: t.def.x, y: t.def.y,
-              targetUid: nearest.uid, owner: t.owner,
-              lx: nearest.x, ly: nearest.y, life: 1.2,
-            });
-            t.def.cd = towerFireCd(t);
+          if (!t.defs || !t.defs.length) continue;
+          for (const d of t.defs) {
+            // Expire either buff once its window is up
+            if (d.rateMult && d.rateExpiresAt <= g.pulse) { d.rateMult = 1; d.rateExpiresAt = 0; }
+            if (d.boulder && d.boulderExpiresAt <= g.pulse) { d.boulder = false; d.boulderExpiresAt = 0; }
+            d.cd -= dt;
+            if (d.cd > 0) continue;
+            let nearest = null, nd = ARROW_RANGE;
+            for (const u of g.units) {
+              if (sameTeam(g, u.owner, t.owner)) continue;
+              const dd = Math.hypot(u.x - t.x, u.y - t.y);
+              if (dd < nd) { nd = dd; nearest = u; }
+            }
+            if (nearest) {
+              g.arrows.push({
+                x: d.x, y: d.y,
+                targetUid: nearest.uid, owner: t.owner,
+                lx: nearest.x, ly: nearest.y, life: 1.2,
+                boulder: !!d.boulder,
+              });
+              d.cd = towerFireCd(t) / (d.rateMult || 1);
+            }
           }
         }
 
-        // Arrow flight — homes on its target, kills on contact
+        // Arrow flight — homes on its target, kills on contact. Boulders (Tower
+        // Defense 2.0) fly slower and crush a small cluster on impact instead of
+        // just the one target.
         const arrowKilled = new Set();
         for (let i = g.arrows.length - 1; i >= 0; i--) {
           const a = g.arrows[i];
@@ -1128,13 +1373,38 @@ function TowerConquest() {
           const tgt = byUid.get(a.targetUid);
           if (tgt && !arrowKilled.has(tgt.uid)) { a.lx = tgt.x; a.ly = tgt.y; }
           const d = Math.hypot(a.lx - a.x, a.ly - a.y) || 1;
-          const v = ARROW_SPEED * dt;
+          const v = (a.boulder ? BOULDER_SPEED : ARROW_SPEED) * dt;
           a.x += ((a.lx - a.x) / d) * v;
           a.y += ((a.ly - a.y) / d) * v;
           if (d <= v + 4) {
             if (tgt && !arrowKilled.has(tgt.uid)) {
               arrowKilled.add(tgt.uid);
               g.sparks.push({ x: tgt.x, y: tgt.y, life: 0.35, color: "#FFD27A" });
+              if (a.boulder) {
+                SoundEngine.boulderHit();
+                addBattleHeat(g, tgt.x, tgt.y, 1.5);
+                // Crush the nearest few enemies caught in the blast radius too
+                const splashed = g.units
+                  .filter((u) => u.uid !== tgt.uid && !arrowKilled.has(u.uid) &&
+                    !sameTeam(g, u.owner, a.owner) && Math.hypot(u.x - tgt.x, u.y - tgt.y) <= BOULDER_SPLASH_RADIUS)
+                  .sort((p, q) => Math.hypot(p.x - tgt.x, p.y - tgt.y) - Math.hypot(q.x - tgt.x, q.y - tgt.y))
+                  .slice(0, BOULDER_SPLASH_COUNT - 1);
+                for (const u of splashed) {
+                  arrowKilled.add(u.uid);
+                  g.sparks.push({ x: u.x, y: u.y, life: 0.35, color: "#C99060" });
+                }
+                // Dust-cloud burst at the impact point
+                for (let k = 0; k < 6; k++) {
+                  const ang = Math.random() * Math.PI * 2, r = Math.random() * BOULDER_SPLASH_RADIUS * 0.6;
+                  g.sparks.push({
+                    x: tgt.x + Math.cos(ang) * r, y: tgt.y + Math.sin(ang) * r,
+                    life: 0.4, color: "#8a7660",
+                  });
+                }
+              } else {
+                SoundEngine.arrowHit();
+                addBattleHeat(g, tgt.x, tgt.y, 0.6);
+              }
             }
             g.arrows.splice(i, 1);
           } else if (a.life <= 0) {
@@ -1143,6 +1413,7 @@ function TowerConquest() {
         }
         if (arrowKilled.size) {
           g.units = g.units.filter((u) => !arrowKilled.has(u.uid));
+          gainTrainTime(g, arrowKilled.size);
         }
 
         // Sparks fade
@@ -1181,19 +1452,11 @@ function TowerConquest() {
         for (let pid = 0; pid < g.numPlayers; pid++)
           if (!g.eliminated.has(pid)) aliveTeams.add(g.teams[pid]);
         const myTeam = g.teams[0];
-        if (!aliveTeams.has(myTeam)) { g.over = true; setOutcome("lose"); }
-        else if (aliveTeams.size === 1) { g.over = true; setOutcome("win"); }
+        if (!aliveTeams.has(myTeam)) { g.over = true; setOutcome("lose"); SoundEngine.lose(); SoundEngine.stopBattle(); }
+        else if (aliveTeams.size === 1) { g.over = true; setOutcome("win"); SoundEngine.win(); SoundEngine.stopBattle(); }
 
         // Special "train" progress + effect animations
         if (g.trainProgress < TRAIN_MAX) g.trainProgress = Math.min(TRAIN_MAX, g.trainProgress + dt);
-        for (let i = g.blasts.length - 1; i >= 0; i--) {
-          g.blasts[i].life += dt;
-          if (g.blasts[i].life >= g.blasts[i].dur) g.blasts.splice(i, 1);
-        }
-        for (let i = g.storms.length - 1; i >= 0; i--) {
-          g.storms[i].life += dt;
-          if (g.storms[i].life >= g.storms[i].dur) g.storms.splice(i, 1);
-        }
         for (let i = g.rings.length - 1; i >= 0; i--) {
           g.rings[i].life += dt;
           if (g.rings[i].life >= g.rings[i].dur) g.rings.splice(i, 1);
@@ -1205,6 +1468,9 @@ function TowerConquest() {
       hudTimer += dt;
       if (hudTimer > 0.35) {
         hudTimer = 0;
+        if (!g.over && !pausedRef.current) {
+          SoundEngine.setBattleIntensity(g.battleHeat / BATTLE_HEAT_MAX);
+        }
         const stats = [];
         for (let pid = 0; pid < g.numPlayers; pid++) {
           const mine = g.towers.filter((t) => t.owner === pid);
@@ -1224,32 +1490,56 @@ function TowerConquest() {
           fireSecs: Math.ceil(Math.max(0, trainThreshold("fire") - g.trainProgress)),
           stormSecs: Math.ceil(Math.max(0, trainThreshold("storm") - g.trainProgress)),
           speedSecs: Math.ceil(Math.max(0, trainThreshold("speed") - g.trainProgress)),
+          fireCd: Math.ceil(cooldownRemaining(g, "fire")),
+          stormCd: Math.ceil(cooldownRemaining(g, "storm")),
+          speedCd: Math.ceil(cooldownRemaining(g, "speed")),
           trainProgress: g.trainProgress,
-          aiming: g.aiming,
         });
       }
       raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(raf);
+    return () => { cancelAnimationFrame(raf); SoundEngine.stopBattle(); };
   }, [screen]);
 
   // ================= Rendering =================
-  // A slim arrow tower that guards each region, neutrals included.
+  // A slim arrow tower that guards each region, neutrals included. Takes a specific
+  // defender from t.defs so a castle with Tower Defense bonuses can draw several.
   // Drawn upright at the projected base — the translate/scale wrapper keeps
   // the sprite vertical while it scales with zoom and depth.
-  function drawDefenseTower(ctx, t, g) {
-    if (!t.def) return;
+  function drawDefenseTower(ctx, t, def, g) {
+    if (!def) return;
     const col = t.owner === NEUTRAL ? NEUTRAL_COLOR : FACTIONS[t.owner].color;
-    const B = proj(g, t.def.x, t.def.y);
+    const B = proj(g, def.x, def.y);
     ctx.save();
     ctx.translate(B.x, B.y);
     ctx.scale(B.s, B.s);
-    ctx.translate(-t.def.x, -t.def.y);
-    const x = t.def.x, y = t.def.y;
+    ctx.translate(-def.x, -def.y);
+    const x = def.x, y = def.y;
     const lvl = t.level || 1;
-    const s = 1 + Math.min(lvl - 1, 6) * 0.09;
+    const buff2 = def.rateMult === TOWER_DEF_RATE_MULT;  // Tower Defense (2x fire rate)
+    const boulder = !!def.boulder;                        // Tower Defense 2.0 (splash boulders)
+    const s = (1 + Math.min(lvl - 1, 6) * 0.09) * (boulder ? 1.15 : buff2 ? 1.15 : 1);
     const w = 11 * s, h = 22 * s;
+
+    // Boulder mode gets a pulsing red menace-glow behind it; 2x fire rate gets a
+    // softer gold glow.
+    if (boulder) {
+      const pulseT = 0.5 + 0.5 * Math.sin(g.pulse * 6);
+      const glowR = w * (2.2 + 0.5 * pulseT);
+      const glow = ctx.createRadialGradient(x, y - h * 0.3, 0, x, y - h * 0.3, glowR);
+      glow.addColorStop(0, `rgba(255,40,20,${0.3 + 0.14 * pulseT})`);
+      glow.addColorStop(1, "rgba(255,40,20,0)");
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(x, y - h * 0.3, glowR, 0, Math.PI * 2); ctx.fill();
+    } else if (buff2) {
+      const glowR = w * 1.8;
+      const glow = ctx.createRadialGradient(x, y - h * 0.3, 0, x, y - h * 0.3, glowR);
+      glow.addColorStop(0, "rgba(255,216,106,0.28)");
+      glow.addColorStop(1, "rgba(255,216,106,0)");
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(x, y - h * 0.3, glowR, 0, Math.PI * 2); ctx.fill();
+    }
 
     // Shadow
     ctx.fillStyle = "rgba(0,0,0,0.3)";
@@ -1257,22 +1547,39 @@ function TowerConquest() {
     ctx.ellipse(x, y + h / 2 + 2, w * 0.7, 4, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Shaft
+    // Shaft — same silhouette as the base tower, just retinted: boulder mode goes
+    // dark scorched stone, the 2x buff gets a warm gold cast, unbuffed stays grey.
     const grad = ctx.createLinearGradient(x - w / 2, 0, x + w / 2, 0);
-    grad.addColorStop(0, "#6E7AA0");
-    grad.addColorStop(1, "#3b4463");
+    if (boulder) {
+      grad.addColorStop(0, "#5A4438"); grad.addColorStop(0.5, "#3A2A22"); grad.addColorStop(1, "#5A4438");
+    } else if (buff2) {
+      grad.addColorStop(0, "#FFD86A"); grad.addColorStop(1, "#C98A2E");
+    } else {
+      grad.addColorStop(0, "#6E7AA0"); grad.addColorStop(1, "#3b4463");
+    }
     ctx.fillStyle = grad;
     ctx.fillRect(x - w / 2, y - h / 2, w, h);
 
     // Crenellated top
-    ctx.fillStyle = "#6E7AA0";
+    ctx.fillStyle = boulder ? "#3A2A22" : buff2 ? "#FFD86A" : "#6E7AA0";
     ctx.fillRect(x - w / 2, y - h / 2 - 3, 3, 4);
     ctx.fillRect(x - 1.5, y - h / 2 - 3, 3, 4);
     ctx.fillRect(x + w / 2 - 3, y - h / 2 - 3, 3, 4);
 
-    // Arrow slit glows in faction color
-    ctx.fillStyle = col;
-    ctx.fillRect(x - 1.5, y - h / 2 + 4, 3, 8);
+    // Arrow slit — boulder mode glows hot ember-orange instead of faction color
+    if (boulder) {
+      const slitGlow = ctx.createRadialGradient(x, y - h / 2 + 8, 0, x, y - h / 2 + 8, 6);
+      slitGlow.addColorStop(0, "rgba(255,190,110,0.95)");
+      slitGlow.addColorStop(0.6, "rgba(255,90,30,0.75)");
+      slitGlow.addColorStop(1, "rgba(255,90,30,0)");
+      ctx.fillStyle = slitGlow;
+      ctx.beginPath(); ctx.arc(x, y - h / 2 + 8, 6, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#FFD8A0";
+      ctx.fillRect(x - 1.5, y - h / 2 + 4, 3, 8);
+    } else {
+      ctx.fillStyle = col;
+      ctx.fillRect(x - 1.5, y - h / 2 + 4, 3, 8);
+    }
     ctx.restore();
   }
 
@@ -1507,6 +1814,44 @@ function TowerConquest() {
     ctx.restore();
   }
 
+  // Rising smoke puffs at the base of a castle currently under attack — purely
+  // procedural (derived from g.pulse + tower id), no particle array to manage.
+  // Several overlapping puffs loop continuously, drifting up and fading out.
+  function drawAttackSmoke(ctx, t, g) {
+    const groundY = t.y + 14; // matches the castle sprite's base
+
+    // Constant dense haze at the base — always present while under attack, so
+    // there's steady visual weight even between puffs, not just faint dots.
+    const B = proj(g, t.x, groundY - 6);
+    const haze = ctx.createRadialGradient(B.x, B.y, 0, B.x, B.y, 28 * B.s);
+    haze.addColorStop(0, "rgba(55,56,62,0.55)");
+    haze.addColorStop(0.6, "rgba(55,56,62,0.32)");
+    haze.addColorStop(1, "rgba(55,56,62,0)");
+    ctx.fillStyle = haze;
+    ctx.beginPath(); ctx.arc(B.x, B.y, 28 * B.s, 0, Math.PI * 2); ctx.fill();
+
+    // Bigger, denser, more numerous rising puffs on top of the haze
+    const puffs = 7;
+    const cycle = 1.4; // seconds per puff's rise-and-fade loop — shorter = more overlap
+    for (let i = 0; i < puffs; i++) {
+      const seed = t.id * 7.31 + i * 2.77;
+      const phase = ((g.pulse + seed) % cycle) / cycle; // 0..1, staggered per puff
+      const rise = phase * 36;
+      const drift = Math.sin(seed + phase * 5) * 7;
+      const alpha = 0.55 * (1 - phase);
+      const r = 4 + phase * 11;
+      const wx = t.x + (i - (puffs - 1) / 2) * 5 + drift;
+      const wy = groundY - rise;
+      const P = proj(g, wx, wy);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = "#5B5F68";
+      ctx.beginPath();
+      ctx.arc(P.x, P.y, r * P.s, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
   function draw(g) {
     const c = canvasRef.current;
     if (!c) return;
@@ -1569,7 +1914,7 @@ function TowerConquest() {
 
     // Arrow-tower coverage rings — a true circle centered on the castle itself
     for (const t of g.towers) {
-      if (!t.def) continue;
+      if (!t.defs || !t.defs.length) continue;
       const C = P(t.x, t.y);
       const lvl = t.level || 1;
       const ringA = Math.min(0x66, 0x22 + (lvl - 1) * 0x10);
@@ -1624,19 +1969,42 @@ function TowerConquest() {
       ctx.drawImage(soldierSprite(u.owner, frame, flip), Q.x - w / 2, Q.y - h + bob, w, h);
     }
 
-    // Arrows in flight
+    // Arrows / boulders in flight
     for (const a of g.arrows) {
       const A = P(a.x, a.y);
       const T = P(a.lx, a.ly);
       const dx = T.x - A.x, dy = T.y - A.y;
       const d = Math.hypot(dx, dy) || 1;
       const ux = dx / d, uy = dy / d;
-      ctx.strokeStyle = "#F4E4B8";
-      ctx.lineWidth = 1.5 * A.s;
-      ctx.beginPath();
-      ctx.moveTo(A.x, A.y);
-      ctx.lineTo(A.x - ux * 7 * A.s, A.y - uy * 7 * A.s);
-      ctx.stroke();
+      if (a.boulder) {
+        // A tumbling rock with a short dust trail — heavier and slower-reading than an arrow
+        ctx.strokeStyle = "rgba(120,104,88,0.55)";
+        ctx.lineWidth = 3 * A.s;
+        ctx.beginPath();
+        ctx.moveTo(A.x, A.y);
+        ctx.lineTo(A.x - ux * 14 * A.s, A.y - uy * 14 * A.s);
+        ctx.stroke();
+        const r = 4.5 * A.s;
+        const spin = (a.x + a.y) * 0.15;
+        const rockGrad = ctx.createRadialGradient(A.x - r * 0.3, A.y - r * 0.3, 0, A.x, A.y, r);
+        rockGrad.addColorStop(0, "#B0A08C");
+        rockGrad.addColorStop(1, "#4A3F32");
+        ctx.fillStyle = rockGrad;
+        ctx.beginPath(); ctx.arc(A.x, A.y, r, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = "#2E2620";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(A.x + Math.cos(spin) * r * 0.5, A.y + Math.sin(spin) * r * 0.5);
+        ctx.lineTo(A.x + Math.cos(spin + Math.PI) * r * 0.5, A.y + Math.sin(spin + Math.PI) * r * 0.5);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = "#F4E4B8";
+        ctx.lineWidth = 1.5 * A.s;
+        ctx.beginPath();
+        ctx.moveTo(A.x, A.y);
+        ctx.lineTo(A.x - ux * 7 * A.s, A.y - uy * 7 * A.s);
+        ctx.stroke();
+      }
     }
 
     // Clash sparks
@@ -1651,215 +2019,44 @@ function TowerConquest() {
       ctx.globalAlpha = 1;
     }
 
-    // Fireball blasts — white-hot core, licking flames, rising embers
-    for (const b of g.blasts) {
-      const C = P(b.x, b.y);
-      const p = b.life / b.dur;                 // 0..1
-      const fade = 1 - p;
-      const r = FIRE_RADIUS * C.s * (0.4 + 0.6 * Math.sqrt(p));
-      ctx.save();
-      ctx.globalCompositeOperation = "lighter";  // additive glow
 
-      // Outer smoke/heat haze
-      let g0 = ctx.createRadialGradient(C.x, C.y, 0, C.x, C.y, r * 1.15);
-      g0.addColorStop(0, `rgba(255,120,30,${0.5 * fade})`);
-      g0.addColorStop(0.6, `rgba(180,40,15,${0.3 * fade})`);
-      g0.addColorStop(1, "rgba(120,20,10,0)");
-      ctx.fillStyle = g0;
-      ctx.beginPath(); ctx.arc(C.x, C.y, r * 1.15, 0, Math.PI * 2); ctx.fill();
-
-      // Flame tongues around the rim (flicker via seed)
-      const tongues = 11;
-      for (let i = 0; i < tongues; i++) {
-        const a = (i / tongues) * Math.PI * 2 + b.seed;
-        const flick = 0.75 + 0.35 * Math.sin(b.seed * 3 + i * 1.7 + p * 20);
-        const len = r * (0.85 + 0.5 * flick);
-        const tipX = C.x + Math.cos(a) * len, tipY = C.y + Math.sin(a) * len;
-        const bw = r * 0.28;
-        const bx = C.x + Math.cos(a) * r * 0.3, by = C.y + Math.sin(a) * r * 0.3;
-        const nx = -Math.sin(a), ny = Math.cos(a);
-        const fg = ctx.createLinearGradient(bx, by, tipX, tipY);
-        fg.addColorStop(0, `rgba(255,220,120,${0.9 * fade})`);
-        fg.addColorStop(0.5, `rgba(255,130,30,${0.7 * fade})`);
-        fg.addColorStop(1, "rgba(200,40,10,0)");
-        ctx.fillStyle = fg;
-        ctx.beginPath();
-        ctx.moveTo(bx + nx * bw, by + ny * bw);
-        ctx.lineTo(tipX, tipY);
-        ctx.lineTo(bx - nx * bw, by - ny * bw);
-        ctx.closePath();
-        ctx.fill();
-      }
-
-      // Bright molten core
-      const core = ctx.createRadialGradient(C.x, C.y, 0, C.x, C.y, r * 0.7);
-      core.addColorStop(0, `rgba(255,255,245,${0.95 * fade})`);
-      core.addColorStop(0.4, `rgba(255,225,150,${0.9 * fade})`);
-      core.addColorStop(0.75, `rgba(255,140,40,${0.7 * fade})`);
-      core.addColorStop(1, "rgba(230,70,20,0)");
-      ctx.fillStyle = core;
-      ctx.beginPath(); ctx.arc(C.x, C.y, r * 0.7, 0, Math.PI * 2); ctx.fill();
-
-      // Rising embers
-      const embers = 10;
-      for (let i = 0; i < embers; i++) {
-        const a = b.seed + i * 2.399;
-        const er = r * (0.3 + (i / embers) * 0.9);
-        const ex = C.x + Math.cos(a) * er;
-        const ey = C.y + Math.sin(a) * er - p * 26 * C.s; // drift upward
-        ctx.fillStyle = `rgba(255,${180 - i * 6},80,${fade * 0.9})`;
-        ctx.beginPath(); ctx.arc(ex, ey, Math.max(0.5, 2.2 * fade * C.s), 0, Math.PI * 2); ctx.fill();
-      }
-      ctx.restore();
-    }
-
-    // Storm zones — churning thundercloud; the ground shading and boundary lie
-    // flat (squashed) on the board while the cloud itself stays volumetric.
-    for (const st of g.storms) {
-      const C = P(st.x, st.y);
-      const inT = Math.min(1, st.life / 0.4);
-      const outT = Math.min(1, (st.dur - st.life) / 0.8);
-      const alpha = Math.max(0, Math.min(inT, outT));
-      const R = st.radius * C.s;
-
-      // Soft dark base so the ground reads as "under weather"
-      const base = ctx.createRadialGradient(C.x, C.y, 0, C.x, C.y, R);
-      base.addColorStop(0, `rgba(40,50,75,${0.10 * alpha})`);
-      base.addColorStop(0.7, `rgba(45,55,80,${0.26 * alpha})`);
-      base.addColorStop(1, `rgba(30,38,60,${0.05 * alpha})`);
-      ctx.fillStyle = base;
-      ctx.beginPath(); ctx.ellipse(C.x, C.y, R, R * TILT, 0, 0, Math.PI * 2); ctx.fill();
-
-      // Puffy cloud lobes, slowly rotating so it churns
-      const lobes = 9;
-      const drift = g.pulse * 0.35 + st.seed;
-      for (let i = 0; i < lobes; i++) {
-        const ang = (i / lobes) * Math.PI * 2 + drift * (i % 2 ? 1 : -1) * 0.15;
-        const rr = R * (0.45 + 0.12 * Math.sin(st.seed + i * 1.3));
-        const lx = C.x + Math.cos(ang) * rr * 0.7;
-        const ly = C.y + Math.sin(ang) * rr * 0.7 * TILT - R * 0.05;
-        const lobeR = R * (0.34 + 0.08 * Math.sin(st.seed * 2 + i));
-        const cg = ctx.createRadialGradient(lx, ly - lobeR * 0.3, lobeR * 0.2, lx, ly, lobeR);
-        cg.addColorStop(0, `rgba(150,162,190,${0.5 * alpha})`);
-        cg.addColorStop(0.6, `rgba(95,108,140,${0.42 * alpha})`);
-        cg.addColorStop(1, `rgba(70,80,110,0)`);
-        ctx.fillStyle = cg;
-        ctx.beginPath(); ctx.arc(lx, ly, lobeR, 0, Math.PI * 2); ctx.fill();
-      }
-      // A denser core puff
-      const cc = ctx.createRadialGradient(C.x, C.y - R * 0.1, R * 0.1, C.x, C.y, R * 0.6);
-      cc.addColorStop(0, `rgba(120,132,162,${0.5 * alpha})`);
-      cc.addColorStop(1, `rgba(80,92,124,0)`);
-      ctx.fillStyle = cc;
-      ctx.beginPath(); ctx.arc(C.x, C.y, R * 0.6, 0, Math.PI * 2); ctx.fill();
-
-      // Rain streaks slanting down
-      ctx.strokeStyle = `rgba(190,210,245,${0.45 * alpha})`;
-      ctx.lineWidth = 1;
-      for (let k = 0; k < 14; k++) {
-        const a = (k / 14) * Math.PI * 2 + st.seed;
-        const rr = ((g.pulse * 70 + k * 31) % R);
-        const sx = C.x + Math.cos(a) * rr, sy = C.y + Math.sin(a) * rr * 0.7;
-        ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx - 2, sy + 8); ctx.stroke();
-      }
-
-      // Periodic lightning flash + bolt
-      const strike = (g.pulse * 1.7 + st.seed) % 2.0;
-      if (strike < 0.16) {
-        const fl = 1 - strike / 0.16;
-        const flash = ctx.createRadialGradient(C.x, C.y, 0, C.x, C.y, R);
-        flash.addColorStop(0, `rgba(235,240,255,${0.5 * fl * alpha})`);
-        flash.addColorStop(1, "rgba(235,240,255,0)");
-        ctx.fillStyle = flash;
-        ctx.beginPath(); ctx.arc(C.x, C.y, R, 0, Math.PI * 2); ctx.fill();
-        // jagged bolt
-        ctx.strokeStyle = `rgba(255,255,255,${0.9 * fl})`;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        let bx = C.x + Math.cos(st.seed) * R * 0.2, by = C.y - R * 0.5;
-        ctx.moveTo(bx, by);
-        for (let s = 0; s < 4; s++) {
-          bx += (Math.sin(st.seed * (s + 2)) * R * 0.18);
-          by += R * 0.28;
-          ctx.lineTo(bx, by);
-        }
-        ctx.stroke();
-      }
-
-      // Faction-tinted boundary so you can tell whose storm it is
-      if (st.owner != null && FACTIONS[st.owner]) {
-        ctx.strokeStyle = FACTIONS[st.owner].color + Math.round(0.4 * alpha * 255).toString(16).padStart(2, "0");
-        ctx.lineWidth = 2;
-        ctx.setLineDash([6, 6]);
-        ctx.beginPath(); ctx.ellipse(C.x, C.y, R, R * TILT, 0, 0, Math.PI * 2); ctx.stroke();
-        ctx.setLineDash([]);
-      }
-    }
-
-    // Speed cast rings — quick expanding cyan pulse, flat on the ground
+    // Special-cast rings — quick expanding pulse at each affected castle, flat on
+    // the ground. Shared by Speed (cyan) and Tower Defense / 2.0 (gold).
+    const RING_RADIUS = 70;
     for (const rg of g.rings) {
       const C = P(rg.x, rg.y);
       const p = rg.life / rg.dur;
-      const rr = SPEED_RADIUS * C.s * (0.4 + 0.6 * p);
-      ctx.strokeStyle = `rgba(87,224,198,${0.8 * (1 - p)})`;
+      const rr = RING_RADIUS * C.s * (0.4 + 0.6 * p);
+      const alpha = Math.round(0.8 * (1 - p) * 255).toString(16).padStart(2, "0");
+      ctx.strokeStyle = rg.color + alpha;
       ctx.lineWidth = 3;
       ctx.beginPath(); ctx.ellipse(C.x, C.y, rr, rr * TILT, 0, 0, Math.PI * 2); ctx.stroke();
     }
 
-    // Aiming preview (kind-aware, themed) — flat radius ellipse + icon
-    if (g.aiming && !g.over) {
-      const C = P(g.pointer.x, g.pointer.y);
-      const kind = g.aiming;
-      const rad = (kind === "fire" ? FIRE_RADIUS : kind === "storm" ? STORM_RADIUS : SPEED_RADIUS) * C.s;
-      const line = kind === "fire" ? "rgba(255,140,60,0.95)" : kind === "storm" ? "rgba(150,185,255,0.95)" : "rgba(87,224,198,0.95)";
-      const fill = kind === "fire" ? "rgba(255,120,40,0.13)" : kind === "storm" ? "rgba(120,160,240,0.14)" : "rgba(87,224,198,0.12)";
-      const x = C.x, y = C.y, sc = C.s;
-      ctx.setLineDash([5, 5]);
-      ctx.strokeStyle = line;
-      ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.ellipse(x, y, rad, rad * TILT, 0, 0, Math.PI * 2); ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillStyle = fill;
-      ctx.beginPath(); ctx.ellipse(x, y, rad, rad * TILT, 0, 0, Math.PI * 2); ctx.fill();
-
-      if (kind === "fire") {
-        ctx.save();
-        ctx.globalCompositeOperation = "lighter";
-        const fg = ctx.createRadialGradient(x, y, 0, x, y, 16 * sc);
-        fg.addColorStop(0, "rgba(255,240,180,0.95)");
-        fg.addColorStop(0.6, "rgba(255,140,40,0.8)");
-        fg.addColorStop(1, "rgba(220,60,20,0)");
-        ctx.fillStyle = fg;
-        ctx.beginPath(); ctx.arc(x, y, 16 * sc, 0, Math.PI * 2); ctx.fill();
-        ctx.restore();
-      } else if (kind === "storm") {
-        ctx.fillStyle = "rgba(180,195,230,0.85)";
-        for (const [ox, oy, rr] of [[-9, 2, 8], [0, -3, 10], [10, 2, 8], [0, 5, 9]]) {
-          ctx.beginPath(); ctx.arc(x + ox * sc, y + oy * sc, rr * sc, 0, Math.PI * 2); ctx.fill();
-        }
-      } else {
-        // speed chevrons
-        ctx.strokeStyle = "rgba(87,224,198,0.95)"; ctx.lineWidth = 2.5;
-        for (let k = -1; k <= 1; k++) {
-          ctx.beginPath();
-          ctx.moveTo(x - 8 * sc, y + (k * 6 - 4) * sc);
-          ctx.lineTo(x, y + k * 6 * sc);
-          ctx.lineTo(x - 8 * sc, y + (k * 6 + 4) * sc);
-          ctx.stroke();
-        }
-      }
-    }
 
     // Buildings — depth-sorted by world y so nearer sprites overlap farther ones
     const sprites = [];
     for (const t of g.towers) {
-      if (t.def) sprites.push({ wy: t.def.y, def: true, t });
+      if (t.defs) for (const d of t.defs) sprites.push({ wy: d.y, def: true, t, d });
       sprites.push({ wy: t.y, def: false, t });
     }
     sprites.sort((a, b) => a.wy - b.wy);
     for (const s of sprites) {
-      if (s.def) drawDefenseTower(ctx, s.t, g);
+      if (s.def) drawDefenseTower(ctx, s.t, s.d, g);
       else drawTowerSprite(ctx, s.t, g);
+    }
+
+    // Smoke at the base of any castle currently under attack — only once hostile
+    // troops are actually at the walls, not while they're still marching in.
+    for (const t of g.towers) {
+      let attacked = false;
+      for (const u of g.units) {
+        if (u.dst === t.id && !sameTeam(g, u.owner, t.owner) && u.owner !== t.owner && dist(u, t) <= ATTACK_SMOKE_R) {
+          attacked = true;
+          break;
+        }
+      }
+      if (attacked) drawAttackSmoke(ctx, t, g);
     }
 
     // Troop counters last, on top of every building — a taller castle in front
@@ -1961,10 +2158,15 @@ function TowerConquest() {
               <li>Every region — even neutral ones — has a defense tower that shoots troops crossing it.</li>
               <li>Castles hold up to 10 troops. Double-tap a full castle to upgrade it: costs half its troops, adds +10 capacity, and speeds up regen and firing.</li>
               <li>
-                Your specials — <span style={{ color: "#57E0C6" }}>speed</span>,{" "}
-                <span style={{ color: "#9DBBFF" }}>storm</span>, and{" "}
-                <span style={{ color: "#FF7A4A" }}>fireball</span> — share one loading bar.
-                Casting any of them spends 60 seconds off the bar. Enemies play by the same rules.
+                Your specials — <span style={{ color: "#9DBBFF" }}>tower defense</span> (every
+                castle's tower fires 2x as fast), <span style={{ color: "#57E0C6" }}>speed</span> (boosts
+                every marching soldier), and <span style={{ color: "#FF7A4A" }}>tower defense 2.0</span> (towers
+                lob boulders instead of arrows — each hit crushes up to 4 enemies, the strongest of
+                the three) — trigger instantly with one tap and share one loading bar. The 1st, 2nd,
+                and 3rd specials cost 20s, 40s, and 60s of that bar to cast. Each special also has
+                its own 20s cooldown, so you can't spam the same one back to back. Every soldier that
+                dies anywhere on the field — yours, an ally's, or an enemy's — refills 0.1s for
+                everyone. Enemies play by the same rules.
               </li>
               <li>Everyone starts even. Take every rival's last castle to win.</li>
             </ul>
@@ -2089,11 +2291,15 @@ function TowerConquest() {
               })()}
             </div>
             <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
-              <button onClick={() => setPaused((p) => !p)}
+              <button onClick={() => { SoundEngine.click(); setSoundOn((s) => !s); }}
+                style={chip({ padding: "6px 10px", fontSize: 13 })}>
+                {soundOn ? "🔊" : "🔇"}
+              </button>
+              <button onClick={() => { SoundEngine.pause(); setPaused((p) => !p); }}
                 style={chip({ padding: "6px 14px", fontSize: 13 })}>
                 {paused ? "Resume" : "Pause"}
               </button>
-              <button onClick={() => setScreen("menu")}
+              <button onClick={() => { SoundEngine.click(); setScreen("menu"); }}
                 style={chip({ padding: "6px 14px", fontSize: 13 })}>
                 New map
               </button>
@@ -2110,7 +2316,7 @@ function TowerConquest() {
               onClick={() => setPaused(false)}
             >
               <div style={{ fontSize: 26, fontWeight: 800, letterSpacing: 3, color: "#E8EEF9" }}>PAUSED</div>
-              <button onClick={(e) => { e.stopPropagation(); setPaused(false); }}
+              <button onClick={(e) => { e.stopPropagation(); SoundEngine.pause(); setPaused(false); }}
                 style={chip({ background: "#FFD23F", color: "#0A0E18", fontWeight: 800, border: "1px solid #FFD23F", padding: "9px 20px", fontSize: 14 })}>
                 Resume
               </button>
@@ -2144,7 +2350,7 @@ function TowerConquest() {
                   style={chip({ background: "#FFD23F", color: "#0A0E18", fontWeight: 800, border: "1px solid #FFD23F", padding: "8px 14px" })}>
                   Redeploy
                 </button>
-                <button onClick={() => setScreen("menu")} style={chip({ padding: "8px 14px" })}>Menu</button>
+                <button onClick={() => { SoundEngine.click(); setScreen("menu"); }} style={chip({ padding: "8px 14px" })}>Menu</button>
               </div>
             </div>
           )}
@@ -2163,76 +2369,118 @@ function TowerConquest() {
           padding: "9px 12px calc(9px + env(safe-area-inset-bottom, 0px))",
           display: "flex", flexDirection: "column", alignItems: "center", gap: 9,
         }}>
-          {/* Specials: one merged "train" — each segment is both its own load-progress
-              fill AND the tap target for that special. Fills left-to-right in load
-              order (Speed → Storm → Fireball); a segment only becomes tappable once
-              it (and everything before it) has fully loaded. */}
+          {/* Specials: one merged "train" — each of the first 3 segments is both its own
+              load-progress fill AND the tap target for that special. Fills left-to-right
+              in load order (Tower Defense → Speed → Tower Defense 2.0); a segment only
+              becomes tappable once it (and everything before it) has fully loaded —
+              tapping it casts instantly, no aiming/targeting step. A 4th segment (no
+              special of its own) visibly fills after that, banking reserve capacity —
+              enough that casting Tower Defense 2.0 from a full bar still leaves enough
+              to immediately follow up with Tower Defense. */}
           <div style={{
-            display: "flex", width: "100%", maxWidth: 420,
+            display: "flex", width: "100%", maxWidth: 460,
             borderRadius: 12, overflow: "hidden", border: "1px solid #3a4d72",
           }}>
             {(() => {
               const specials = [
-                { kind: "speed", icon: "💨", name: "Speed", secs: fireInfo.speedSecs,
-                  on: "#57E0C6", readyTxt: "#B8F5EA",
-                  aimBg: "rgba(87,224,198,0.32)", readyBg: "rgba(46,158,138,0.34)", fillTint: "#57E0C6" },
-                { kind: "storm", icon: "🌩️", name: "Storm", secs: fireInfo.stormSecs,
-                  on: "#8FB4FF", readyTxt: "#D2E0FF",
-                  aimBg: "rgba(140,175,255,0.32)", readyBg: "rgba(92,124,196,0.34)", fillTint: "#8FB4FF" },
-                { kind: "fire", icon: "🔥", name: "Fireball", secs: fireInfo.fireSecs,
-                  on: "#FF8C3C", readyTxt: "#FFD8B0",
-                  aimBg: "rgba(255,140,60,0.32)", readyBg: "rgba(228,83,74,0.32)", fillTint: "#FF8C3C" },
+                { kind: "storm", icon: "🛡️", name: "Tower Defense", secs: fireInfo.stormSecs, cd: fireInfo.stormCd,
+                  readyTxt: "#D2E0FF", readyBg: "rgba(92,124,196,0.34)", fillTint: "#8FB4FF" },
+                { kind: "speed", icon: "💨", name: "Speed", secs: fireInfo.speedSecs, cd: fireInfo.speedCd,
+                  readyTxt: "#B8F5EA", readyBg: "rgba(46,158,138,0.34)", fillTint: "#57E0C6" },
+                { kind: "fire", icon: "🪨", name: "Tower Defense 2.0", secs: fireInfo.fireSecs, cd: fireInfo.fireCd,
+                  readyTxt: "#FFC7B0", readyBg: "rgba(180,40,25,0.42)", fillTint: "#FF3B30" },
               ];
-              return specials.map((s, i) => {
-                const start = i * TRAIN_STAGE, end = (i + 1) * TRAIN_STAGE;
-                const fillPct = Math.max(0, Math.min(100, ((fireInfo.trainProgress - start) / TRAIN_STAGE) * 100));
-                const ready = s.secs <= 0;
-                const aiming = fireInfo.aiming === s.kind;
-                const pulsing = pulse[s.kind];
-                return (
-                  <button key={s.kind} className="special" onClick={() => toggleAim(s.kind)}
-                    disabled={!ready && !aiming}
-                    style={{
-                      position: "relative",
-                      fontFamily: "'Oxanium', sans-serif",
-                      flex: "1 1 0", minWidth: 0, minHeight: 52,
-                      padding: 0,
-                      border: "none",
-                      borderLeft: i > 0 ? "1px solid #3a4d72" : "none",
-                      background: "#1c2942",
-                      overflow: "hidden",
-                      cursor: ready || aiming ? "pointer" : "default",
-                      boxShadow: aiming ? `inset 0 0 0 2px ${s.on}` : "none",
-                      animation: pulsing ? "specialReady 0.6s ease-out" : "none",
-                    }}>
-                    {/* Fill — this stage's own load progress; covers 100% once ready */}
-                    <div style={{
-                      position: "absolute", left: 0, top: 0, bottom: 0,
-                      width: `${fillPct}%`,
-                      background: aiming ? s.aimBg : ready ? s.readyBg : s.fillTint + "38",
-                      transition: "width 0.1s linear, background 0.15s",
-                    }} />
-                    <div style={{
-                      position: "relative",
-                      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-                      gap: 2, height: "100%", padding: "6px 6px",
-                      color: aiming ? s.on : ready ? s.readyTxt : "#8a93ab",
-                    }}>
-                      <span style={{ fontSize: 18, lineHeight: 1 }}>{aiming ? "✕" : s.icon}</span>
-                      {aiming ? (
-                        <span style={{ fontSize: 11, fontWeight: 800 }}>Tap target</span>
-                      ) : ready ? (
-                        <span style={{ fontSize: 12, fontWeight: 800 }}>{s.name}</span>
-                      ) : (
-                        <span style={{ display: "flex", flexDirection: "column", alignItems: "center", lineHeight: 1.2 }}>
+              return [
+                ...specials.map((s, i) => {
+                  const start = i * TRAIN_STAGE;
+                  const fillPct = Math.max(0, Math.min(100, ((fireInfo.trainProgress - start) / TRAIN_STAGE) * 100));
+                  // Ready needs BOTH the train loaded AND this special's own 20s cooldown
+                  // clear. Show whichever is the binding constraint as the countdown.
+                  const ready = s.secs <= 0 && s.cd <= 0;
+                  const displaySecs = Math.max(s.secs, s.cd);
+                  const onCooldown = s.secs <= 0 && s.cd > 0;
+                  const pulsing = pulse[s.kind];
+                  return (
+                    <button key={s.kind} className="special" onClick={() => castPlayerSpecial(s.kind)}
+                      disabled={!ready}
+                      style={{
+                        position: "relative",
+                        fontFamily: "'Oxanium', sans-serif",
+                        flex: "1 1 0", minWidth: 0, minHeight: 52,
+                        padding: 0,
+                        border: "none",
+                        borderLeft: i > 0 ? "1px solid #3a4d72" : "none",
+                        background: "#1c2942",
+                        overflow: "hidden",
+                        cursor: ready ? "pointer" : "default",
+                        animation: pulsing ? "specialReady 0.6s ease-out" : "none",
+                      }}>
+                      {/* Fill — this stage's own load progress; covers 100% once ready.
+                          Once loaded but still on its own cooldown, the fill goes a flat
+                          muted grey instead of the special's color, so "loaded" and
+                          "cooling down" read as visually distinct states. */}
+                      <div style={{
+                        position: "absolute", left: 0, top: 0, bottom: 0,
+                        width: `${fillPct}%`,
+                        background: ready ? s.readyBg : onCooldown ? "rgba(138,147,171,0.4)" : s.fillTint + "38",
+                        transition: "width 0.1s linear, background 0.15s",
+                      }} />
+                      <div style={{
+                        position: "relative",
+                        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                        gap: 2, height: "100%", padding: "6px 6px",
+                        color: ready ? s.readyTxt : onCooldown ? "#C7CCDA" : "#8a93ab",
+                      }}>
+                        <span style={{ fontSize: 18, lineHeight: 1 }}>{onCooldown ? "⏳" : s.icon}</span>
+                        {ready ? (
                           <span style={{ fontSize: 12, fontWeight: 800 }}>{s.name}</span>
-                          <span style={{ fontSize: 10, fontWeight: 700, opacity: 0.85 }}>{s.secs}s</span>
-                        </span>
-                      )}
+                        ) : (
+                          <span style={{ display: "flex", flexDirection: "column", alignItems: "center", lineHeight: 1.2 }}>
+                            <span style={{ fontSize: 12, fontWeight: 800 }}>{s.name}</span>
+                            <span style={{ fontSize: 10, fontWeight: 700, opacity: 0.85 }}>{displaySecs}s</span>
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                  );
+                }),
+                (() => {
+                  // 4th segment: pure reserve capacity, no special of its own. Fills
+                  // from the 3rd special's threshold (60s) up to TRAIN_MAX (80s) —
+                  // banking this is what lets you follow up Tower Defense 2.0 with
+                  // Tower Defense right away instead of starting from empty.
+                  const start = 3 * TRAIN_STAGE;
+                  const fillPct = Math.max(0, Math.min(100, ((fireInfo.trainProgress - start) / TRAIN_STAGE) * 100));
+                  const full = fillPct >= 100;
+                  return (
+                    <div key="reserve"
+                      style={{
+                        position: "relative",
+                        fontFamily: "'Oxanium', sans-serif",
+                        flex: "1 1 0", minWidth: 0, minHeight: 52,
+                        borderLeft: "1px solid #3a4d72",
+                        background: "#1c2942",
+                        overflow: "hidden",
+                      }}>
+                      <div style={{
+                        position: "absolute", left: 0, top: 0, bottom: 0,
+                        width: `${fillPct}%`,
+                        background: full ? "rgba(138,147,171,0.4)" : "rgba(138,147,171,0.22)",
+                        transition: "width 0.1s linear, background 0.15s",
+                      }} />
+                      <div style={{
+                        position: "relative",
+                        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                        gap: 2, height: "100%", padding: "6px 6px",
+                        color: full ? "#C7CCDA" : "#6b7590",
+                      }}>
+                        <span style={{ fontSize: 16, lineHeight: 1 }}>🔋</span>
+                        <span style={{ fontSize: 10, fontWeight: 800 }}>Reserve</span>
+                      </div>
                     </div>
-                  </button>
-                );
-              });
+                  );
+                })(),
+              ];
             })()}
           </div>
 
