@@ -46,7 +46,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.100"; // bump by 0.001 each update
+const APP_VERSION = "0.101"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // level-1 cap; each upgrade adds 10
 const MAX_LEVEL = 4;         // cap: level 4 → 40 troops
@@ -885,11 +885,20 @@ function TowerConquest() {
     const targets = g.towers.filter((t) => !isTeam(t.owner));
     if (targets.length === 0) return;
 
+    const REVENGE_COOLDOWN = 8; // seconds before we'll consider retaking a castle we just lost
     const evalTarget = (t) => {
       const travel = dist(src, t) / UNIT_SPEED;
-      const garrison = Math.min(towerMax(t), t.troops + towerRegen(t) * travel);
+      // Reinforcements already inbound to this castle (from its owner, or anyone
+      // else hostile to us) count toward its defense — otherwise we'll throw an
+      // attack at a castle that's about to be re-garrisoned and lose for nothing.
+      const garrison = Math.min(towerMax(t), t.troops + towerRegen(t) * travel) + inc[t.id].enemy;
       return garrison - inc[t.id].team;             // don't pile onto what the team already has covered
     };
+    // A castle we just lost is a trap unless we can hit it hard: demand a much
+    // bigger margin during the cooldown window instead of pecking at it again
+    // the moment it looks weak.
+    const revengeMargin = (t) =>
+      (t.lostBy === pid && g.pulse - t.lostAt < REVENGE_COOLDOWN) ? 2 : 1.3;
 
     let best = null, bestScore = Infinity;
     for (const t of targets) {
@@ -902,14 +911,14 @@ function TowerConquest() {
     // Only worth attacking if the force sent clears the defense with real room to
     // spare — sending barely more than the garrison means the attack can fail to
     // arithmetic rounding, regen ticks, or reinforcements landing a beat early.
-    const minSend = need * 1.3;
+    const minSend = need * revengeMargin(best);
     const choice = [25, 50, ATTACK_CAP].find(
       (o) => Math.floor((src.troops * o) / 100) >= minSend
     );
 
     if (choice) { issueOrder(g, src, best, choice); return; }
 
-    // src alone can't clear 1.3x even at the 75% cap — pull in the nearest other
+    // src alone can't clear the bar even at the 75% cap — pull in the nearest other
     // castle that can spare troops so the combined force still hits the bar,
     // rather than either overcommitting one castle or attacking too thin.
     const primarySend = Math.floor(src.troops * ATTACK_CAP / 100);
@@ -948,6 +957,8 @@ function TowerConquest() {
     } else if (t.troops >= 1) {
       t.troops -= 1;
     } else {
+      t.lostBy = t.owner;      // who just lost this castle
+      t.lostAt = g.pulse;      // game clock at the moment of capture
       t.owner = u.owner;
       t.level = Math.max(1, t.level - 1); // a defeated castle is knocked down a level
       t.upgrading = null;                 // cancel any build in progress
