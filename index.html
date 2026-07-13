@@ -185,6 +185,7 @@ function soldierSprite(owner, frame, flip) {
 }
 
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
 // ================= Voronoi (half-plane clipping) =================
 function clipHalfPlane(poly, a, b) {
@@ -273,27 +274,37 @@ function generateMap(numPlayers, W, H, teamMode = false) {
       else break;
     }
     // One side holds owners 0 and 1 (side rotated by π holds 2 and 3).
+    // Start levels: home/extra slots are 1 or 2, chosen once per slot so every
+    // player (and their mirrored ally on the opposite side) gets the identical
+    // pattern — no one starts with an edge.
+    const homeLevel = pick([1, 2]);
+    const extraLevels = Array.from({ length: Math.max(0, pp - 1) }, () => pick([1, 2]));
     const sideTemplate = [];
     const allyAngs = [a0 - spread, a0 + spread];
     for (let a = 0; a < 2; a++) {
-      sideTemplate.push({ f: homeF, ang: allyAngs[a], owner: a });
+      sideTemplate.push({ f: homeF, ang: allyAngs[a], owner: a, level: homeLevel });
       for (let i = 0; i < pp - 1; i++) {
-        sideTemplate.push({ f: extraF, ang: allyAngs[a] + (i ? -0.18 : 0.18), owner: a });
+        sideTemplate.push({ f: extraF, ang: allyAngs[a] + (i ? -0.18 : 0.18), owner: a, level: extraLevels[i] });
       }
     }
     for (let k = 0; k < 2; k++) {
       for (const s of sideTemplate) {
         const p = ell(s.f, s.ang + k * Math.PI);
-        raw.push({ x: p.x, y: p.y, owner: s.owner + k * 2 });
+        raw.push({ x: p.x, y: p.y, owner: s.owner + k * 2, level: s.level });
       }
     }
-    // Neutrals along the mid-axis between the two teams (>= 2, symmetric)
+    // Neutrals along the mid-axis between the two teams (>= 2, symmetric).
+    // Each ring shares one level (1–3) so both teams face the same strength;
+    // level 4 is reserved for the single true-center tower.
+    const midLevel = pick([1, 2, 3]);
+    const extraMidLevel = pick([1, 2, 3]);
+    const centerLevel = pick([1, 2, 3, 4]);
     const mid = [a0 + Math.PI / 2, a0 - Math.PI / 2];
-    for (const ma of mid) { const p = ell(0.9, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL }); }
-    if (extraMid) for (const ma of mid) { const p = ell(0.44, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL }); }
-    if (centerNeutral) raw.push({ x: cx, y: cy, owner: NEUTRAL });
+    for (const ma of mid) { const p = ell(0.9, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: midLevel }); }
+    if (extraMid) for (const ma of mid) { const p = ell(0.44, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: extraMidLevel }); }
+    if (centerNeutral) raw.push({ x: cx, y: cy, owner: NEUTRAL, level: centerLevel });
 
-    const towers = raw.map((p, i) => ({ id: i, x: p.x, y: p.y, owner: p.owner, troops: START_TROOPS, level: 1, cell: [] }));
+    const towers = raw.map((p, i) => ({ id: i, x: p.x, y: p.y, owner: p.owner, troops: START_TROOPS, level: p.level || 1, cell: [] }));
     computeCells(towers, W, H);
     placeDefenders(towers);
     const neutrals = towers.filter((t) => t.owner === NEUTRAL).length;
@@ -326,39 +337,46 @@ function generateMap(numPlayers, W, H, teamMode = false) {
   for (let i = 0; i < pp - 1; i++) {
     template.push({ f: extraF, ang: extraAngs[i % extraAngs.length] });
   }
+  // Start levels: one slot (home or extra) gets a level once, then every
+  // player's wedge reuses the same per-slot level — nobody starts ahead.
+  const templateLevels = template.map(() => pick([1, 2]));
 
   const raw = [];
   for (let k = 0; k < n; k++) {
-    for (const s of template) {
+    template.forEach((s, j) => {
       const p = ell(s.f, a0 + k * step + s.ang);
-      raw.push({ x: p.x, y: p.y, owner: k });
-    }
+      raw.push({ x: p.x, y: p.y, owner: k, level: templateLevels[j] });
+    });
   }
 
-  // Equal neutral buffers between adjacent players, out near the rim
+  // Equal neutral buffers between adjacent players, out near the rim.
+  // Every ring shares one level (1–3) so whichever players border it face
+  // the same strength; level 4 is reserved for the single center tower.
+  const bufferedLevel = pick([1, 2, 3]);
   if (buffered) {
     for (let k = 0; k < n; k++) {
       const p = ell(0.92, a0 + (k + 0.5) * step);
-      raw.push({ x: p.x, y: p.y, owner: NEUTRAL });
+      raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: bufferedLevel });
     }
   }
   // Inner contested ring (one per wedge → symmetric)
+  const innerLevel = pick([1, 2, 3]);
   if (innerRing) {
     const inF = 0.4 + Math.random() * 0.1;
     const off = buffered ? 0.5 : 0.0;
     for (let k = 0; k < n; k++) {
       const p = ell(inF, a0 + (k + off) * step);
-      raw.push({ x: p.x, y: p.y, owner: NEUTRAL });
+      raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: innerLevel });
     }
   }
-  // Shared center
+  // Shared center — the only tower allowed to start at level 4
   if (centerNeutral || (!buffered && !innerRing)) {
-    raw.push({ x: cx, y: cy, owner: NEUTRAL });
+    raw.push({ x: cx, y: cy, owner: NEUTRAL, level: pick([1, 2, 3, 4]) });
   }
 
   const towers = raw.map((p, i) => ({
     id: i, x: p.x, y: p.y,
-    owner: p.owner, troops: START_TROOPS, level: 1,
+    owner: p.owner, troops: START_TROOPS, level: p.level || 1,
     cell: [],
   }));
 
