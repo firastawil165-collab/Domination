@@ -463,7 +463,7 @@ function TowerConquest() {
     let gameMode = gameModeIn;
     let playersResolved = players;
     if (gameModeIn === "random") {
-      gameMode = Math.random() < 0.5 ? "ffa" : "2v2";
+      gameMode = Math.random() < 0.75 ? "ffa" : "2v2";
       playersResolved = gameMode === "ffa" ? [2, 3, 4][Math.floor(Math.random() * 3)] : players;
     }
     const { W, H } = viewSize();
