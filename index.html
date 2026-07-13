@@ -46,6 +46,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
+const APP_VERSION = "0.100"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // level-1 cap; each upgrade adds 10
 const MAX_LEVEL = 4;         // cap: level 4 → 40 troops
@@ -1912,6 +1913,13 @@ function TowerConquest() {
           overflowY: "auto", WebkitOverflowScrolling: "touch", touchAction: "pan-y",
           background: "rgba(24,35,58,0.94)",
         }}>
+          <div style={{
+            position: "absolute", bottom: 10, right: 14,
+            fontSize: 11, letterSpacing: 1, color: "#4a5570",
+            fontFamily: "'IBM Plex Mono', monospace",
+          }}>
+            v{APP_VERSION}
+          </div>
           <div style={{
             minHeight: "100%", boxSizing: "border-box",
             display: "flex", alignItems: "center", justifyContent: "center",
