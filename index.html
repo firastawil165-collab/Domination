@@ -46,7 +46,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.127"; // bump by 0.001 each update
+const APP_VERSION = "0.128"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // level-1 cap; each upgrade adds 10
 const MAX_LEVEL = 4;         // cap: level 4 → 40 troops
@@ -2435,6 +2435,29 @@ function TowerConquest() {
               </div>
             </div>
           )}
+
+          {/* Commit % — overlaid on the map itself (translucent) instead of taking
+              up space in the panel below, so the battlefield gets more room. */}
+          <div style={{
+            position: "absolute", left: 0, right: 0, bottom: 10,
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
+            pointerEvents: "auto",
+          }}>
+            <span style={{ fontSize: 11, letterSpacing: 3, color: "rgba(138,147,171,0.75)" }}>COMMIT</span>
+            {[25, 50, 75, 100].map((p) => (
+              <button key={p} onClick={() => setPct(p)}
+                style={chip({
+                  fontFamily: "'IBM Plex Mono', monospace",
+                  padding: "8px 14px", fontSize: 13,
+                  borderColor: pct === p ? "rgba(255,210,63,0.75)" : "rgba(70,87,125,0.55)",
+                  color: pct === p ? "#FFD23F" : "rgba(232,235,242,0.85)",
+                  background: pct === p ? "rgba(255,210,63,0.16)" : "rgba(28,41,66,0.45)",
+                  backdropFilter: "blur(3px)",
+                })}>
+                {p}%
+              </button>
+            ))}
+          </div>
         </>
       )}
       </div>
@@ -2563,23 +2586,6 @@ function TowerConquest() {
                 })(),
               ];
             })()}
-          </div>
-
-          {/* Commit % row */}
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-            <span style={{ fontSize: 12, letterSpacing: 3, color: "#8a93ab" }}>COMMIT</span>
-            {[25, 50, 75, 100].map((p) => (
-              <button key={p} onClick={() => setPct(p)}
-                style={chip({
-                  fontFamily: "'IBM Plex Mono', monospace",
-                  padding: "9px 15px", fontSize: 14,
-                  borderColor: pct === p ? "#FFD23F" : "#46577d",
-                  color: pct === p ? "#FFD23F" : "#E8EBF2",
-                  background: pct === p ? "rgba(255,210,63,0.18)" : "#28385a",
-                })}>
-                {p}%
-              </button>
-            ))}
           </div>
         </div>
       )}
