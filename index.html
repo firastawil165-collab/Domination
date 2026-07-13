@@ -17,6 +17,11 @@
   /* Simple loading text shown until React mounts */
   #boot { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
           color: #8a93ab; font-family: 'Oxanium', sans-serif; letter-spacing: 3px; }
+  @keyframes specialReady {
+    0%   { box-shadow: 0 0 0 0 rgba(255,210,63,0.65); transform: scale(1); }
+    35%  { box-shadow: 0 0 0 10px rgba(255,210,63,0); transform: scale(1.08); }
+    100% { box-shadow: 0 0 0 0 rgba(255,210,63,0); transform: scale(1); }
+  }
 </style>
 <!-- React + Babel from CDN so this single file runs by just opening it -->
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
@@ -72,19 +77,28 @@ const towerMax = (t) => t.level * BASE_MAX;
 const towerRegen = (t) => REGEN_RATE * levelMult(t);
 const towerFireCd = (t) => ARROW_FIRE_CD / levelMult(t);
 
+// Specials share one "train" of loading capacity instead of independent cooldowns.
+// It loads in a fixed order — Speed, then Storm, then Fireball — each stage taking
+// TRAIN_STAGE seconds, so a special isn't available until every stage before it (and
+// its own) has loaded. Casting ANY special spends TRAIN_USE_COST off the shared total,
+// which can knock later-stage specials back out of "loaded" until it recharges past
+// their threshold again.
+const TRAIN_STAGE = 30;                  // seconds to load each stage
+const TRAIN_MAX = TRAIN_STAGE * 3;       // 90s = fully loaded (all three ready)
+const TRAIN_USE_COST = 60;               // seconds of progress spent per special use
+const SPECIAL_STAGE = { speed: 1, storm: 2, fire: 3 }; // load order, 1st/2nd/3rd
+const trainThreshold = (kind) => SPECIAL_STAGE[kind] * TRAIN_STAGE;
+
 // Fireball special
-const FIRE_COOLDOWN = 60;    // seconds between uses
 const FIRE_RADIUS = 78;      // blast kill radius
 const FIRE_TOWER_DMG = 3;    // unused now that fireball spares castle garrisons
 
 // Storm special
-const STORM_COOLDOWN = 45;   // seconds between uses
 const STORM_RADIUS = 96;     // area of effect
 const STORM_DURATION = 6;    // seconds the storm lingers
 const STORM_SLOW = 0.4;      // enemy speed multiplier inside the storm
 
 // Speed special — buffs your team's troops caught in the radius for the rest of their trip
-const SPEED_COOLDOWN = 45;
 const SPEED_RADIUS = 112;
 const SPEED_BOOST = 1.5;     // +50% movement speed
 
@@ -370,8 +384,33 @@ function TowerConquest() {
   const [hud, setHud] = useState([]);
   const [outcome, setOutcome] = useState(null);
   const [fireInfo, setFireInfo] = useState({
-    fireSecs: FIRE_COOLDOWN, stormSecs: STORM_COOLDOWN, speedSecs: SPEED_COOLDOWN, aiming: null,
+    fireSecs: TRAIN_STAGE * 3, stormSecs: TRAIN_STAGE * 2, speedSecs: TRAIN_STAGE * 1,
+    trainProgress: 0, aiming: null,
   });
+
+  // Pulse each special button once, right when it comes off cooldown.
+  const [pulse, setPulse] = useState({ fire: false, storm: false, speed: false });
+  const prevSecsRef = useRef({ fire: TRAIN_STAGE * 3, storm: TRAIN_STAGE * 2, speed: TRAIN_STAGE * 1 });
+  useEffect(() => {
+    const prev = prevSecsRef.current;
+    const next = { fire: fireInfo.fireSecs, storm: fireInfo.stormSecs, speed: fireInfo.speedSecs };
+    const justReady = {
+      fire: prev.fire > 0 && next.fire <= 0,
+      storm: prev.storm > 0 && next.storm <= 0,
+      speed: prev.speed > 0 && next.speed <= 0,
+    };
+    prevSecsRef.current = next;
+    if (justReady.fire || justReady.storm || justReady.speed) {
+      setPulse((p) => ({
+        fire: p.fire || justReady.fire,
+        storm: p.storm || justReady.storm,
+        speed: p.speed || justReady.speed,
+      }));
+      for (const k of ["fire", "storm", "speed"]) {
+        if (justReady[k]) setTimeout(() => setPulse((p) => ({ ...p, [k]: false })), 650);
+      }
+    }
+  }, [fireInfo.fireSecs, fireInfo.stormSecs, fireInfo.speedSecs]);
 
   useEffect(() => { pctRef.current = pct; }, [pct]);
 
@@ -427,9 +466,7 @@ function TowerConquest() {
       blasts: [],       // fireball explosions: {x, y, life, dur}
       storms: [],       // storm zones: {x, y, radius, life, dur}
       rings: [],        // one-shot cast rings (speed): {x, y, life, dur, color}
-      fireCd: FIRE_COOLDOWN,       // all specials start inactive and must charge up
-      stormCd: STORM_COOLDOWN,
-      speedCd: SPEED_COOLDOWN,
+      trainProgress: 0,            // player's shared special "train" — must load up from 0
       aiming: null,     // null | "fire" | "storm" — which special is being aimed
       pointer: { x: W / 2, y: H / 2 },
       uidSeq: 1,
@@ -439,11 +476,9 @@ function TowerConquest() {
       hover: null,
       eliminated: new Set(),
       aiTimers: Array.from({ length: nPlayers }, () => 1 + Math.random() * 1.5),
-      // Specials start fully on cooldown for the AI too (a little jitter so the
-      // AIs don't all fire on the same frame), never before the timer allows.
-      aiFireCd: Array.from({ length: nPlayers }, () => FIRE_COOLDOWN * (1 + Math.random() * 0.3)),
-      aiStormCd: Array.from({ length: nPlayers }, () => STORM_COOLDOWN * (1 + Math.random() * 0.3)),
-      aiSpeedCd: Array.from({ length: nPlayers }, () => SPEED_COOLDOWN * (1 + Math.random() * 0.3)),
+      // AI trains also start empty, with a little negative jitter so they don't
+      // all cross each loading threshold on the same frame.
+      aiTrain: Array.from({ length: nPlayers }, () => -Math.random() * 6),
       aiFxTimer: 0.6,
       over: false,
       pulse: 0,
@@ -548,24 +583,25 @@ function TowerConquest() {
   };
 
   // ----- Specials -----
+  const trainOf = (g, owner) => (owner === 0 ? g.trainProgress : g.aiTrain[owner]);
+
   const syncSpecials = (g) =>
     setFireInfo({
-      fireSecs: Math.ceil(g.fireCd), stormSecs: Math.ceil(g.stormCd),
-      speedSecs: Math.ceil(g.speedCd),
+      fireSecs: Math.ceil(Math.max(0, trainThreshold("fire") - g.trainProgress)),
+      stormSecs: Math.ceil(Math.max(0, trainThreshold("storm") - g.trainProgress)),
+      speedSecs: Math.ceil(Math.max(0, trainThreshold("speed") - g.trainProgress)),
+      trainProgress: g.trainProgress,
       aiming: g.aiming,
     });
 
-  // Where the cooldown for a given caster + kind lives.
+  // Casting any special spends TRAIN_USE_COST off that caster's shared train —
+  // may knock later-stage specials back out of "loaded" until it recharges.
   const setCd = (g, kind, owner) => {
-    const dur = { fire: FIRE_COOLDOWN, storm: STORM_COOLDOWN, speed: SPEED_COOLDOWN }[kind];
     if (owner === 0) {
-      if (kind === "fire") g.fireCd = dur;
-      else if (kind === "storm") g.stormCd = dur;
-      else g.speedCd = dur;
+      g.trainProgress = Math.max(0, g.trainProgress - TRAIN_USE_COST);
       g.aiming = null; syncSpecials(g);
     } else {
-      const arr = { fire: g.aiFireCd, storm: g.aiStormCd, speed: g.aiSpeedCd }[kind];
-      arr[owner] = dur;
+      g.aiTrain[owner] = Math.max(0, g.aiTrain[owner] - TRAIN_USE_COST);
     }
   };
 
@@ -599,9 +635,7 @@ function TowerConquest() {
     setCd(g, "speed", owner);
   }
 
-  const cdFor = (g, kind) =>
-    kind === "fire" ? g.fireCd : kind === "storm" ? g.stormCd : g.speedCd;
-  const readyFor = (g, kind) => cdFor(g, kind) <= 0;
+  const readyFor = (g, kind, owner = 0) => trainOf(g, owner) >= trainThreshold(kind);
 
   const toggleAim = (kind) => {
     const g = gameRef.current;
@@ -709,11 +743,11 @@ function TowerConquest() {
   function aiSpecials(g) {
     for (let pid = 1; pid < g.numPlayers; pid++) {
       if (g.eliminated.has(pid)) continue;
-      if (g.aiFireCd[pid] <= 0) {
+      if (g.aiTrain[pid] >= trainThreshold("fire")) {
         const spot = bestCluster(g, pid, FIRE_RADIUS);
         if (spot && spot.count >= 6) detonateFireball(g, spot.x, spot.y, pid);
       }
-      if (g.aiStormCd[pid] <= 0) {
+      if (g.aiTrain[pid] >= trainThreshold("storm")) {
         const spot = bestCluster(g, pid, STORM_RADIUS);
         if (spot && spot.count >= 5) {
           const nearHome = g.towers.some(
@@ -722,7 +756,7 @@ function TowerConquest() {
           if (spot.count >= 8 || nearHome) castStorm(g, spot.x, spot.y, pid);
         }
       }
-      if (g.aiSpeedCd[pid] <= 0) {
+      if (g.aiTrain[pid] >= trainThreshold("speed")) {
         const spot = bestFriendlyCluster(g, pid, SPEED_RADIUS);
         if (spot && spot.count >= 6) castSpeed(g, spot.x, spot.y, pid);
       }
@@ -1070,9 +1104,7 @@ function TowerConquest() {
             aiAct(g, pid);
             g.aiTimers[pid] = 1.1 + Math.random() * 1.6;
           }
-          if (g.aiFireCd[pid] > 0) g.aiFireCd[pid] = Math.max(0, g.aiFireCd[pid] - dt);
-          if (g.aiStormCd[pid] > 0) g.aiStormCd[pid] = Math.max(0, g.aiStormCd[pid] - dt);
-          if (g.aiSpeedCd[pid] > 0) g.aiSpeedCd[pid] = Math.max(0, g.aiSpeedCd[pid] - dt);
+          if (g.aiTrain[pid] < TRAIN_MAX) g.aiTrain[pid] = Math.min(TRAIN_MAX, g.aiTrain[pid] + dt);
         }
         // Evaluate AI specials a few times a second (keeps the cluster search cheap)
         g.aiFxTimer -= dt;
@@ -1097,10 +1129,8 @@ function TowerConquest() {
         if (!aliveTeams.has(myTeam)) { g.over = true; setOutcome("lose"); }
         else if (aliveTeams.size === 1) { g.over = true; setOutcome("win"); }
 
-        // Special cooldowns + effect animations
-        if (g.fireCd > 0) g.fireCd = Math.max(0, g.fireCd - dt);
-        if (g.stormCd > 0) g.stormCd = Math.max(0, g.stormCd - dt);
-        if (g.speedCd > 0) g.speedCd = Math.max(0, g.speedCd - dt);
+        // Special "train" progress + effect animations
+        if (g.trainProgress < TRAIN_MAX) g.trainProgress = Math.min(TRAIN_MAX, g.trainProgress + dt);
         for (let i = g.blasts.length - 1; i >= 0; i--) {
           g.blasts[i].life += dt;
           if (g.blasts[i].life >= g.blasts[i].dur) g.blasts.splice(i, 1);
@@ -1136,8 +1166,10 @@ function TowerConquest() {
         }
         setHud(stats);
         setFireInfo({
-          fireSecs: Math.ceil(g.fireCd), stormSecs: Math.ceil(g.stormCd),
-          speedSecs: Math.ceil(g.speedCd),
+          fireSecs: Math.ceil(Math.max(0, trainThreshold("fire") - g.trainProgress)),
+          stormSecs: Math.ceil(Math.max(0, trainThreshold("storm") - g.trainProgress)),
+          speedSecs: Math.ceil(Math.max(0, trainThreshold("speed") - g.trainProgress)),
+          trainProgress: g.trainProgress,
           aiming: g.aiming,
         });
       }
@@ -1863,17 +1895,18 @@ function TowerConquest() {
               Press anywhere in one of your regions and drag to any territory — release,
               and your troops march out. Every region — including neutral white territory —
               raises a defensive arrow tower that shoots any troops crossing it, so hurling
-              waves through hostile or unclaimed land bleeds you. Once a minute you
-              can call down a <span style={{ color: "#FF7A4A" }}>fireball</span> to incinerate
-              enemy troops caught on the field, or a <span style={{ color: "#9DBBFF" }}>storm</span>
-              {" "}(every 45s) to bog down enemy troops crossing it — hold them in your arrow
-              towers' fire. The enemy generals wield the same fireball and storm against you.
+              waves through hostile or unclaimed land bleeds you.
               Castles start at 3 troops and fill to 10. When a castle is full, double-tap it to
               upgrade: it costs half the garrison but raises the cap by 10 and makes the castle
               regenerate and fire arrows faster. Keep upgrading to build fortress strongholds.
-              Three specials charge up over the match: a <span style={{ color: "#FF7A4A" }}>fireball</span>,
-              a <span style={{ color: "#9DBBFF" }}>storm</span>, and a <span style={{ color: "#57E0C6" }}>speed</span>
-              {" "}burst that hastens your own troops. Players start evenly placed; take every rival's last castle to win.
+              Your three specials — <span style={{ color: "#57E0C6" }}>speed</span>,
+              {" "}<span style={{ color: "#9DBBFF" }}>storm</span>, and{" "}
+              <span style={{ color: "#FF7A4A" }}>fireball</span> — share one loading bar that
+              fills in that order, 30 seconds per stage: speed loads first, then storm, then
+              fireball needs all 90 seconds. Casting any special spends 60 seconds off the bar,
+              which can knock a later-stage special back out of "loaded" until it recharges
+              past its threshold again. The enemy generals load and cast on the same rules.
+              Players start evenly placed; take every rival's last castle to win.
             </p>
             )}
             <div style={{ display: "flex", gap: 32, justifyContent: "center", marginTop: 26, flexWrap: "wrap" }}>
@@ -2047,52 +2080,73 @@ function TowerConquest() {
           padding: "9px 12px calc(9px + env(safe-area-inset-bottom, 0px))",
           display: "flex", flexDirection: "column", alignItems: "center", gap: 9,
         }}>
-          {/* Specials row — in the panel, never overlapping the map */}
-          <div style={{ display: "flex", gap: 8, justifyContent: "center", width: "100%" }}>
+          {/* Specials: one merged "train" — each segment is both its own load-progress
+              fill AND the tap target for that special. Fills left-to-right in load
+              order (Speed → Storm → Fireball); a segment only becomes tappable once
+              it (and everything before it) has fully loaded. */}
+          <div style={{
+            display: "flex", width: "100%", maxWidth: 420,
+            borderRadius: 12, overflow: "hidden", border: "1px solid #3a4d72",
+          }}>
             {(() => {
               const specials = [
-                { kind: "fire", icon: "🔥", name: "Fireball", secs: fireInfo.fireSecs,
-                  on: "#FF8C3C", ready: "#E4534A", readyTxt: "#FFD8B0",
-                  aimBg: "rgba(255,140,60,0.28)", readyBg: "rgba(228,83,74,0.24)", glow: "rgba(255,110,50,0.55)" },
-                { kind: "storm", icon: "🌩️", name: "Storm", secs: fireInfo.stormSecs,
-                  on: "#8FB4FF", ready: "#5C7CC4", readyTxt: "#D2E0FF",
-                  aimBg: "rgba(140,175,255,0.28)", readyBg: "rgba(92,124,196,0.26)", glow: "rgba(120,160,255,0.5)" },
                 { kind: "speed", icon: "💨", name: "Speed", secs: fireInfo.speedSecs,
-                  on: "#57E0C6", ready: "#2E9E8A", readyTxt: "#B8F5EA",
-                  aimBg: "rgba(87,224,198,0.28)", readyBg: "rgba(46,158,138,0.26)", glow: "rgba(87,224,198,0.5)" },
+                  on: "#57E0C6", readyTxt: "#B8F5EA",
+                  aimBg: "rgba(87,224,198,0.32)", readyBg: "rgba(46,158,138,0.34)", fillTint: "#57E0C6" },
+                { kind: "storm", icon: "🌩️", name: "Storm", secs: fireInfo.stormSecs,
+                  on: "#8FB4FF", readyTxt: "#D2E0FF",
+                  aimBg: "rgba(140,175,255,0.32)", readyBg: "rgba(92,124,196,0.34)", fillTint: "#8FB4FF" },
+                { kind: "fire", icon: "🔥", name: "Fireball", secs: fireInfo.fireSecs,
+                  on: "#FF8C3C", readyTxt: "#FFD8B0",
+                  aimBg: "rgba(255,140,60,0.32)", readyBg: "rgba(228,83,74,0.32)", fillTint: "#FF8C3C" },
               ];
-              return specials.map((s) => {
+              return specials.map((s, i) => {
+                const start = i * TRAIN_STAGE, end = (i + 1) * TRAIN_STAGE;
+                const fillPct = Math.max(0, Math.min(100, ((fireInfo.trainProgress - start) / TRAIN_STAGE) * 100));
                 const ready = s.secs <= 0;
                 const aiming = fireInfo.aiming === s.kind;
+                const pulsing = pulse[s.kind];
                 return (
                   <button key={s.kind} className="special" onClick={() => toggleAim(s.kind)}
                     disabled={!ready && !aiming}
                     style={{
+                      position: "relative",
                       fontFamily: "'Oxanium', sans-serif",
-                      flex: "1 1 0", maxWidth: 150, minWidth: 0,
-                      display: "flex", alignItems: "center", gap: 7, justifyContent: "center",
-                      minHeight: 44,
-                      padding: "7px 10px",
-                      borderRadius: 12,
-                      border: `2px solid ${aiming ? s.on : ready ? s.ready : "#46577d"}`,
-                      fontSize: 14, fontWeight: 800,
+                      flex: "1 1 0", minWidth: 0, minHeight: 52,
+                      padding: 0,
+                      border: "none",
+                      borderLeft: i > 0 ? "1px solid #3a4d72" : "none",
+                      background: "#1c2942",
+                      overflow: "hidden",
                       cursor: ready || aiming ? "pointer" : "default",
-                      color: aiming ? s.on : ready ? s.readyTxt : "#8a93ab",
-                      background: aiming ? s.aimBg : ready ? s.readyBg : "#28385a",
-                      boxShadow: ready || aiming ? `0 0 12px ${s.glow}` : "none",
-                      transition: "background 0.15s, box-shadow 0.15s, border-color 0.15s",
+                      boxShadow: aiming ? `inset 0 0 0 2px ${s.on}` : "none",
+                      animation: pulsing ? "specialReady 0.6s ease-out" : "none",
                     }}>
-                    <span style={{ fontSize: 19, lineHeight: 1 }}>{aiming ? "✕" : s.icon}</span>
-                    {aiming ? (
-                      <span>Tap target</span>
-                    ) : ready ? (
-                      <span>{s.name}</span>
-                    ) : (
-                      <span style={{ display: "flex", flexDirection: "column", lineHeight: 1.15, alignItems: "flex-start" }}>
-                        <span>{s.name}</span>
-                        <span style={{ fontSize: 12, fontWeight: 600, opacity: 0.85 }}>{s.secs}s</span>
-                      </span>
-                    )}
+                    {/* Fill — this stage's own load progress; covers 100% once ready */}
+                    <div style={{
+                      position: "absolute", left: 0, top: 0, bottom: 0,
+                      width: `${fillPct}%`,
+                      background: aiming ? s.aimBg : ready ? s.readyBg : s.fillTint + "38",
+                      transition: "width 0.1s linear, background 0.15s",
+                    }} />
+                    <div style={{
+                      position: "relative",
+                      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                      gap: 2, height: "100%", padding: "6px 6px",
+                      color: aiming ? s.on : ready ? s.readyTxt : "#8a93ab",
+                    }}>
+                      <span style={{ fontSize: 18, lineHeight: 1 }}>{aiming ? "✕" : s.icon}</span>
+                      {aiming ? (
+                        <span style={{ fontSize: 11, fontWeight: 800 }}>Tap target</span>
+                      ) : ready ? (
+                        <span style={{ fontSize: 12, fontWeight: 800 }}>{s.name}</span>
+                      ) : (
+                        <span style={{ display: "flex", flexDirection: "column", alignItems: "center", lineHeight: 1.2 }}>
+                          <span style={{ fontSize: 12, fontWeight: 800 }}>{s.name}</span>
+                          <span style={{ fontSize: 10, fontWeight: 700, opacity: 0.85 }}>{s.secs}s</span>
+                        </span>
+                      )}
+                    </div>
                   </button>
                 );
               });
