@@ -46,7 +46,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.134"; // bump by 0.001 each update
+const APP_VERSION = "0.142"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // level-1 cap; each upgrade adds 10
 const MAX_LEVEL = 4;         // cap: level 4 → 40 troops
@@ -77,6 +77,33 @@ const BOULDER_SPEED = 200;   // px/sec — slower, heavier flight for Tower Defe
 // Battle-bed heat: tracks how hot the fighting is near the player's OWN castles,
 // decaying over time, and drives SoundEngine's ambient combat layer.
 const BATTLE_RADIUS = 140;     // px — combat within this range of a friendly castle counts
+const CASTLE_SCALE = 0.9;      // castle sprite size — 75% base, bumped up per feedback
+// Per-level castle geometry (grows more in width than height so tall castles
+// don't hide neighbours' troops). Each level has a distinct silhouette: L1
+// plain · L2 roofed · L3 wide roofed gatehouse · L4 grand. Shared between the
+// castle sprite (drawTowerSprite) and defenderPoint below, so the defense
+// tower's attach point always tracks the actual silhouette at any level.
+const CASTLE_LEVEL_CFG = {
+  1: { w: 34, keepH: 20, turretH: 24, roof: false, wide: false },
+  2: { w: 35, keepH: 21, turretH: 30, roof: true,  wide: false },
+  3: { w: 52, keepH: 30, turretH: 38, roof: false, wide: true },
+  4: { w: 58, keepH: 38, turretH: 46, roof: true,  wide: true, grand: true },
+};
+// Where a castle's defense tower actually lives now: the top of its own right
+// flanking turret — not a separate structure floating elsewhere in the region.
+// Returns world-space coordinates (for arrow origins etc.), already pulled in
+// to match the castle sprite's CASTLE_SCALE shrink. Recompute after any level
+// change (the turret moves as the silhouette grows).
+function defenderPoint(t) {
+  const cfg = CASTLE_LEVEL_CFG[Math.min(t.level || 1, 4)];
+  const groundY = t.y + 14;
+  const rx = t.x + cfg.w / 2;
+  const turretTop = groundY - cfg.turretH;
+  return {
+    x: t.x + (rx - t.x) * CASTLE_SCALE,
+    y: groundY + (turretTop - groundY) * CASTLE_SCALE,
+  };
+}
 const BATTLE_HEAT_MAX = 6;     // heat value that maps to full (1.0) intensity
 const BATTLE_HEAT_DECAY = 1.8; // heat lost per second with no new nearby kills
 
@@ -241,29 +268,13 @@ function computeCells(towers, W, H) {
   placeDefenders(towers);
 }
 
-function polyCentroid(poly) {
-  let a = 0, cx = 0, cy = 0;
-  for (let i = 0; i < poly.length; i++) {
-    const p = poly[i], q = poly[(i + 1) % poly.length];
-    const cross = p.x * q.y - q.x * p.y;
-    a += cross; cx += (p.x + q.x) * cross; cy += (p.y + q.y) * cross;
-  }
-  if (Math.abs(a) < 1e-6) return { x: poly[0].x, y: poly[0].y };
-  a *= 0.5;
-  return { x: cx / (6 * a), y: cy / (6 * a) };
-}
-
-// Place each region's defensive tower off to the side of its castle, inside the cell.
-// t.defs is an array so Tower Defense specials can bolt on extra temporary towers —
-// index 0 is always the permanent base defender.
+// Attach each region's defense tower directly to its castle's own right
+// turret (see defenderPoint) — it's not a separate structure elsewhere in
+// the cell anymore, so there's nothing further to compute here.
 function placeDefenders(towers) {
   for (const t of towers) {
-    const c = t.cell.length >= 3 ? polyCentroid(t.cell) : { x: t.x, y: t.y };
-    let dx = c.x - t.x, dy = c.y - t.y;
-    const len = Math.hypot(dx, dy);
-    if (len < 12) { dx = 40; dy = -18; } // degenerate/tiny cell: nudge up-right
-    else { const off = Math.min(58, Math.max(38, len * 0.85)); dx = (dx / len) * off; dy = (dy / len) * off; }
-    t.defs = [{ x: t.x + dx, y: t.y + dy, cd: Math.random() * ARROW_FIRE_CD }];
+    const p = defenderPoint(t);
+    t.defs = [{ x: p.x, y: p.y, cd: Math.random() * ARROW_FIRE_CD }];
   }
 }
 
@@ -444,6 +455,9 @@ const SoundEngine = (() => {
   const lastPlayed = {};
 
   const ensureCtx = () => {
+    // iOS can fully close a backgrounded PWA's AudioContext (not just suspend it) —
+    // resume() throws on a closed context, so start fresh instead.
+    if (ctx && ctx.state === "closed") { ctx = null; master = null; }
     if (!ctx) {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return null;
@@ -452,9 +466,27 @@ const SoundEngine = (() => {
       master.gain.value = 0.5;
       master.connect(ctx.destination);
     }
-    if (ctx.state === "suspended") ctx.resume();
+    // "suspended" is the common case, but iOS Safari also uses "interrupted" (phone
+    // call, Control Center, etc.) — resume() is the right call for any non-running
+    // state, and a stray resume() call while already running is a harmless no-op.
+    if (ctx.state !== "running") ctx.resume().catch(() => {});
     return ctx;
   };
+
+  // A locked screen or backgrounded PWA suspends the AudioContext on iOS, and it
+  // doesn't reliably resume itself once the app is foregrounded again — the game
+  // would otherwise stay silent until the player happened to trigger a sound from
+  // a fresh tap. Proactively try to resume the moment the app becomes visible again,
+  // covering the PWA-relaunched-from-home-screen case (pageshow) as well as simple
+  // tab/app switching (visibilitychange, focus).
+  const tryResume = () => { if (ctx && ctx.state !== "running") ctx.resume().catch(() => {}); };
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") tryResume();
+    });
+    window.addEventListener("pageshow", tryResume);
+    window.addEventListener("focus", tryResume);
+  }
 
   // Skip a call if the same sound name played too recently — stops dozens of
   // simultaneous arrow/clash kills from spawning dozens of overlapping nodes.
@@ -1373,11 +1405,13 @@ function TowerConquest() {
       t.troops = 1;
       if (g.tutorial && u.owner === 0) g.tutorialFlags.captured = true;
       // A captured castle loses any active Tower Defense / 2.0 buff — it doesn't
-      // carry over to benefit whoever just took it.
+      // carry over to benefit whoever just took it. It also just changed level,
+      // so re-attach the defender to the (now smaller) right turret.
       for (const d of t.defs) {
         d.rateMult = 1; d.rateExpiresAt = 0;
         d.boulder = false; d.boulderExpiresAt = 0;
       }
+      if (t.defs[0]) { const p = defenderPoint(t); t.defs[0].x = p.x; t.defs[0].y = p.y; }
       // Any half-finished orders leaving this tower are cancelled by the capture
       for (const o of g.orders) if (o.src === t.id && o.owner !== u.owner) o.remaining = 0;
     }
@@ -1413,6 +1447,12 @@ function TowerConquest() {
           if (t.upgrading.time >= t.upgrading.dur) {
             t.level += 1;
             t.upgrading = null;
+            // The defense tower lives on the right turret, which moves as the
+            // silhouette grows — keep it attached at the new level's position.
+            if (t.defs && t.defs[0]) {
+              const p = defenderPoint(t);
+              t.defs[0].x = p.x; t.defs[0].y = p.y;
+            }
             if (g.tutorial && t.owner === 0) g.tutorialFlags.upgraded = true;
             for (let i = 0; i < 14; i++) {
               const a = (i / 14) * Math.PI * 2;
@@ -1710,86 +1750,6 @@ function TowerConquest() {
   }, [screen]);
 
   // ================= Rendering =================
-  // A slim arrow tower that guards each region, neutrals included. Takes a specific
-  // defender from t.defs so a castle with Tower Defense bonuses can draw several.
-  // Drawn upright at the projected base — the translate/scale wrapper keeps
-  // the sprite vertical while it scales with zoom and depth.
-  function drawDefenseTower(ctx, t, def, g) {
-    if (!def) return;
-    const col = t.owner === NEUTRAL ? NEUTRAL_COLOR : FACTIONS[t.owner].color;
-    const B = proj(g, def.x, def.y);
-    ctx.save();
-    ctx.translate(B.x, B.y);
-    ctx.scale(B.s, B.s);
-    ctx.translate(-def.x, -def.y);
-    const x = def.x, y = def.y;
-    const lvl = t.level || 1;
-    const buff2 = def.rateMult === TOWER_DEF_RATE_MULT;  // Tower Defense (2x fire rate)
-    const boulder = !!def.boulder;                        // Tower Defense 2.0 (splash boulders)
-    const s = (1 + Math.min(lvl - 1, 6) * 0.09) * (boulder ? 1.15 : buff2 ? 1.15 : 1);
-    const w = 11 * s, h = 22 * s;
-
-    // Boulder mode gets a pulsing red menace-glow behind it; 2x fire rate gets a
-    // softer gold glow.
-    if (boulder) {
-      const pulseT = 0.5 + 0.5 * Math.sin(g.pulse * 6);
-      const glowR = w * (2.2 + 0.5 * pulseT);
-      const glow = ctx.createRadialGradient(x, y - h * 0.3, 0, x, y - h * 0.3, glowR);
-      glow.addColorStop(0, `rgba(255,40,20,${0.3 + 0.14 * pulseT})`);
-      glow.addColorStop(1, "rgba(255,40,20,0)");
-      ctx.fillStyle = glow;
-      ctx.beginPath(); ctx.arc(x, y - h * 0.3, glowR, 0, Math.PI * 2); ctx.fill();
-    } else if (buff2) {
-      const glowR = w * 1.8;
-      const glow = ctx.createRadialGradient(x, y - h * 0.3, 0, x, y - h * 0.3, glowR);
-      glow.addColorStop(0, "rgba(255,216,106,0.28)");
-      glow.addColorStop(1, "rgba(255,216,106,0)");
-      ctx.fillStyle = glow;
-      ctx.beginPath(); ctx.arc(x, y - h * 0.3, glowR, 0, Math.PI * 2); ctx.fill();
-    }
-
-    // Shadow
-    ctx.fillStyle = "rgba(0,0,0,0.3)";
-    ctx.beginPath();
-    ctx.ellipse(x, y + h / 2 + 2, w * 0.7, 4, 0, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Shaft — same silhouette as the base tower, just retinted: boulder mode goes
-    // dark scorched stone, the 2x buff gets a warm gold cast, unbuffed stays grey.
-    const grad = ctx.createLinearGradient(x - w / 2, 0, x + w / 2, 0);
-    if (boulder) {
-      grad.addColorStop(0, "#5A4438"); grad.addColorStop(0.5, "#3A2A22"); grad.addColorStop(1, "#5A4438");
-    } else if (buff2) {
-      grad.addColorStop(0, "#FFD86A"); grad.addColorStop(1, "#C98A2E");
-    } else {
-      grad.addColorStop(0, "#6E7AA0"); grad.addColorStop(1, "#3b4463");
-    }
-    ctx.fillStyle = grad;
-    ctx.fillRect(x - w / 2, y - h / 2, w, h);
-
-    // Crenellated top
-    ctx.fillStyle = boulder ? "#3A2A22" : buff2 ? "#FFD86A" : "#6E7AA0";
-    ctx.fillRect(x - w / 2, y - h / 2 - 3, 3, 4);
-    ctx.fillRect(x - 1.5, y - h / 2 - 3, 3, 4);
-    ctx.fillRect(x + w / 2 - 3, y - h / 2 - 3, 3, 4);
-
-    // Arrow slit — boulder mode glows hot ember-orange instead of faction color
-    if (boulder) {
-      const slitGlow = ctx.createRadialGradient(x, y - h / 2 + 8, 0, x, y - h / 2 + 8, 6);
-      slitGlow.addColorStop(0, "rgba(255,190,110,0.95)");
-      slitGlow.addColorStop(0.6, "rgba(255,90,30,0.75)");
-      slitGlow.addColorStop(1, "rgba(255,90,30,0)");
-      ctx.fillStyle = slitGlow;
-      ctx.beginPath(); ctx.arc(x, y - h / 2 + 8, 6, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = "#FFD8A0";
-      ctx.fillRect(x - 1.5, y - h / 2 + 4, 3, 8);
-    } else {
-      ctx.fillStyle = col;
-      ctx.fillRect(x - 1.5, y - h / 2 + 4, 3, 8);
-    }
-    ctx.restore();
-  }
-
   // The troop counter for a castle. Drawn in its own pass AFTER every building,
   // so a tall castle in front can never paint over a counter behind it. The plate
   // sits just below the castle base; projected and scaled like the sprite.
@@ -1830,32 +1790,48 @@ function TowerConquest() {
     const x = t.x, y = t.y;
     const lvl = t.level || 1;
 
-    // ---- Per-level castle geometry (grows more in width than height so tall
-    // castles don't hide neighbours' troops). Each level has a distinct
-    // silhouette: L1 plain · L2 roofed · L3 wide roofed gatehouse · L4 grand. ----
-    const cfg = {
-      1: { w: 34, keepH: 20, turretH: 24, roof: false, wide: false },
-      2: { w: 35, keepH: 21, turretH: 30, roof: true,  wide: false },
-      3: { w: 52, keepH: 30, turretH: 38, roof: false, wide: true },
-      4: { w: 58, keepH: 38, turretH: 46, roof: true,  wide: true, grand: true },
-    }[Math.min(lvl, 4)];
+    // Per-level castle geometry — see CASTLE_LEVEL_CFG (shared with defenderPoint).
+    const cfg = CASTLE_LEVEL_CFG[Math.min(lvl, 4)];
     const baseW = cfg.w;
     const turretW = 9;
     const keepW = baseW - turretW * 2 + 4;
     const groundY = y + 14;                 // fixed base; castle grows upward
     const turretTop = groundY - cfg.turretH;
     const keepTop = groundY - cfg.keepH;
-    const totalH = Math.max(cfg.keepH, cfg.turretH) + (cfg.grand ? 12 : 0);
+
+    // The right turret is this castle's defense tower — when Tower Defense or
+    // 2.0 is active it visibly grows (not just recolors), so the buff reads at
+    // a glance from across the map. Computed up here so the enlarged turret is
+    // included in the castle's overall bounding box (totalH) below.
+    const def = t.defs && t.defs[0];
+    const buff2 = def && def.rateMult === TOWER_DEF_RATE_MULT; // Tower Defense (2x fire rate)
+    const boulder = def && !!def.boulder;                       // Tower Defense 2.0 (splash boulders)
+    const buffed = buff2 || boulder;
+    const rTurretW = turretW * (buffed ? 1.45 : 1);
+    const rTurretH = cfg.turretH * (buffed ? 1.25 : 1);
+    const rTurretTop = groundY - rTurretH;
+
+    const totalH = Math.max(cfg.keepH, rTurretH) + (cfg.grand ? 12 : 0);
     const topY = groundY - totalH;
     const midY = groundY - totalH / 2;
 
-    const stone = (cxx, cw, top, ht) => {
+    // Shrink the whole castle (and everything drawn relative to it below —
+    // shadow, team ring, body, flags, drag/hover rings, upgrade dust) around
+    // its ground point, so it still sits in the same spot in its region but
+    // takes up less room where neighbouring castles' sprites would otherwise
+    // start overlapping.
+    ctx.translate(x, groundY);
+    ctx.scale(CASTLE_SCALE, CASTLE_SCALE);
+    ctx.translate(-x, -groundY);
+
+    const stone = (cxx, cw, top, ht, colors) => {
       const grad = ctx.createLinearGradient(cxx - cw / 2, 0, cxx + cw / 2, 0);
-      grad.addColorStop(0, "#6E7AA0"); grad.addColorStop(0.55, "#525d80"); grad.addColorStop(1, "#3b4463");
+      const [c1, c2, c3] = colors || ["#6E7AA0", "#525d80", "#3b4463"];
+      grad.addColorStop(0, c1); grad.addColorStop(0.55, c2); grad.addColorStop(1, c3);
       ctx.fillStyle = grad; ctx.fillRect(cxx - cw / 2, top, cw, ht);
     };
-    const crenellate = (cxx, cw, top) => {
-      ctx.fillStyle = "#6E7AA0"; const m = cw / 5;
+    const crenellate = (cxx, cw, top, color) => {
+      ctx.fillStyle = color || "#6E7AA0"; const m = cw / 5;
       for (let i = 0; i < 3; i++) ctx.fillRect(cxx - cw / 2 + i * 2 * m, top - 4, m, 4);
     };
     const roofTop = (cxx, cw, top, hh) => {
@@ -1923,10 +1899,56 @@ function TowerConquest() {
       else crenellate(x, keepW, keepTop);
     }
 
-    // Flanking turrets
+    // Right turret doubles as this castle's defense tower — there's no separate
+    // structure floating elsewhere in the region anymore. An active buff isn't
+    // just a small accent: the whole turret grows (rTurretW/H, set above) and
+    // is fully recolored, plus a glow halo behind it, so the effect reads at a
+    // glance instead of requiring a close look for a tinted window.
+    const defMidY = rTurretTop + rTurretH * 0.42;
+    if (boulder) {
+      const pulseT = 0.5 + 0.5 * Math.sin(g.pulse * 6);
+      const glowR = rTurretW * (2.4 + 0.6 * pulseT);
+      const glow = ctx.createRadialGradient(rx, defMidY, 0, rx, defMidY, glowR);
+      glow.addColorStop(0, `rgba(255,40,20,${0.36 + 0.16 * pulseT})`);
+      glow.addColorStop(1, "rgba(255,40,20,0)");
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(rx, defMidY, glowR, 0, Math.PI * 2); ctx.fill();
+    } else if (buff2) {
+      const glowR = rTurretW * 1.9;
+      const glow = ctx.createRadialGradient(rx, defMidY, 0, rx, defMidY, glowR);
+      glow.addColorStop(0, "rgba(255,216,106,0.34)");
+      glow.addColorStop(1, "rgba(255,216,106,0)");
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(rx, defMidY, glowR, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // Left turret — always plain stone
     stone(lx, turretW, turretTop, cfg.turretH);
-    stone(rx, turretW, turretTop, cfg.turretH);
-    crenellate(lx, turretW, turretTop); crenellate(rx, turretW, turretTop);
+    crenellate(lx, turretW, turretTop);
+
+    // Right turret — dark scorched stone for boulder mode, gold for the 2x
+    // fire-rate buff, plain stone otherwise. Crenellations match.
+    const rColors = boulder ? ["#8A5A44", "#5A4438", "#3A2A22"] : buff2 ? ["#FFE38A", "#FFD86A", "#C98A2E"] : null;
+    const rCren = boulder ? "#3A2A22" : buff2 ? "#FFD86A" : undefined;
+    stone(rx, rTurretW, rTurretTop, rTurretH, rColors);
+    crenellate(rx, rTurretW, rTurretTop, rCren);
+
+    // Arrow slit on the right turret — ember glow while boulder mode is
+    // active, otherwise faction color (buff2's gold already covers the whole
+    // turret, so the slit there just stays faction-colored for contrast).
+    if (boulder) {
+      const slitGlow = ctx.createRadialGradient(rx, defMidY, 0, rx, defMidY, 6);
+      slitGlow.addColorStop(0, "rgba(255,190,110,0.95)");
+      slitGlow.addColorStop(0.6, "rgba(255,90,30,0.75)");
+      slitGlow.addColorStop(1, "rgba(255,90,30,0)");
+      ctx.fillStyle = slitGlow;
+      ctx.beginPath(); ctx.arc(rx, defMidY, 6, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#FFD8A0";
+      ctx.fillRect(rx - 1.4, defMidY - 3.5, 2.8, 7);
+    } else {
+      ctx.fillStyle = col;
+      ctx.fillRect(rx - 1.2, defMidY - 3, 2.4, 6);
+    }
 
     // Windows per level
     if (lvl === 2) win(x, keepTop + cfg.keepH * 0.34, 4, cfg.keepH * 0.32);
@@ -2113,19 +2135,9 @@ function TowerConquest() {
       ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x + H, H); ctx.stroke();
     }
 
-    // Arrow-tower coverage rings — a true circle centered on the castle itself
-    for (const t of g.towers) {
-      if (!t.defs || !t.defs.length) continue;
-      const C = P(t.x, t.y);
-      const lvl = t.level || 1;
-      const ringA = Math.min(0x66, 0x22 + (lvl - 1) * 0x10);
-      const col = t.owner === NEUTRAL ? NEUTRAL_COLOR : FACTIONS[t.owner].color;
-      ctx.strokeStyle = col + ringA.toString(16).padStart(2, "0");
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.arc(C.x, C.y, ARROW_RANGE * C.s, 0, Math.PI * 2);
-      ctx.stroke();
-    }
+    // Tower range rings were removed entirely per feedback (they were previously
+    // drawn here as a dashed circle around each defended castle). ARROW_RANGE
+    // still governs actual defense-tower reach — just no longer visualized.
 
     // "This is you" ring — a pulsing yellow marching-ants circle around the
     // player's own castles, only for the first few seconds of a match, so it's
@@ -2258,17 +2270,12 @@ function TowerConquest() {
     }
 
 
-    // Buildings — depth-sorted by world y so nearer sprites overlap farther ones
-    const sprites = [];
-    for (const t of g.towers) {
-      if (t.defs) for (const d of t.defs) sprites.push({ wy: d.y, def: true, t, d });
-      sprites.push({ wy: t.y, def: false, t });
-    }
+    // Buildings — depth-sorted by world y so nearer sprites overlap farther ones.
+    // The defense tower is drawn as part of the castle sprite now (see
+    // drawTowerSprite's right turret), so there's just one entry per castle.
+    const sprites = g.towers.map((t) => ({ wy: t.y, t }));
     sprites.sort((a, b) => a.wy - b.wy);
-    for (const s of sprites) {
-      if (s.def) drawDefenseTower(ctx, s.t, s.d, g);
-      else drawTowerSprite(ctx, s.t, g);
-    }
+    for (const s of sprites) drawTowerSprite(ctx, s.t, g);
 
     // Smoke at the base of any castle currently under attack — only once hostile
     // troops are actually at the walls, not while they're still marching in.
