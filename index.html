@@ -46,7 +46,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.133"; // bump by 0.001 each update
+const APP_VERSION = "0.134"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // level-1 cap; each upgrade adds 10
 const MAX_LEVEL = 4;         // cap: level 4 → 40 troops
@@ -620,11 +620,17 @@ const TUTORIAL_STEPS = [
   },
   {
     title: "Special: Tower Defense",
-    body: "Your specials share one loading bar. Tower Defense makes every one of your towers fire twice as fast for a while. We've charged the bar for you.",
+    body: "Your specials share one loading bar. Tower Defense makes every one of your towers fire twice as fast for a while. We've charged the bar for you — and sent a few scouts your way so you can watch it work.",
     hint: "Tap the Tower Defense segment to cast it",
     waitFor: "castStorm",
     settleFor: TOWER_DEF_DURATION, // hold the step open for the buff's full active window
-    onEnter: (g) => { g.trainProgress = trainThreshold("storm"); },
+    tutorialWave: true, // keep a small enemy trickle marching at the player for the demo
+    onEnter: (g) => {
+      g.trainProgress = trainThreshold("storm");
+      const attacker = g.towers.filter((t) => t.owner === 1)
+        .sort((a, b) => a.troops - b.troops)[0];
+      if (attacker) attacker.troops = towerMax(attacker); // make sure it has plenty to send
+    },
   },
   {
     title: "Special: Speed",
@@ -636,11 +642,17 @@ const TUTORIAL_STEPS = [
   },
   {
     title: "Special: Tower Defense 2.0",
-    body: "The strongest special — your towers lob splash-damage boulders, each hit crushing up to 4 enemies. Fully charged for you.",
+    body: "The strongest special — your towers lob splash-damage boulders, each hit crushing up to 4 enemies. Fully charged for you — and we've sent a few scouts your way so you can watch it work.",
     hint: "Tap the Tower Defense 2.0 segment to cast it",
     waitFor: "castFire",
     settleFor: TOWER_DEF_DURATION, // hold the step open for the buff's full active window
-    onEnter: (g) => { g.trainProgress = trainThreshold("fire"); },
+    tutorialWave: true, // keep a small enemy trickle marching at the player for the demo
+    onEnter: (g) => {
+      g.trainProgress = trainThreshold("fire");
+      const attacker = g.towers.filter((t) => t.owner === 1)
+        .sort((a, b) => a.troops - b.troops)[0];
+      if (attacker) attacker.troops = towerMax(attacker); // make sure it has plenty to send
+    },
   },
   {
     title: "You're Ready",
@@ -652,6 +664,8 @@ const TUTORIAL_STEPS = [
 function applyTutorialStep(g, idx) {
   const step = TUTORIAL_STEPS[idx];
   g.tutorialWaitStart = null; // reset the settle timer for the new step
+  g.tutorialAutoWave = !!(step && step.tutorialWave); // only the two TD steps keep the enemy trickle going
+  g.tutorialWaveTimer = 0; // fire the first wave immediately if this step wants one
   if (step && step.onEnter) step.onEnter(g);
 }
 
@@ -777,6 +791,10 @@ function TowerConquest() {
       tutorialWaitStart: null, // g.pulse timestamp when the current step's waitFor flag tripped;
                                // null while still waiting. Used to hold the step open for
                                // `settleFor` seconds so the player actually sees the effect.
+      tutorialAutoWave: false, // true only during the two Tower Defense steps — keeps a small
+                               // enemy trickle marching at the player so the buffed tower has
+                               // something to fire on (see tutorialSendWave).
+      tutorialWaveTimer: 0,
       orders: [],       // gradual deployments: {owner, src, dst, remaining, accum}
       units: [],        // individual soldiers: {owner, x, y, dst, off, speed, phase}
       arrows: [],       // defensive-tower shots: {x, y, targetUid, owner, life}
@@ -891,6 +909,30 @@ function TowerConquest() {
     const n = Math.floor(src.troops * (percent / 100));
     if (n < 1) return;
     g.orders.push({ owner: src.owner, src: src.id, dst: dst.id, remaining: n, accum: 0 });
+  }
+
+  // Tutorial-only: during the two Tower Defense special steps, the AI's own
+  // attack decisions aren't reliable enough to guarantee something is actually
+  // marching at the player's castle when they tap the special — so we force a
+  // small, steady trickle from the nearest AI castle instead. Fixed troop count
+  // (not a percent) keeps every wave small: enough for the buffed tower to
+  // visibly fire on, never enough to threaten the castle.
+  function tutorialSendWave(g) {
+    const enemyTowers = g.towers.filter((t) => t.owner === 1);
+    const mine = g.towers.filter((t) => t.owner === 0);
+    if (!enemyTowers.length || !mine.length) return;
+    let attacker = null, target = null, bd = Infinity;
+    for (const e of enemyTowers) {
+      for (const m of mine) {
+        const d = dist(e, m);
+        if (d < bd) { bd = d; attacker = e; target = m; }
+      }
+    }
+    if (!attacker || attacker.troops < 2) return;
+    const n = Math.min(3, Math.floor(attacker.troops) - 1);
+    if (n < 1) return;
+    attacker.troops -= n;
+    g.orders.push({ owner: attacker.owner, src: attacker.id, dst: target.id, remaining: n, accum: 0 });
   }
 
   // ----- Input: press a tower, drag to the target, release to march -----
@@ -1567,6 +1609,17 @@ function TowerConquest() {
             g.aiTimers[pid] = 1.1 + Math.random() * 1.6;
           }
           if (g.aiTrain[pid] < TRAIN_MAX) g.aiTrain[pid] = Math.min(TRAIN_MAX, g.aiTrain[pid] + dt);
+        }
+
+        // Tutorial-only: keep a small enemy trickle marching at the player during
+        // the Tower Defense special steps, so casting the special always has
+        // something nearby for the buffed tower to actually fire on.
+        if (g.tutorial && g.tutorialAutoWave) {
+          g.tutorialWaveTimer -= dt;
+          if (g.tutorialWaveTimer <= 0) {
+            tutorialSendWave(g);
+            g.tutorialWaveTimer = 2.5 + Math.random() * 1.5;
+          }
         }
         // Evaluate AI specials a few times a second (keeps the cluster search cheap)
         g.aiFxTimer -= dt;
