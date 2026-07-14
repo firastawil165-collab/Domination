@@ -46,7 +46,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.128"; // bump by 0.001 each update
+const APP_VERSION = "0.133"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // level-1 cap; each upgrade adds 10
 const MAX_LEVEL = 4;         // cap: level 4 → 40 troops
@@ -575,6 +575,86 @@ const SoundEngine = (() => {
   };
 })();
 
+// ================= Tutorial =================
+// A short, scripted playthrough: pauses to explain a mechanic, then unpauses
+// and waits for the player to actually try it (detected via g.tutorialFlags,
+// set at the relevant action sites) before auto-pausing again for the next
+// step. Steps without `waitFor` are pure explanation — the Continue button
+// just advances immediately. `onEnter` runs once when a step becomes current,
+// used to hand the player whatever resource they need to try the mechanic
+// (a topped-off castle, a charged specials train) without waiting for it.
+// `waitFor` flags are set at the moment the OUTCOME is actually visible (a
+// capture completing, an upgrade finishing) — not at the moment the player
+// merely presses the button — and `settleFor` (seconds) then holds the step
+// open that much longer after the flag trips, so the player has time to
+// watch the effect play out (a buff's full active duration, etc.) before the
+// tutorial auto-pauses and moves on.
+const TUTORIAL_STEPS = [
+  {
+    title: "Welcome, General",
+    body: "This is a private training ground — your rival here can never defeat you. Take your time and try everything.",
+    waitFor: null,
+  },
+  {
+    title: "Sending Troops",
+    body: "Drag from any castle you own to another region — enemy, neutral, or your own — to send troops there.",
+    hint: "Drag from one of your castles onto a rival castle to capture it",
+    waitFor: "captured",
+    settleFor: 1.5, // let them see the castle actually flip to their color
+  },
+  {
+    title: "Regions & Defense Towers",
+    body: "Every region, even neutral ones, has a defense tower that shoots hostile troops crossing it. Marching through enemy or unclaimed land costs you soldiers, so plan your routes.",
+    waitFor: null,
+  },
+  {
+    title: "Upgrading Castles",
+    body: "When a castle is full, double-tap it to upgrade — it costs half the garrison but raises capacity and speeds up regen and firing. We've topped one off for you.",
+    hint: "Double-tap your topped-off castle to upgrade it",
+    waitFor: "upgraded",
+    settleFor: 1.5, // let them see the new level before moving on
+    onEnter: (g) => {
+      const mine = g.towers.find((t) => t.owner === 0);
+      if (mine) mine.troops = towerMax(mine);
+    },
+  },
+  {
+    title: "Special: Tower Defense",
+    body: "Your specials share one loading bar. Tower Defense makes every one of your towers fire twice as fast for a while. We've charged the bar for you.",
+    hint: "Tap the Tower Defense segment to cast it",
+    waitFor: "castStorm",
+    settleFor: TOWER_DEF_DURATION, // hold the step open for the buff's full active window
+    onEnter: (g) => { g.trainProgress = trainThreshold("storm"); },
+  },
+  {
+    title: "Special: Speed",
+    body: "Speed instantly boosts every marching soldier on your team for the rest of their trip. Charged and ready.",
+    hint: "Tap the Speed segment to cast it",
+    waitFor: "castSpeed",
+    settleFor: 3, // brief pause so the pulse and any boosted march are visible
+    onEnter: (g) => { g.trainProgress = trainThreshold("speed"); },
+  },
+  {
+    title: "Special: Tower Defense 2.0",
+    body: "The strongest special — your towers lob splash-damage boulders, each hit crushing up to 4 enemies. Fully charged for you.",
+    hint: "Tap the Tower Defense 2.0 segment to cast it",
+    waitFor: "castFire",
+    settleFor: TOWER_DEF_DURATION, // hold the step open for the buff's full active window
+    onEnter: (g) => { g.trainProgress = trainThreshold("fire"); },
+  },
+  {
+    title: "You're Ready",
+    body: "That covers territory, upgrades, and specials. In a real match rivals fight back and can beat you — this one just can't. Good luck out there, General.",
+    waitFor: null,
+    final: true,
+  },
+];
+function applyTutorialStep(g, idx) {
+  const step = TUTORIAL_STEPS[idx];
+  g.tutorialWaitStart = null; // reset the settle timer for the new step
+  if (step && step.onEnter) step.onEnter(g);
+}
+
 // ================= Component =================
 function TowerConquest() {
   const canvasRef = useRef(null);
@@ -584,7 +664,7 @@ function TowerConquest() {
   const [screen, setScreen] = useState("menu");
   const [numPlayers, setNumPlayers] = useState(2);
   const [mode, setMode] = useState("ffa"); // "ffa" | "2v2"
-  const [showHelp, setShowHelp] = useState(false); // instructions collapsed by default
+  const [showHelp, setShowHelp] = useState(false); // "How to play" modal, closed by default
   const [pct, setPct] = useState(100);
   const pctRef = useRef(100);
   const [hud, setHud] = useState([]);
@@ -599,6 +679,9 @@ function TowerConquest() {
   useEffect(() => { SoundEngine.setMuted(!soundOn); }, [soundOn]);
   const [showPlayers, setShowPlayers] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [tutorialStep, setTutorialStep] = useState(0);
+  const tutorialStepRef = useRef(0);
+  useEffect(() => { tutorialStepRef.current = tutorialStep; }, [tutorialStep]);
   const [fireInfo, setFireInfo] = useState({
     fireSecs: TRAIN_STAGE * 3, stormSecs: TRAIN_STAGE * 1, speedSecs: TRAIN_STAGE * 2,
     fireCd: 0, stormCd: 0, speedCd: 0,
@@ -663,13 +746,13 @@ function TowerConquest() {
     H: mapRef.current ? mapRef.current.clientHeight : window.innerHeight,
   });
 
-  const startGame = useCallback((players, gameModeIn = "ffa") => {
+  const startGame = useCallback((players, gameModeIn = "ffa", tutorial = false) => {
     SoundEngine.resume();
     SoundEngine.click();
     // "random" isn't a real mode — resolve it to one of the concrete modes now.
-    let gameMode = gameModeIn;
-    let playersResolved = players;
-    if (gameModeIn === "random") {
+    let gameMode = tutorial ? "ffa" : gameModeIn;
+    let playersResolved = tutorial ? 2 : players;
+    if (!tutorial && gameModeIn === "random") {
       gameMode = Math.random() < 0.75 ? "ffa" : "2v2";
       playersResolved = gameMode === "ffa" ? [2, 3, 4][Math.floor(Math.random() * 3)] : players;
     }
@@ -679,11 +762,21 @@ function TowerConquest() {
     // Team assignment: FFA → everyone their own team; 2v2 → {0,1} vs {2,3}
     const teams = teamMode ? [0, 0, 1, 1] : Array.from({ length: nPlayers }, (_, i) => i);
     const map = generateMap(nPlayers, W, H, teamMode);
+    if (tutorial) {
+      // Keep the tutorial forgiving: every castle except the player's own starts at
+      // level 1, so nothing the player attacks is beefed up beyond the baseline.
+      for (const t of map.towers) if (t.owner !== 0) t.level = 1;
+    }
     gameRef.current = {
       W, H,
       towers: map.towers,
       teams,
       mode: gameMode,
+      tutorial,          // if true, the player can never lose (see outcome check)
+      tutorialFlags: { captured: false, upgraded: false, castStorm: false, castSpeed: false, castFire: false },
+      tutorialWaitStart: null, // g.pulse timestamp when the current step's waitFor flag tripped;
+                               // null while still waiting. Used to hold the step open for
+                               // `settleFor` seconds so the player actually sees the effect.
       orders: [],       // gradual deployments: {owner, src, dst, remaining, accum}
       units: [],        // individual soldiers: {owner, x, y, dst, off, speed, phase}
       arrows: [],       // defensive-tower shots: {x, y, targetUid, owner, life}
@@ -708,9 +801,16 @@ function TowerConquest() {
       pulse: 0,
     };
     setOutcome(null);
-    setPaused(false);
     setShowPlayers(false);
     setMenuOpen(false);
+    setShowHelp(false);
+    if (tutorial) {
+      applyTutorialStep(gameRef.current, 0);
+      setTutorialStep(0);
+      setPaused(true);
+    } else {
+      setPaused(false);
+    }
     setScreen("play");
   }, []);
 
@@ -929,6 +1029,11 @@ function TowerConquest() {
     if (kind === "speed") castSpeed(g, 0);
     else if (kind === "storm") castTowerDefense(g, 0, "storm");
     else if (kind === "fire") castTowerDefense(g, 0, "fire");
+    if (g.tutorial) {
+      if (kind === "speed") g.tutorialFlags.castSpeed = true;
+      else if (kind === "storm") g.tutorialFlags.castStorm = true;
+      else if (kind === "fire") g.tutorialFlags.castFire = true;
+    }
   };
 
   const handleDown = (e) => {
@@ -973,7 +1078,12 @@ function TowerConquest() {
       const now = performance.now();
       if (g.lastTap && g.lastTap.id === src.id && now - g.lastTap.time < 350) {
         g.lastTap = null;
-        if (canStartUpgrade(src)) startUpgrade(g, src);
+        if (canStartUpgrade(src)) {
+          startUpgrade(g, src);
+          // Tutorial's "upgraded" flag fires when the build actually finishes
+          // (see the upgrade-build-completion block in the game loop), not here —
+          // otherwise the tutorial would advance before the player sees the result.
+        }
       } else {
         g.lastTap = { id: src.id, time: now };
       }
@@ -982,6 +1092,9 @@ function TowerConquest() {
 
     if (target && target.id !== src.id && src.owner === 0) {
       issueOrder(g, src, target, pctRef.current);
+      // Tutorial's "captured" flag fires on actual capture (see unitArrives),
+      // not on order-issue, so the step waits until the player really takes
+      // the castle rather than advancing the instant they let go of the drag.
     }
   };
 
@@ -1131,7 +1244,21 @@ function TowerConquest() {
       // else hostile to us) count toward its defense — otherwise we'll throw an
       // attack at a castle that's about to be re-garrisoned and lose for nothing.
       const garrison = Math.min(towerMax(t), t.troops + towerRegen(t) * travel) + inc[t.id].enemy;
-      return garrison - inc[t.id].team;             // don't pile onto what the team already has covered
+      const rawNeed = garrison - inc[t.id].team; // don't pile onto what the team already has covered
+      // The defense tower itself whittles down an approaching force — every shot
+      // it gets off during the march (and during the time it takes to actually
+      // deploy that many troops, since orders trickle out at SPAWN_RATE) kills
+      // one attacker before they ever reach the garrison fight. Without this the
+      // AI routinely sends forces that look sufficient on paper but arrive short
+      // by exactly the number of arrows fired en route — the classic "attacked
+      // and lost for nothing" case.
+      if (t.defs && t.defs.length && rawNeed > 0) {
+        const fireCd = towerFireCd(t) / (t.defs[0].rateMult || 1);
+        const spawnDuration = rawNeed / SPAWN_RATE;
+        const shots = (travel + spawnDuration) / fireCd;
+        return rawNeed + shots;
+      }
+      return rawNeed;
     };
     // A castle we just lost is a trap unless we can hit it hard: demand a much
     // bigger margin during the cooldown window instead of pecking at it again
@@ -1202,6 +1329,7 @@ function TowerConquest() {
       t.level = Math.max(1, t.level - 1); // a defeated castle is knocked down a level
       t.upgrading = null;                 // cancel any build in progress
       t.troops = 1;
+      if (g.tutorial && u.owner === 0) g.tutorialFlags.captured = true;
       // A captured castle loses any active Tower Defense / 2.0 buff — it doesn't
       // carry over to benefit whoever just took it.
       for (const d of t.defs) {
@@ -1243,6 +1371,7 @@ function TowerConquest() {
           if (t.upgrading.time >= t.upgrading.dur) {
             t.level += 1;
             t.upgrading = null;
+            if (g.tutorial && t.owner === 0) g.tutorialFlags.upgraded = true;
             for (let i = 0; i < 14; i++) {
               const a = (i / 14) * Math.PI * 2;
               g.sparks.push({ x: t.x + Math.cos(a) * 22, y: t.y + Math.sin(a) * 22, life: 0.55, color: "#FFD86A" });
@@ -1459,8 +1588,26 @@ function TowerConquest() {
         for (let pid = 0; pid < g.numPlayers; pid++)
           if (!g.eliminated.has(pid)) aliveTeams.add(g.teams[pid]);
         const myTeam = g.teams[0];
-        if (!aliveTeams.has(myTeam)) { g.over = true; setOutcome("lose"); SoundEngine.lose(); SoundEngine.stopBattle(); }
+        if (!g.tutorial && !aliveTeams.has(myTeam)) { g.over = true; setOutcome("lose"); SoundEngine.lose(); SoundEngine.stopBattle(); }
         else if (aliveTeams.size === 1) { g.over = true; setOutcome("win"); SoundEngine.win(); SoundEngine.stopBattle(); }
+
+        // Tutorial: once the requested action is detected, hold the step open
+        // for `settleFor` seconds so the player actually sees the effect (a
+        // capture completing, a buff's full active window), then auto-pause
+        // and advance to the next step (which may hand the player a fresh
+        // resource via onEnter). Steps with no waitFor only advance via the
+        // overlay's own Continue button, not here.
+        if (g.tutorial) {
+          const tStep = TUTORIAL_STEPS[tutorialStepRef.current];
+          if (tStep && tStep.waitFor && g.tutorialFlags[tStep.waitFor]) {
+            if (g.tutorialWaitStart == null) g.tutorialWaitStart = g.pulse;
+            if (g.pulse - g.tutorialWaitStart >= (tStep.settleFor || 0)) {
+              const next = tutorialStepRef.current + 1;
+              if (TUTORIAL_STEPS[next]) { applyTutorialStep(g, next); setTutorialStep(next); }
+              setPaused(true);
+            }
+          }
+        }
 
         // Special "train" progress + effect animations
         if (g.trainProgress < TRAIN_MAX) g.trainProgress = Math.min(TRAIN_MAX, g.trainProgress + dt);
@@ -2162,7 +2309,7 @@ function TowerConquest() {
               DOMIN<span style={{ color: "#FFD23F" }}>ATION</span>
             </h1>
             <button
-              onClick={() => setShowHelp((v) => !v)}
+              onClick={() => { SoundEngine.click(); setShowHelp(true); }}
               style={chip({
                 marginTop: 6,
                 padding: "6px 14px",
@@ -2171,29 +2318,49 @@ function TowerConquest() {
                 color: "#8a93ab",
                 borderColor: "#3a4d72",
               })}>
-              {showHelp ? "Hide instructions ▲" : "How to play ▼"}
+              How to play
             </button>
+
             {showHelp && (
-            <ul style={{
-              color: "#8a93ab", lineHeight: 1.6, fontSize: 15, marginTop: 16,
-              textAlign: "left", paddingLeft: 20, display: "flex", flexDirection: "column", gap: 8,
-            }}>
-              <li>Drag from your region to any territory to send troops.</li>
-              <li>Every region — even neutral ones — has a defense tower that shoots troops crossing it.</li>
-              <li>Castles hold up to 10 troops. Double-tap a full castle to upgrade it: costs half its troops, adds +10 capacity, and speeds up regen and firing.</li>
-              <li>
-                Your specials — <span style={{ color: "#9DBBFF" }}>tower defense</span> (every
-                castle's tower fires 2x as fast), <span style={{ color: "#57E0C6" }}>speed</span> (boosts
-                every marching soldier), and <span style={{ color: "#FF7A4A" }}>tower defense 2.0</span> (towers
-                lob boulders instead of arrows — each hit crushes up to 4 enemies, the strongest of
-                the three) — trigger instantly with one tap and share one loading bar. The 1st, 2nd,
-                and 3rd specials cost 20s, 40s, and 60s of that bar to cast. Each special also has
-                its own 20s cooldown, so you can't spam the same one back to back. Every soldier that
-                dies anywhere on the field — yours, an ally's, or an enemy's — refills 0.1s for
-                everyone. Enemies play by the same rules.
-              </li>
-              <li>Everyone starts even. Take every rival's last castle to win.</li>
-            </ul>
+              <div onClick={() => setShowHelp(false)}
+                style={{
+                  position: "fixed", inset: 0, zIndex: 100,
+                  background: "rgba(6,9,16,0.75)", backdropFilter: "blur(2px)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  padding: 20,
+                }}>
+                <div onClick={(e) => e.stopPropagation()}
+                  style={{
+                    background: "#182238", border: "1px solid #3a4d72", borderRadius: 14,
+                    padding: 24, maxWidth: 480, maxHeight: "80vh", overflowY: "auto",
+                    boxShadow: "0 12px 40px rgba(0,0,0,0.5)", textAlign: "left",
+                  }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+                    <div style={{ fontSize: 17, fontWeight: 800, color: "#E8EEF9" }}>How to play</div>
+                    <button onClick={() => setShowHelp(false)}
+                      style={{ background: "none", border: "none", color: "#8a93ab", fontSize: 20, cursor: "pointer", lineHeight: 1 }}>
+                      ✕
+                    </button>
+                  </div>
+                  <ul style={{
+                    color: "#8a93ab", lineHeight: 1.6, fontSize: 15,
+                    paddingLeft: 20, display: "flex", flexDirection: "column", gap: 8, margin: 0,
+                  }}>
+                    <li>Drag from your region to any territory to send troops.</li>
+                    <li>Every region — even neutral ones — has a defense tower that shoots troops crossing it.</li>
+                    <li>Castles hold up to 10 troops. Double-tap a full castle to upgrade it: costs half its troops, adds +10 capacity, and speeds up regen and firing.</li>
+                    <li>
+                      Specials share one loading bar and fire instantly with a tap —
+                      no aiming. <span style={{ color: "#9DBBFF" }}>Tower defense</span> doubles
+                      your fire rate, <span style={{ color: "#57E0C6" }}>speed</span> boosts every
+                      marching soldier, and <span style={{ color: "#FF7A4A" }}>tower defense 2.0</span> fires
+                      boulders that splash nearby enemies. Deaths on the battlefield refill the
+                      bar for everyone. Enemies play by the same rules.
+                    </li>
+                    <li>Everyone starts even. Take every rival's last castle to win.</li>
+                  </ul>
+                </div>
+              </div>
             )}
             <div style={{ display: "flex", gap: 32, justifyContent: "center", marginTop: 26, flexWrap: "wrap" }}>
               <div>
@@ -2254,6 +2421,15 @@ function TowerConquest() {
               })}>
               Deploy
             </button>
+            <div style={{ marginTop: 10 }}>
+              <button onClick={() => startGame(2, "ffa", true)}
+                style={chip({
+                  padding: "8px 16px", fontSize: 13,
+                  color: "#8a93ab", borderColor: "#3a4d72",
+                })}>
+                🎓 Play Tutorial
+              </button>
+            </div>
           </div>
           </div>
         </div>
@@ -2387,8 +2563,8 @@ function TowerConquest() {
             </div>
           </div>
 
-          {/* Paused overlay */}
-          {paused && !outcome && (
+          {/* Paused overlay (regular games only — tutorial has its own below) */}
+          {paused && !outcome && !gameRef.current?.tutorial && (
             <div style={{
               position: "absolute", inset: 0,
               display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
@@ -2401,6 +2577,58 @@ function TowerConquest() {
                 style={chip({ background: "#FFD23F", color: "#0A0E18", fontWeight: 800, border: "1px solid #FFD23F", padding: "9px 20px", fontSize: 14 })}>
                 Resume
               </button>
+            </div>
+          )}
+
+          {/* Tutorial step overlay — explains the current step, then either lets
+              the player try it live (unpausing) or advances straight to the next
+              explanation. */}
+          {paused && !outcome && gameRef.current?.tutorial && TUTORIAL_STEPS[tutorialStep] && (
+            <div style={{
+              position: "absolute", inset: 0,
+              display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+              gap: 14, background: "rgba(10,14,24,0.88)", backdropFilter: "blur(2px)",
+              padding: 24, textAlign: "center",
+            }}>
+              <div style={{ fontSize: 11, letterSpacing: 3, color: "#FFD23F", fontWeight: 800 }}>
+                TUTORIAL · {tutorialStep + 1} / {TUTORIAL_STEPS.length}
+              </div>
+              <div style={{ fontSize: 21, fontWeight: 800, color: "#E8EEF9", maxWidth: 420 }}>
+                {TUTORIAL_STEPS[tutorialStep].title}
+              </div>
+              <div style={{ fontSize: 14, color: "#B8C0D6", maxWidth: 420, lineHeight: 1.6 }}>
+                {TUTORIAL_STEPS[tutorialStep].body}
+              </div>
+              <button onClick={() => {
+                SoundEngine.click();
+                const step = TUTORIAL_STEPS[tutorialStep];
+                if (step.final) { setScreen("menu"); return; }
+                if (step.waitFor) { setPaused(false); }
+                else {
+                  const next = tutorialStep + 1;
+                  if (TUTORIAL_STEPS[next]) { applyTutorialStep(gameRef.current, next); setTutorialStep(next); }
+                }
+              }}
+                style={chip({ background: "#FFD23F", color: "#0A0E18", fontWeight: 800, border: "1px solid #FFD23F", padding: "10px 22px", fontSize: 15 })}>
+                {TUTORIAL_STEPS[tutorialStep].final ? "Finish Tutorial" : TUTORIAL_STEPS[tutorialStep].waitFor ? "Try it →" : "Continue →"}
+              </button>
+              <button onClick={() => { SoundEngine.click(); setScreen("menu"); }}
+                style={{ background: "none", border: "none", color: "#5c6580", fontSize: 12, textDecoration: "underline", cursor: "pointer" }}>
+                Skip tutorial
+              </button>
+            </div>
+          )}
+
+          {/* Live hint while unpaused and waiting for the player to try the
+              current step's mechanic. */}
+          {!paused && gameRef.current?.tutorial && TUTORIAL_STEPS[tutorialStep]?.hint && (
+            <div style={{
+              position: "absolute", top: 60, left: "50%", transform: "translateX(-50%)",
+              background: "rgba(28,41,66,0.9)", border: "1px solid #FFD23F", borderRadius: 10,
+              padding: "8px 16px", fontSize: 13, color: "#FFD23F", fontWeight: 700,
+              pointerEvents: "none", zIndex: 30, textAlign: "center", maxWidth: "80%",
+            }}>
+              🎯 {TUTORIAL_STEPS[tutorialStep].hint}
             </div>
           )}
 
