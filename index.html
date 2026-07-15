@@ -46,10 +46,10 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.146"; // bump by 0.001 each update
+const APP_VERSION = "0.151"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
-const BASE_MAX = 10;         // level-1 cap; each upgrade adds 10
-const MAX_LEVEL = 4;         // cap: level 4 → 40 troops
+const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
+const MAX_LEVEL = 4;         // cap: level 4 → 50 troops
 const MAX_CASTLES = 12;      // hard cap on total towers (players + neutrals) per map
 const REGEN_RATE = 0.6;      // troops/sec at level 1 (grows with level)
 const UNIT_SPEED = 72;       // base px/sec per soldier
@@ -69,6 +69,89 @@ const PERSP = 0.3;           // nearer rows render slightly wider/larger
 // viewport vertically — the "maximum zoom out" framing, locked in.
 const CAM_ZOOM = 1 / TILT;
 
+// ----- Unified lighting + terrain texture (graphics pass) -----
+// A single light direction is shared by the terrain base texture and every
+// castle's shadow/gradient, so the whole board reads as one lit scene instead
+// of separately-designed layers. Upper-left, matching the existing castle
+// stone gradients (lighter on the left edge).
+const LIGHT_DIR = { x: -0.55, y: -0.8 };
+
+// Smooth (smoothstep-interpolated) value noise — deliberately NOT per-pixel
+// random static, which reads as pixelated/grainy once blended in. Built once
+// into a cached terrain texture (see buildTerrainTexture), never per-frame.
+function noiseHash(x, y) { const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123; return s - Math.floor(s); }
+function smoothNoise(x, y, scale) {
+  x /= scale; y /= scale;
+  const x0 = Math.floor(x), y0 = Math.floor(y), x1 = x0 + 1, y1 = y0 + 1;
+  const sx = x - x0, sy = y - y0;
+  const fx = sx * sx * (3 - 2 * sx), fy = sy * sy * (3 - 2 * sy);
+  const n00 = noiseHash(x0, y0), n10 = noiseHash(x1, y0), n01 = noiseHash(x0, y1), n11 = noiseHash(x1, y1);
+  const ix0 = n00 + fx * (n10 - n00), ix1 = n01 + fx * (n11 - n01);
+  return ix0 + fy * (ix1 - ix0);
+}
+
+// Top-level mirror of the component's proj() — needed here because
+// buildTerrainTexture runs outside the component closure. Must stay in sync
+// with proj() in the component (camera: tilted board + mild perspective).
+function projPoint(g, wx, wy) {
+  const dy = wy - g.H / 2;
+  const p = 1 + (dy / g.H) * PERSP;
+  return { x: g.W / 2 + (wx - g.W / 2) * CAM_ZOOM * p, y: g.H / 2 + dy * CAM_ZOOM * TILT };
+}
+
+// Builds (or rebuilds) the cached terrain base: organic noise mottling +
+// a soft directional-light gradient + a blurred ambient-occlusion shadow
+// along every cell border, all baked once into an offscreen canvas at CSS
+// pixel resolution (not downsampled — that's what caused the pixelated
+// look in the earlier concept). Rebuilt only on map generation and resize,
+// never per frame, so it costs nothing during actual play.
+function buildTerrainTexture(g) {
+  const W = Math.max(1, Math.round(g.W)), H = Math.max(1, Math.round(g.H));
+  const tex = document.createElement("canvas");
+  tex.width = W; tex.height = H;
+  const tc = tex.getContext("2d");
+  const img = tc.createImageData(W, H);
+  const baseR = 58, baseG = 74, baseB = 108;
+  const data = img.data;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const n1 = smoothNoise(x, y, 90);
+      const n2 = smoothNoise(x + 500, y + 500, 34);
+      const shade = (n1 - 0.5) * 10 + (n2 - 0.5) * 5;
+      const lightAmt = ((x / W) * (-LIGHT_DIR.x) + (y / H) * (-LIGHT_DIR.y)) * 16;
+      const idx = (y * W + x) * 4;
+      data[idx] = Math.max(0, Math.min(255, baseR + shade + lightAmt));
+      data[idx + 1] = Math.max(0, Math.min(255, baseG + shade + lightAmt));
+      data[idx + 2] = Math.max(0, Math.min(255, baseB + shade + lightAmt));
+      data[idx + 3] = 255;
+    }
+  }
+  tc.putImageData(img, 0, 0);
+
+  // Soft AO band along every real cell border — reuses the exact same Voronoi
+  // polygons the game already computed, just stroked wide + blurred instead
+  // of the old crisp 1px hatching, so borders read as gentle seams.
+  tc.save();
+  tc.filter = "blur(7px)";
+  tc.strokeStyle = "rgba(0,0,0,0.4)";
+  tc.lineWidth = 9;
+  for (const t of g.towers) {
+    if (!t.cell || t.cell.length < 3) continue;
+    const p0 = projPoint(g, t.cell[0].x, t.cell[0].y);
+    tc.beginPath();
+    tc.moveTo(p0.x, p0.y);
+    for (let i = 1; i < t.cell.length; i++) {
+      const pi = projPoint(g, t.cell[i].x, t.cell[i].y);
+      tc.lineTo(pi.x, pi.y);
+    }
+    tc.closePath();
+    tc.stroke();
+  }
+  tc.restore();
+
+  g.terrainTex = tex;
+}
+
 // Defensive arrow towers
 const ARROW_RANGE = 92;      // px, how far a defense tower can shoot
 const ARROW_FIRE_CD = 1.3;   // seconds between shots at level 1 (faster when upgraded)
@@ -80,15 +163,23 @@ const BOULDER_SPEED = 200;   // px/sec — slower, heavier flight for Tower Defe
 const BATTLE_RADIUS = 140;     // px — combat within this range of a friendly castle counts
 const CASTLE_SCALE = 0.9;      // castle sprite size — 75% base, bumped up per feedback
 // Per-level castle geometry (grows more in width than height so tall castles
-// don't hide neighbours' troops). Each level has a distinct silhouette: L1
-// plain · L2 roofed · L3 wide roofed gatehouse · L4 grand. Shared between the
-// castle sprite (drawTowerSprite) and defenderPoint below, so the defense
-// tower's attach point always tracks the actual silhouette at any level.
+// don't hide neighbours' troops). Rebalanced this session: the old level 1
+// tier was dropped entirely (old level 2 now IS level 1 — every level's
+// underlying stats/geometry shifted down one slot), and a new top tier was
+// added above the old level 4. Each level has a distinct silhouette: L1
+// roofed · L2 wide roofed gatehouse · L3 grand · L4 grand, larger still.
+// Levels 3 and 4 share the "grand" rendering path (drawTowerSprite) at
+// different sizes — they're told apart primarily by size and by the flag
+// count (see nFlags in drawTowerSprite: one flag per level, always derived
+// from the level number, never hardcoded — that's what broke when two
+// levels first started sharing a shape). Shared between the castle sprite
+// (drawTowerSprite) and defenderPoint below, so the defense tower's attach
+// point always tracks the actual silhouette at any level.
 const CASTLE_LEVEL_CFG = {
-  1: { w: 34, keepH: 20, turretH: 24, roof: false, wide: false },
-  2: { w: 35, keepH: 21, turretH: 30, roof: true,  wide: false },
-  3: { w: 52, keepH: 30, turretH: 38, roof: false, wide: true },
-  4: { w: 58, keepH: 38, turretH: 46, roof: true,  wide: true, grand: true },
+  1: { w: 35, keepH: 21, turretH: 30, roof: true,  wide: false },
+  2: { w: 52, keepH: 30, turretH: 38, roof: false, wide: true },
+  3: { w: 58, keepH: 38, turretH: 46, roof: true,  wide: true, grand: true },
+  4: { w: 66, keepH: 46, turretH: 54, roof: true,  wide: true, grand: true },
 };
 // Where a castle's defense tower actually lives now: the top of its own right
 // flanking turret — not a separate structure floating elsewhere in the region.
@@ -108,10 +199,14 @@ function defenderPoint(t) {
 const BATTLE_HEAT_MAX = 6;     // heat value that maps to full (1.0) intensity
 const BATTLE_HEAT_DECAY = 1.8; // heat lost per second with no new nearby kills
 
-// Per-castle scaling by upgrade level (level 1→4 multipliers: 1, 1.3, 1.6, 2)
-const LEVEL_MULT = [1, 1.6, 2.2, 3]; // level 4 = 3x level 1 regen & fire rate
+// Per-castle scaling by level. Rebalanced this session: old level 1 was
+// dropped (old level 2's multiplier, 1.6, is now level 1's), and the new top
+// tier (level 4) is set to exactly 3x the new level 1's rate, per spec.
+const LEVEL_MULT = [1.6, 2.2, 3, 4.8]; // level 4 = 3x level 1 (1.6 x 3 = 4.8) regen & fire rate
 const levelMult = (t) => LEVEL_MULT[Math.min(t.level, MAX_LEVEL) - 1];
-const towerMax = (t) => t.level * BASE_MAX;
+// +1 in the formula is what shifts the whole cap ladder up one BASE_MAX step
+// now that the old level-1 (10-cap) tier is gone: level 1→20, 2→30, 3→40, 4→50.
+const towerMax = (t) => (t.level + 1) * BASE_MAX;
 const towerRegen = (t) => REGEN_RATE * levelMult(t);
 const towerFireCd = (t) => ARROW_FIRE_CD / levelMult(t);
 
@@ -187,9 +282,18 @@ function soldierSprite(owner, frame, flip) {
   const cx = SOLDIER_W / 2;
   const footY = SOLDIER_H - 0.5;
 
-  // Ground shadow (baked into the sprite)
+  // Light-consistent shading: the shadow side in WORLD space is opposite
+  // LIGHT_DIR. The sprite's own mirror transform (the flip above) inverts
+  // local x, so which local side that lands on has to compensate for `flip`
+  // or left- and right-facing soldiers would appear lit from different
+  // directions. Reused below for both the shadow offset and the tunic shade.
+  const litLeft = LIGHT_DIR.x < 0;
+  const shadowOnLocalRight = flip ? litLeft : !litLeft;
+  const shadowOffX = (shadowOnLocalRight ? 1 : -1) * 1.2;
+
+  // Ground shadow (baked into the sprite), nudged toward the shadow side
   x.fillStyle = "rgba(0,0,0,0.28)";
-  x.beginPath(); x.ellipse(cx, footY, 3.3, 1.1, 0, 0, Math.PI * 2); x.fill();
+  x.beginPath(); x.ellipse(cx + shadowOffX, footY, 3.3, 1.1, 0, 0, Math.PI * 2); x.fill();
 
   // Legs — two frames of a marching step
   x.strokeStyle = "#2b3350";
@@ -210,6 +314,10 @@ function soldierSprite(owner, frame, flip) {
   x.strokeStyle = f.dim;
   x.lineWidth = 0.8;
   x.beginPath(); x.roundRect(cx - 2.4, footY - 8.6, 4.8, 4.8, 1.2); x.fill(); x.stroke();
+  // Shadow-side shade — same light source as the shadow offset above, so the
+  // tunic reads as lit from one side instead of flat faction-color fill.
+  x.fillStyle = "rgba(0,0,0,0.16)";
+  x.fillRect(shadowOnLocalRight ? cx : cx - 2.4, footY - 8.6, 2.4, 4.8);
   // Belt
   x.fillStyle = "rgba(0,0,0,0.25)";
   x.fillRect(cx - 2.4, footY - 5.2, 4.8, 0.9);
@@ -875,6 +983,7 @@ function TowerConquest() {
       units: [],        // individual soldiers: {owner, x, y, dst, off, speed, phase}
       arrows: [],       // defensive-tower shots: {x, y, targetUid, owner, life}
       sparks: [],       // clash effects: {x, y, life, color}
+      puffs: [],        // soft impact dust puffs at clash/boulder-hit points: {x, y, age, dur}
       rings: [],        // one-shot cast rings (speed + tower defense): {x, y, life, dur, color}
       trainProgress: 0,            // player's shared special "train" — must load up from 0
       lastCast: {},     // "{owner}_{kind}" -> g.pulse of last successful cast, for cooldowns
@@ -894,6 +1003,7 @@ function TowerConquest() {
       over: false,
       pulse: 0,
     };
+    buildTerrainTexture(gameRef.current);
     setOutcome(null);
     setShowPlayers(false);
     setMenuOpen(false);
@@ -970,8 +1080,10 @@ function TowerConquest() {
           for (const rg of g.rings) { rg.x *= sx; rg.y *= sy; }
           if (g.pointer) { g.pointer.x *= sx; g.pointer.y *= sy; }
           for (const s of g.sparks) { s.x *= sx; s.y *= sy; }
+          for (const p of g.puffs) { p.x *= sx; p.y *= sy; }
           g.W = W; g.H = H;
           computeCells(g.towers, W, H);
+          buildTerrainTexture(g);
         }
       }
     };
@@ -981,6 +1093,17 @@ function TowerConquest() {
   }, [screen]);
 
   // ----- Orders -----
+  // Percentage is deliberately computed from the garrison as it reads RIGHT
+  // NOW, not from some "troops not already promised elsewhere" pool. That
+  // means stacking several orders while an earlier one is still trickling
+  // out is allowed to promise more, in total, than the castle actually had
+  // to begin with (e.g. 50% of 50, then 50% of the 40 still showing, then
+  // 50% of the 30 still showing — 25+20+15 = 60 promised from 50 troops).
+  // That's intentional, not a bug — the actual safety net lives in the order-
+  // draining loop below (see the "Cutoff" comment there): once the castle
+  // truly runs out of troops, whatever's left unsent on any pending order is
+  // dropped rather than sitting around to auto-consume troops that show up
+  // later via regen or a reinforcement arriving from elsewhere.
   function issueOrder(g, src, dst, percent) {
     const n = Math.floor(src.troops * (percent / 100));
     if (n < 1) return;
@@ -1530,6 +1653,18 @@ function TowerConquest() {
               phase: Math.random() * Math.PI * 2,
             });
           }
+          // Cutoff: an order's percentage is deliberately computed from
+          // whatever the garrison shows at the moment it's issued (so
+          // stacking several orders while earlier ones are still draining
+          // can legitimately promise more than the castle currently holds —
+          // that's expected). But if the castle actually runs dry before
+          // this order finishes, the leftover backlog is void — it must NOT
+          // sit here waiting, because regen or a later reinforcement arrival
+          // would otherwise top the garrison back up and this stale order
+          // would immediately ship those troops back out again, which reads
+          // as troops entering the castle only to be auto-sent right back
+          // out. Once troops hit 0, drop whatever's left unsent.
+          if (src.troops < 1 && o.remaining > 0) o.remaining = 0;
           if (o.remaining <= 0) g.orders.splice(i, 1);
         }
 
@@ -1575,6 +1710,7 @@ function TowerConquest() {
                   dead.add(i); dead.add(j);
                   const mx = (u.x + v.x) / 2, my = (u.y + v.y) / 2;
                   g.sparks.push({ x: mx, y: my, life: 0.45, color: "#FFE9C2" });
+                  g.puffs.push({ x: mx, y: my, age: 0, dur: 0.4, r: 16 });
                   addBattleHeat(g, mx, my, 1);
                   break outer;
                 }
@@ -1646,6 +1782,7 @@ function TowerConquest() {
               g.sparks.push({ x: tgt.x, y: tgt.y, life: 0.35, color: "#FFD27A" });
               if (a.boulder) {
                 SoundEngine.boulderHit();
+                g.puffs.push({ x: tgt.x, y: tgt.y, age: 0, dur: 0.6, r: BOULDER_SPLASH_RADIUS * 0.9 });
                 addBattleHeat(g, tgt.x, tgt.y, 1.5);
                 // Crush the nearest few enemies caught in the blast radius too
                 const splashed = g.units
@@ -1684,6 +1821,12 @@ function TowerConquest() {
         for (let i = g.sparks.length - 1; i >= 0; i--) {
           g.sparks[i].life -= dt;
           if (g.sparks[i].life <= 0) g.sparks.splice(i, 1);
+        }
+
+        // Impact puffs fade
+        for (let i = g.puffs.length - 1; i >= 0; i--) {
+          g.puffs[i].age += dt;
+          if (g.puffs[i].age >= g.puffs[i].dur) g.puffs.splice(i, 1);
         }
 
         // AI turns
@@ -1870,9 +2013,14 @@ function TowerConquest() {
     ctx.scale(CASTLE_SCALE, CASTLE_SCALE);
     ctx.translate(-x, -groundY);
 
+    // Which local side is lit is derived from LIGHT_DIR.x, not hardcoded, so
+    // castle shading stays locked to the same light source as the terrain and
+    // the ground shadow — change LIGHT_DIR and these follow automatically.
+    const litLeft = LIGHT_DIR.x < 0;
     const stone = (cxx, cw, top, ht, colors) => {
       const grad = ctx.createLinearGradient(cxx - cw / 2, 0, cxx + cw / 2, 0);
-      const [c1, c2, c3] = colors || ["#6E7AA0", "#525d80", "#3b4463"];
+      let [c1, c2, c3] = colors || ["#6E7AA0", "#525d80", "#3b4463"];
+      if (!litLeft) { [c1, c3] = [c3, c1]; }
       grad.addColorStop(0, c1); grad.addColorStop(0.55, c2); grad.addColorStop(1, c3);
       ctx.fillStyle = grad; ctx.fillRect(cxx - cw / 2, top, cw, ht);
     };
@@ -1881,7 +2029,10 @@ function TowerConquest() {
       for (let i = 0; i < 3; i++) ctx.fillRect(cxx - cw / 2 + i * 2 * m, top - 4, m, 4);
     };
     const roofTop = (cxx, cw, top, hh) => {
-      ctx.fillStyle = "#7d4a4a";
+      const grad = ctx.createLinearGradient(cxx - cw / 2, 0, cxx + cw / 2, 0);
+      const [r1, r2] = litLeft ? ["#96604f", "#6b3f34"] : ["#6b3f34", "#96604f"];
+      grad.addColorStop(0, r1); grad.addColorStop(1, r2);
+      ctx.fillStyle = grad;
       ctx.beginPath();
       ctx.moveTo(cxx - cw / 2 - 1, top); ctx.lineTo(cxx, top - hh); ctx.lineTo(cxx + cw / 2 + 1, top);
       ctx.closePath(); ctx.fill();
@@ -1898,10 +2049,11 @@ function TowerConquest() {
       ctx.moveTo(fx, fy - 12); ctx.lineTo(fx + 9 * dir, fy - 9.5); ctx.lineTo(fx, fy - 7); ctx.closePath(); ctx.fill();
     };
 
-    // Ground shadow
+    // Ground shadow — offset opposite LIGHT_DIR so it agrees with the terrain's
+    // directional light instead of sitting perfectly centered under the castle.
     ctx.fillStyle = "rgba(0,0,0,0.35)";
     ctx.beginPath();
-    ctx.ellipse(x, groundY + 3, baseW * 0.72, 7, 0, 0, Math.PI * 2);
+    ctx.ellipse(x - LIGHT_DIR.x * 6, groundY + 3 - LIGHT_DIR.y * 2, baseW * 0.72, 7, 0, 0, Math.PI * 2);
     ctx.fill();
 
     // Team ring (2v2 only) — independent of per-player faction color, so an
@@ -2011,6 +2163,13 @@ function TowerConquest() {
     ctx.beginPath(); ctx.moveTo(x, groundY - 11); ctx.lineTo(x, groundY); ctx.stroke();
 
     // Flags: one per level, planted on flat stone or a roof apex (never a slope).
+    // Positions are always generated FROM nFlags (never a hardcoded-length
+    // array) — grand and wide shapes previously had their own fixed 4- and
+    // 3-flag arrays, which was fine back when only one level ever used each
+    // shape. Now that two levels can share "grand" (levels 3 and 4), a fixed
+    // array meant level 3 wrongly showed 4 flags instead of 3 — reading as a
+    // 5th level. Deriving positions from nFlags keeps "one flag per level"
+    // true regardless of how many levels end up sharing a silhouette.
     const nFlags = Math.min(lvl, 4);
     const flagBaseAt = (fx) => {
       const d = Math.abs(fx - x);
@@ -2020,11 +2179,9 @@ function TowerConquest() {
       if (cfg.roof) return keepTop - 12;
       return keepTop;
     };
-    let flagOffs;
-    if (cfg.grand) { const tX = baseW * 0.42, bX = baseW * 0.35; flagOffs = [-tX, -bX, bX, tX]; }
-    else if (cfg.wide) { const sX = baseW * 0.28; flagOffs = [-sX, 0, sX]; }
-    else if (nFlags === 1) flagOffs = [0];
-    else { const s = baseW * 0.4; flagOffs = Array.from({ length: nFlags }, (_, i) => -s + (i / (nFlags - 1)) * s * 2); }
+    const spanFrac = cfg.grand ? 0.42 : cfg.wide ? 0.28 : 0.4;
+    const span = baseW * spanFrac;
+    const flagOffs = nFlags === 1 ? [0] : Array.from({ length: nFlags }, (_, i) => -span + (i / (nFlags - 1)) * span * 2);
     flagOffs.forEach((ox, i) => flag(x + ox, flagBaseAt(x + ox), i % 2 === 0 ? 1 : -1));
 
     // Build animation: while upgrading, a thick cloud of dust/smoke billows up
@@ -2145,10 +2302,15 @@ function TowerConquest() {
     const { W, H } = g;
     const P = (wx, wy) => proj(g, wx, wy);
 
-    // The camera is clamped inside the board, so no "outside" is ever visible.
-    // A flat base fill remains only as a safety net against sub-pixel seams.
-    ctx.fillStyle = "#41547d";
-    ctx.fillRect(0, 0, W, H);
+    // Cached terrain base (organic noise + unified directional light + soft
+    // AO along cell borders — see buildTerrainTexture). Falls back to a flat
+    // fill for a stray frame before the first texture finishes building.
+    if (g.terrainTex) {
+      ctx.drawImage(g.terrainTex, 0, 0, W, H);
+    } else {
+      ctx.fillStyle = "#41547d";
+      ctx.fillRect(0, 0, W, H);
+    }
 
     const tracePoly = (cell) => {
       const p0 = P(cell[0].x, cell[0].y);
@@ -2166,8 +2328,6 @@ function TowerConquest() {
     for (const t of g.towers) {
       if (t.cell.length < 3) continue;
       tracePoly(t.cell);
-      ctx.fillStyle = "#41547d";
-      ctx.fill();
       ctx.fillStyle = t.owner === NEUTRAL ? NEUTRAL_FILL : FACTIONS[t.owner].fill;
       ctx.fill();
 
@@ -2203,12 +2363,6 @@ function TowerConquest() {
       ctx.stroke();
     }
 
-    // Subtle hatching for texture (screen-space is fine)
-    ctx.strokeStyle = "rgba(255,255,255,0.03)";
-    ctx.lineWidth = 1;
-    for (let x = -H; x < W; x += 26) {
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x + H, H); ctx.stroke();
-    }
 
     // Tower range rings were removed entirely per feedback (they were previously
     // drawn here as a dashed circle around each defended castle). ARROW_RANGE
@@ -2315,6 +2469,28 @@ function TowerConquest() {
         ctx.moveTo(A.x, A.y);
         ctx.lineTo(A.x - ux * 7 * A.s, A.y - uy * 7 * A.s);
         ctx.stroke();
+      }
+    }
+
+    // Impact puffs — soft expanding dust burst under the sparks, with a brief
+    // bright flash on the impact frame. Drawn first so sparks pop on top.
+    for (const pf of g.puffs) {
+      const Q = P(pf.x, pf.y);
+      const p = pf.age / pf.dur;
+      const r = (pf.r * 0.35 + p * pf.r) * Q.s;
+      const grad = ctx.createRadialGradient(Q.x, Q.y, 0, Q.x, Q.y, r);
+      grad.addColorStop(0, `rgba(255,240,210,${(1 - p) * 0.5})`);
+      grad.addColorStop(0.4, `rgba(210,200,190,${(1 - p) * 0.28})`);
+      grad.addColorStop(1, "rgba(210,200,190,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.ellipse(Q.x, Q.y, r, r * TILT, 0, 0, Math.PI * 2);
+      ctx.fill();
+      if (p < 0.2) {
+        ctx.fillStyle = `rgba(255,255,255,${(1 - p / 0.2) * 0.8})`;
+        ctx.beginPath();
+        ctx.ellipse(Q.x, Q.y, 7 * Q.s, 7 * Q.s * TILT, 0, 0, Math.PI * 2);
+        ctx.fill();
       }
     }
 
