@@ -46,7 +46,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.174"; // bump by 0.001 each update
+const APP_VERSION = "0.177"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -295,8 +295,16 @@ const BATTLE_HEAT_DECAY = 1.8; // heat lost per second with no new nearby kills
 // Per-castle scaling by level. Rebalanced this session: old level 1 was
 // dropped (old level 2's multiplier, 1.6, is now level 1's), and the new top
 // tier (level 4) is set to exactly 3x the new level 1's rate, per spec.
-const LEVEL_MULT = [1.6, 2.2, 3, 4.8]; // level 4 = 3x level 1 (1.6 x 3 = 4.8) regen & fire rate
-const levelMult = (t) => LEVEL_MULT[Math.min(t.level, MAX_LEVEL) - 1];
+// Re-tuned again this session to 1.5 / 2.3 / 3.1 / 4.
+// Originally a single shared table for both regen and fire rate — split into two
+// independent tables this session (each level's fire rate was decoupled from its
+// regen rate on request) so either curve can be re-tuned without touching the
+// other. Both start identical (same numbers as the old shared LEVEL_MULT) so this
+// split is a pure refactor — it changes nothing about current behavior by itself.
+const REGEN_LEVEL_MULT = [1.5, 2.3, 3.1, 4]; // castle regen speed, per level
+const FIRE_LEVEL_MULT = [1.5, 2.3, 3.1, 4];  // tower/castle-buffed fire rate, per level
+const regenLevelMult = (t) => REGEN_LEVEL_MULT[Math.min(t.level, MAX_LEVEL) - 1];
+const fireLevelMult = (t) => FIRE_LEVEL_MULT[Math.min(t.level, MAX_LEVEL) - 1];
 // +1 in the formula is what shifts the whole cap ladder up one BASE_MAX step
 // now that the old level-1 (10-cap) tier is gone: level 1→20, 2→30, 3→40, 4→50.
 const towerMax = (t) => (t.level + 1) * BASE_MAX;
@@ -307,8 +315,9 @@ const towerMax = (t) => (t.level + 1) * BASE_MAX;
 // still keep passively regenerating a bit further, up to towerCapacity, if
 // the player just leaves it be.
 const towerCapacity = (t) => towerMax(t) + CAPACITY_BONUS;
-const towerRegen = (t) => (t.type === "tower" ? 0 : REGEN_RATE * levelMult(t));
-const towerFireCd = (t) => ARROW_FIRE_CD / levelMult(t);
+const towerRegen = (t) => (t.type === "tower" ? 0 : REGEN_RATE * regenLevelMult(t));
+const towerFireCd = (t) => ARROW_FIRE_CD / fireLevelMult(t);
+
 
 // Specials share one "train" of loading capacity instead of independent cooldowns.
 // It loads in a fixed order — Slow Down, then Speed, then Tower Defense — each stage
@@ -344,12 +353,12 @@ const TRAIN_KILL_GAIN = 0.1;             // seconds of train progress per soldie
 
 // Tower Defense specials (replace Fireball & Storm) — no longer add extra towers.
 // "storm" slot = Tower Defense: every existing defense tower the caster (or their
-// team) owns fires 2x as fast for a limited time. "fire" slot = Tower Defense 2.0:
+// team) owns fires 25% faster for a limited time. "fire" slot = Tower Defense 2.0:
 // same fire rate as normal, but every tower lobs trebuchet boulders instead of
 // arrows — each impact crushes a small cluster of enemies instead of just one.
 // ("fire" is currently inactive — see the rotation note above — but kept as-is.)
 const TOWER_DEF_DURATION = 12;     // seconds either buff lasts
-const TOWER_DEF_RATE_MULT = 2;     // fire-rate multiplier — "storm" slot
+const TOWER_DEF_RATE_MULT = 1.25;  // fire-rate multiplier — "storm" slot — +25% (was +100%/2x)
 const BOULDER_SPLASH_COUNT = 4;    // enemies destroyed per boulder impact — "fire" slot (inactive)
 const BOULDER_SPLASH_RADIUS = 42;  // px, blast radius around a boulder's impact point (inactive)
 
@@ -1013,7 +1022,7 @@ const TUTORIAL_STEPS = [
   },
   {
     title: "Special: Tower Defense",
-    body: "The strongest special in the rotation — every one of your towers fires twice as fast for a while. Fully charged for you — and we've sent a few scouts your way so you can watch it work.",
+    body: "The strongest special in the rotation — every one of your towers fires 25% faster for a while. Fully charged for you — and we've sent a few scouts your way so you can watch it work.",
     hint: "Tap the Tower Defense segment to cast it",
     waitFor: "castStorm",
     settleFor: TOWER_DEF_DURATION, // hold the step open for the buff's full active window
@@ -1434,7 +1443,7 @@ function TowerConquest() {
     }
   };
 
-  // "storm" slot speeds up every tower the caster's team owns to 2x fire rate for
+  // "storm" slot speeds up every tower the caster's team owns to +25% fire rate for
   // TOWER_DEF_DURATION seconds; "fire" slot swaps them to splash-damage boulders at
   // normal rate. Crucially, setting rateMult/boulder here is also what temporarily
   // "activates" firing capability in a CASTLE — castles have no defense of their own
@@ -2425,7 +2434,7 @@ function TowerConquest() {
     // a glance from across the map. Computed up here so the enlarged turret is
     // included in the castle's overall bounding box (totalH) below.
     const def = t.defs && t.defs[0];
-    const buff2 = def && def.rateMult === TOWER_DEF_RATE_MULT; // Tower Defense (2x fire rate)
+    const buff2 = def && def.rateMult === TOWER_DEF_RATE_MULT; // Tower Defense (+25% fire rate)
     const boulder = def && !!def.boulder;                       // Tower Defense 2.0 (splash boulders)
     const buffed = buff2 || boulder;
     const rTurretW = turretW * (buffed ? 1.45 : 1);
@@ -3058,6 +3067,17 @@ function TowerConquest() {
         ctx.beginPath();
         ctx.ellipse(Q.x, Q.y, 5.5 * Q.s, 5.5 * Q.s * TILT, 0, 0, Math.PI * 2);
         ctx.fill();
+      } else if (u.speedMul && u.speedMul < 1) {
+        // Slowed (Slow Down special) — deliberately a DASHED ring, not a filled glow,
+        // so it reads as visually distinct from the speed-boost effect above (shape
+        // difference, not just color) even at a glance or for colorblind players.
+        ctx.strokeStyle = "rgba(143,163,199,0.85)";
+        ctx.lineWidth = Math.max(1, 1.3 * Q.s);
+        ctx.setLineDash([2.5 * Q.s, 2.5 * Q.s]);
+        ctx.beginPath();
+        ctx.ellipse(Q.x, Q.y, 5.5 * Q.s, 5.5 * Q.s * TILT, 0, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
       }
       const tgt = g.towers[u.dst];
       const flip = tgt ? tgt.x < u.x : false;
@@ -3065,6 +3085,23 @@ function TowerConquest() {
       const bob = frame === 1 ? -0.5 * Q.s : 0;
       const w = SOLDIER_W * Q.s, h = SOLDIER_H * Q.s;
       ctx.drawImage(soldierSprite(u.owner, frame, flip), Q.x - w / 2, Q.y - h + bob, w, h);
+      if (u.speedMul && u.speedMul < 1) {
+        // Small rotating frost sparkle above the head — a second, unmistakable cue on
+        // top of the ring beneath, cheap to draw (a few strokes) and immune to the
+        // sprite-tinting/compositing bleed risk a per-pixel overlay would have in a
+        // crowd of overlapping units.
+        const sx = Q.x, sy = Q.y - h - 3 * Q.s + Math.sin(g.pulse * 3 + u.phase * 5) * 1.5 * Q.s;
+        const r = 2.4 * Q.s;
+        ctx.strokeStyle = "rgba(191,227,255,0.9)";
+        ctx.lineWidth = Math.max(1, Q.s);
+        ctx.beginPath();
+        for (let k = 0; k < 3; k++) {
+          const ang = (Math.PI / 3) * k + g.pulse * 1.2;
+          ctx.moveTo(sx - Math.cos(ang) * r, sy - Math.sin(ang) * r);
+          ctx.lineTo(sx + Math.cos(ang) * r, sy + Math.sin(ang) * r);
+        }
+        ctx.stroke();
+      }
     }
 
     // Arrows / boulders in flight
@@ -3349,8 +3386,8 @@ function TowerConquest() {
                       Specials share one loading bar and fire instantly with a tap —
                       no aiming. <span style={{ color: "#8FA3C7" }}>Slow Down</span> slows
                       every marching enemy soldier by 25%. <span style={{ color: "#57E0C6" }}>Speed</span> boosts
-                      every marching soldier of yours. <span style={{ color: "#9DBBFF" }}>Tower defense</span> doubles
-                      the fire rate of every tower you own — and temporarily gives your castles
+                      every marching soldier of yours. <span style={{ color: "#9DBBFF" }}>Tower defense</span> boosts
+                      the fire rate of every tower you own by 25% — and temporarily gives your castles
                       the same firing power. Deaths on the battlefield refill the
                       bar for everyone. Enemies play by the same rules.
                     </li>
