@@ -46,7 +46,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.177"; // bump by 0.001 each update
+const APP_VERSION = "0.179"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -203,8 +203,8 @@ const HOLD_MS = 550;               // press-and-hold duration that triggers conv
 // applyMomentumCapture, and applyMomentumBuild (upgrade/convert). Momentum
 // also passively reverts toward baseline on its own over time, from EITHER
 // side — see the revert step in the game loop.
-const MOMENTUM_KILL_STEP = 0.0025;   // ±0.25% per attacker killed by a tower/castle defense
-const MOMENTUM_CAPTURE_BONUS = 0.15; // +15% for the player who captures a building (loser: no penalty)
+const MOMENTUM_KILL_STEP = 0.0015;   // ±0.15% per attacker killed by a tower/castle defense
+const MOMENTUM_CAPTURE_BONUS = 0.10; // +10% for the player who captures a building (loser: no penalty)
 const MOMENTUM_BUILD_BONUS = 0.05;   // +5% for completing an upgrade OR a castle<->tower conversion
 const MOMENTUM_REVERT_STEP = 0.01;       // 1% per MOMENTUM_REVERT_INTERVAL, pulling momentum back toward baseline from either side
 const MOMENTUM_REVERT_INTERVAL = 5;      // seconds — applied continuously (see the revert step), not as a discrete tick
@@ -564,7 +564,34 @@ function polyCentroid(poly) {
 // keeps the castle *building* far enough in that its sprite never gets clipped
 // by the screen edge. Reused by generateMap for the original template's
 // elliptical inset, and by recenterCastles below to clamp after relaxation.
-const MAP_EDGE_MARGIN = 80;
+//
+// This has to be TWO different margins, not one flat number, because the camera
+// (see proj() / CAM_ZOOM / PERSP above) only distorts the HORIZONTAL axis —
+// screenY = worldY exactly (CAM_ZOOM * TILT cancels to 1), but screenX gets
+// multiplied by CAM_ZOOM * p, where p ranges up to 1 + PERSP/2 at the bottom-most
+// row of the board (the "nearest" row in the pseudo-3D tilt, which the perspective
+// widens the most). A flat margin big enough for the vertical axis is nowhere near
+// enough horizontally at that row — and a fixed pixel number can't be right for
+// every viewport width at once, since the shrinkage is multiplicative (a fraction
+// of W), not additive. On top of that, a castle's sprite itself grows with level —
+// its ground shadow (the widest element of its normal silhouette, wider than the
+// keep/turrets themselves) goes from ~23 world px radius at level 1 to ~43 at level
+// 4 — so a margin only sized for a fresh level-1 castle clips it the moment it
+// upgrades. This was the actual bug behind "buildings cut off at the sides,
+// especially after upgrading": MAP_EDGE_MARGIN was a flat 80px tuned by eye against
+// small, low-level sprites, with no horizontal safety margin and no per-level
+// footprint accounted for at all.
+//
+// mapEdgeMarginX(W) derives the true minimum: enough inset that even a maxed-out
+// castle's shadow stays fully inside the visible window at the tightest (bottom)
+// row, for whatever W actually is.
+const CASTLE_MAX_HALF_FOOTPRINT = CASTLE_LEVEL_CFG[4].w * 0.72 * CASTLE_SCALE; // widest normal-state element (ground shadow) at max level
+const CAM_X_ZOOM_WORST = CAM_ZOOM * (1 + PERSP / 2); // horizontal zoom at the nearest/bottom-most row — the tightest case
+const mapEdgeMarginX = (W) => (W / 2) * (1 - 1 / CAM_X_ZOOM_WORST) + CASTLE_MAX_HALF_FOOTPRINT;
+// Vertical needs no perspective correction (screenY = worldY, scale 1 always — see
+// proj()), so a flat margin comfortably covering a maxed castle's full upward
+// height (~60 world px) is enough on its own.
+const MAP_EDGE_MARGIN_Y = 80;
 
 // Single-pass Lloyd relaxation: once every castle's Voronoi cell is known
 // (computeCells must already have run), nudge each castle to the centroid of
@@ -579,13 +606,14 @@ const MAP_EDGE_MARGIN = 80;
 // which pulls their centroid outward toward that flat edge — left unclamped,
 // this pushed some castles' own points right up against (or past) the world
 // boundary, clipping their sprite off the visible board. Clamp the centroid
-// to the same MAP_EDGE_MARGIN inset the original template placement uses.
+// to the same margin inset the original template placement uses.
 function recenterCastles(towers, W, H) {
+  const marginX = mapEdgeMarginX(W);
   for (const t of towers) {
     if (t.cell.length < 3) continue;
     const c = polyCentroid(t.cell);
-    t.x = Math.min(W - MAP_EDGE_MARGIN, Math.max(MAP_EDGE_MARGIN, c.x));
-    t.y = Math.min(H - MAP_EDGE_MARGIN, Math.max(MAP_EDGE_MARGIN, c.y));
+    t.x = Math.min(W - marginX, Math.max(marginX, c.x));
+    t.y = Math.min(H - MAP_EDGE_MARGIN_Y, Math.max(MAP_EDGE_MARGIN_Y, c.y));
   }
   computeCells(towers, W, H);
 }
@@ -610,8 +638,7 @@ function generateMap(numPlayers, W, H, teamMode = false) {
   const n = numPlayers;
   const perPlayer = 2 + Math.floor(Math.random() * 2); // 2–3, equal for all
   const cx = W / 2, cy = H / 2;
-  const margin = MAP_EDGE_MARGIN;
-  const rx = W / 2 - margin, ry = H / 2 - margin;
+  const rx = W / 2 - mapEdgeMarginX(W), ry = H / 2 - MAP_EDGE_MARGIN_Y;
   const step = (Math.PI * 2) / n;
   const a0 = Math.random() * Math.PI * 2 + (n === 4 && !teamMode ? Math.PI / 4 : 0);
 
@@ -3379,7 +3406,7 @@ function TowerConquest() {
                   }}>
                     <li>Drag from your region to any territory to send troops.</li>
                     <li>Two building types: castles grow troops but don't shoot; towers never regrow troops but fire at hostiles passing through, at increasing range per level.</li>
-                    <li>No building gets an automatic defense bonus — instead, every player has <b style={{ color: "#E8EEF9" }}>momentum</b> (shown top-right): win fights and it climbs above 100%, making you hit harder and defend better; lose them and it drops. Killing an attacker with a tower/castle shifts 0.25% either way; capturing a building is worth 15% to the capturer alone — losing one costs nothing extra. Upgrading or converting a building adds 5%. Momentum quietly drifts back toward 100% on its own over time, from either side.</li>
+                    <li>No building gets an automatic defense bonus — instead, every player has <b style={{ color: "#E8EEF9" }}>momentum</b> (shown top-right): win fights and it climbs above 100%, making you hit harder and defend better; lose them and it drops. Killing an attacker with a tower/castle shifts 0.15% either way; capturing a building is worth 10% to the capturer alone — losing one costs nothing extra. Upgrading or converting a building adds 5%. Momentum quietly drifts back toward 100% on its own over time, from either side.</li>
                     <li>Hold down on a building you own to bring up a convert prompt (confirm to switch it to the other type): costs 10 troops and resets it to level 1.</li>
                     <li>Double-tap a full castle or tower to upgrade it: costs half its troops, raises capacity, and speeds up regen (castles) or firing/range (towers).</li>
                     <li>
