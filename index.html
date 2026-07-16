@@ -46,10 +46,31 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.151"; // bump by 0.001 each update
+const APP_VERSION = "0.174"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
-const MAX_LEVEL = 4;         // cap: level 4 → 50 troops
+const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
+// Extra headroom above a level's upgrade threshold (towerMax) that a building
+// can still regen into — see towerCapacity(). A level-1 building becomes
+// upgrade-eligible at 20 troops (towerMax, unchanged), but can keep passively
+// regenerating up to 25 if the player chooses not to upgrade yet. This is
+// purely a regen ceiling, not an upgrade-eligibility change.
+const CAPACITY_BONUS = 5;
+// Per-building population "allowance" that scales a player's total-troops
+// budget: a player owning N buildings can hold up to N * MAX_POPULATION
+// troops in total (10 buildings → 550). This throttles REGENERATION only
+// (see the regen step in the game loop) — regen fills each building only up
+// to its own towerCapacity (towerMax + CAPACITY_BONUS: 25/35/45/55), AND
+// stops contributing anywhere for that player once their empire-wide total
+// hits their building-count-scaled budget. There is no per-building ceiling:
+// reinforcement (see unitArrives) is completely unbounded, so a single
+// building can hold far more than MAX_POPULATION troops if the player
+// marches/consolidates troops into it from elsewhere — that only
+// redistributes population the player already regenerated, it doesn't create
+// more, so it never needs to respect this budget itself. Matches the highest
+// possible per-building regen ceiling (a maxed-out level-4 building's
+// towerCapacity), so the two stay in sync if level tuning ever changes.
+const MAX_POPULATION = (MAX_LEVEL + 1) * BASE_MAX + CAPACITY_BONUS;
 const MAX_CASTLES = 12;      // hard cap on total towers (players + neutrals) per map
 const REGEN_RATE = 0.6;      // troops/sec at level 1 (grows with level)
 const UNIT_SPEED = 72;       // base px/sec per soldier
@@ -153,10 +174,77 @@ function buildTerrainTexture(g) {
 }
 
 // Defensive arrow towers
-const ARROW_RANGE = 92;      // px, how far a defense tower can shoot
+const ARROW_RANGE = 92;      // px, base range at level 1 — grows with level, see towerRange()
+const TOWER_RANGE_PER_LEVEL = 20; // px added per level above 1
+const towerRange = (t) => ARROW_RANGE + (Math.min(t.level || 1, MAX_LEVEL) - 1) * TOWER_RANGE_PER_LEVEL;
 const ARROW_FIRE_CD = 1.3;   // seconds between shots at level 1 (faster when upgraded)
 const ARROW_SPEED = 320;     // px/sec, arrow flight
 const BOULDER_SPEED = 200;   // px/sec — slower, heavier flight for Tower Defense 2.0
+
+// ----- Buildings: castles vs. towers (this session) -----
+// Every region is either a "castle" (grows troops, can be upgraded, no
+// passive ranged defense of its own) or a "tower" (never regenerates troops,
+// but passively fires at hostiles in range — range grows with level). Owning
+// either lets you convert it into the other for CONVERT_COST troops, which
+// also resets its level back to 1. Players never start with towers; a few
+// neutral towers are seeded on the map (see generateMap) for contested,
+// evenly-placed ranged chokepoints. The Tower Defense specials temporarily
+// grant firing capability to a caster's CASTLES too — "activating" tower
+// behavior in them for the buff's duration — see the firing-eligibility
+// check in the game loop and castTowerDefense().
+const CONVERT_COST = 10;           // troops spent converting castle<->tower
+const HOLD_MS = 550;               // press-and-hold duration that triggers conversion instead of a tap
+// ----- Momentum (replaces the old flat CASTLE_DEFENSE_BONUS) -----
+// No building type gets an automatic defense bonus anymore — combat strength
+// is entirely dynamic, tracked per PLAYER as a "momentum" multiplier
+// (baseline 1.0 = 100%, at game start and whenever neither side has an edge).
+// Winning fights builds momentum; losing them erodes it — see unitArrives
+// (the actual combat resolution), momentumMult, applyMomentumKill,
+// applyMomentumCapture, and applyMomentumBuild (upgrade/convert). Momentum
+// also passively reverts toward baseline on its own over time, from EITHER
+// side — see the revert step in the game loop.
+const MOMENTUM_KILL_STEP = 0.0025;   // ±0.25% per attacker killed by a tower/castle defense
+const MOMENTUM_CAPTURE_BONUS = 0.15; // +15% for the player who captures a building (loser: no penalty)
+const MOMENTUM_BUILD_BONUS = 0.05;   // +5% for completing an upgrade OR a castle<->tower conversion
+const MOMENTUM_REVERT_STEP = 0.01;       // 1% per MOMENTUM_REVERT_INTERVAL, pulling momentum back toward baseline from either side
+const MOMENTUM_REVERT_INTERVAL = 5;      // seconds — applied continuously (see the revert step), not as a discrete tick
+const MOMENTUM_MIN = 0.4;            // floor — keeps the damage ratio (see unitArrives) sane at the low end
+const MOMENTUM_MAX = 2.5;            // ceiling — same, at the high end
+const clampMomentum = (v) => Math.max(MOMENTUM_MIN, Math.min(MOMENTUM_MAX, v));
+// A player's current momentum multiplier; NEUTRAL (and anything else out of
+// range) is always exactly 1.0 — it isn't a player and can't build or lose it.
+const momentumMult = (g, owner) =>
+  owner >= 0 && owner < g.numPlayers && g.momentum ? g.momentum[owner] : 1;
+function applyMomentumKill(g, attackerOwner, defenderOwner) {
+  if (!g.momentum) return;
+  if (attackerOwner >= 0 && attackerOwner < g.numPlayers) {
+    g.momentum[attackerOwner] = clampMomentum(g.momentum[attackerOwner] - MOMENTUM_KILL_STEP);
+  }
+  if (defenderOwner >= 0 && defenderOwner < g.numPlayers) {
+    g.momentum[defenderOwner] = clampMomentum(g.momentum[defenderOwner] + MOMENTUM_KILL_STEP);
+  }
+}
+function applyMomentumCapture(g, capturerOwner) {
+  if (!g.momentum) return;
+  if (capturerOwner >= 0 && capturerOwner < g.numPlayers) {
+    g.momentum[capturerOwner] = clampMomentum(g.momentum[capturerOwner] + MOMENTUM_CAPTURE_BONUS);
+  }
+}
+// Completing an upgrade or a castle<->tower conversion — investing in your
+// economy is itself rewarded with a small momentum bump, independent of combat.
+function applyMomentumBuild(g, owner) {
+  if (!g.momentum) return;
+  if (owner >= 0 && owner < g.numPlayers) {
+    g.momentum[owner] = clampMomentum(g.momentum[owner] + MOMENTUM_BUILD_BONUS);
+  }
+}
+// Per-level watchtower geometry (shared by drawWatchtowerSprite & defenderPoint).
+const TOWER_CFG = {
+  1: { w: 22, h: 46 },
+  2: { w: 24, h: 58 },
+  3: { w: 26, h: 70 },
+  4: { w: 28, h: 82 },
+};
 
 // Battle-bed heat: tracks how hot the fighting is near the player's OWN castles,
 // decaying over time, and drives SoundEngine's ambient combat layer.
@@ -187,8 +275,13 @@ const CASTLE_LEVEL_CFG = {
 // to match the castle sprite's CASTLE_SCALE shrink. Recompute after any level
 // change (the turret moves as the silhouette grows).
 function defenderPoint(t) {
-  const cfg = CASTLE_LEVEL_CFG[Math.min(t.level || 1, 4)];
   const groundY = t.y + 14;
+  if (t.type === "tower") {
+    const cfg = TOWER_CFG[Math.min(t.level || 1, 4)];
+    const topY = groundY - cfg.h;
+    return { x: t.x, y: groundY + (topY - groundY) * CASTLE_SCALE };
+  }
+  const cfg = CASTLE_LEVEL_CFG[Math.min(t.level || 1, 4)];
   const rx = t.x + cfg.w / 2;
   const turretTop = groundY - cfg.turretH;
   return {
@@ -207,24 +300,39 @@ const levelMult = (t) => LEVEL_MULT[Math.min(t.level, MAX_LEVEL) - 1];
 // +1 in the formula is what shifts the whole cap ladder up one BASE_MAX step
 // now that the old level-1 (10-cap) tier is gone: level 1→20, 2→30, 3→40, 4→50.
 const towerMax = (t) => (t.level + 1) * BASE_MAX;
-const towerRegen = (t) => REGEN_RATE * levelMult(t);
+// The actual regen ceiling for a building — towerMax (the upgrade-eligibility
+// threshold) plus CAPACITY_BONUS headroom. Deliberately separate from
+// towerMax: upgrade eligibility/cost still key off towerMax alone (level 1 is
+// upgrade-ready at 20 troops), but a building that isn't upgraded yet can
+// still keep passively regenerating a bit further, up to towerCapacity, if
+// the player just leaves it be.
+const towerCapacity = (t) => towerMax(t) + CAPACITY_BONUS;
+const towerRegen = (t) => (t.type === "tower" ? 0 : REGEN_RATE * levelMult(t));
 const towerFireCd = (t) => ARROW_FIRE_CD / levelMult(t);
 
 // Specials share one "train" of loading capacity instead of independent cooldowns.
-// It loads in a fixed order — Tower Defense, then Speed, then Tower Defense 2.0 — each
-// stage taking TRAIN_STAGE seconds, so a special isn't available until every stage before
-// it (and its own) has loaded. Tower Defense 2.0 is last (needs a full 60s load) because
-// it's the strongest of the three. Casting a special spends progress equal to its OWN
+// It loads in a fixed order — Slow Down, then Speed, then Tower Defense — each stage
+// taking TRAIN_STAGE seconds, so a special isn't available until every stage before it
+// (and its own) has loaded. Tower Defense is last (needs a full 60s load) because it's
+// the strongest of the active three. Casting a special spends progress equal to its OWN
 // threshold — the 1st-stage special costs 20s, the 2nd costs 40s, the 3rd costs a full
-// 60s — so using anything beyond the first always drains the whole train. All three
+// 60s — so using anything beyond the first always drains the whole train. All of them
 // trigger instantly on tap — no aiming/targeting.
 // The train actually caps at a 4th, PHANTOM stage with no special of its own — it just
 // banks an extra TRAIN_STAGE of reserve. That means fully maxing out and casting Tower
-// Defense 2.0 (60s) still leaves 20s in the tank — enough to immediately follow up with
-// Tower Defense (the 1st-stage special) instead of starting from zero.
+// Defense (60s) still leaves 20s in the tank — enough to immediately follow up with Slow
+// Down (the 1st-stage special) instead of starting from zero.
+//
+// Tower Defense 2.0 ("fire") is currently PULLED FROM THE ACTIVE ROTATION — it doesn't
+// appear in the specials UI array or get cast by the AI (see both below) — but every bit
+// of its implementation (this section, castTowerDefense's boulder branch, the arrow-flight
+// boulder/splash handling, its sound, its old tutorial step) is left fully intact so it's
+// a quick restore later: re-add a `{ kind: "fire", ... }` entry to the UI array and
+// uncomment its block in aiSpecials. Its threshold stays mapped below (same top tier it
+// always had) so nothing else needs to change when it comes back.
 const TRAIN_STAGE = 20;                  // seconds to load each stage
 const TRAIN_MAX = TRAIN_STAGE * 4;       // 80s to fully max out (3 real stages + 1 reserve)
-const SPECIAL_STAGE = { storm: 1, speed: 2, fire: 3 }; // load order, 1st/2nd/3rd
+const SPECIAL_STAGE = { slow: 1, speed: 2, storm: 3, fire: 3 }; // load order, 1st/2nd/3rd — fire inactive, see note above
 const trainThreshold = (kind) => SPECIAL_STAGE[kind] * TRAIN_STAGE;
 // Beyond the shared train, each individual special also has its own 20s cooldown per
 // caster — even with train progress to spare, you can't spam the same one back to back.
@@ -239,15 +347,56 @@ const TRAIN_KILL_GAIN = 0.1;             // seconds of train progress per soldie
 // team) owns fires 2x as fast for a limited time. "fire" slot = Tower Defense 2.0:
 // same fire rate as normal, but every tower lobs trebuchet boulders instead of
 // arrows — each impact crushes a small cluster of enemies instead of just one.
+// ("fire" is currently inactive — see the rotation note above — but kept as-is.)
 const TOWER_DEF_DURATION = 12;     // seconds either buff lasts
 const TOWER_DEF_RATE_MULT = 2;     // fire-rate multiplier — "storm" slot
-const BOULDER_SPLASH_COUNT = 4;    // enemies destroyed per boulder impact — "fire" slot
-const BOULDER_SPLASH_RADIUS = 42;  // px, blast radius around a boulder's impact point
+const BOULDER_SPLASH_COUNT = 4;    // enemies destroyed per boulder impact — "fire" slot (inactive)
+const BOULDER_SPLASH_RADIUS = 42;  // px, blast radius around a boulder's impact point (inactive)
 
-// Speed special — now the middle tier (2nd stage). Instantly buffs every marching
-// soldier on the caster's team for the rest of their trip (global, no radius/targeting
-// needed).
+// Speed special — the middle tier (2nd stage). Instantly buffs every marching soldier
+// on the caster's team for the rest of their trip (global, no radius/targeting needed).
 const SPEED_BOOST = 1.5;     // +50% movement speed
+
+// Slow Down special — the new 1st-stage (cheapest, fastest to reload) entry point of the
+// rotation. Instantly slows every currently-marching HOSTILE soldier for the rest of
+// their trip — the mirror image of Speed, aimed at the enemy instead of the caster's own
+// troops. Deliberately mild (25%, vs. Speed's +50%) since it's the cheapest tier.
+const SLOW_DEBUFF = 0.75;    // -25% movement speed
+
+
+// AI helper: estimate how many attackers will die to defensive fire on the
+// way from src to dst — not just from dst itself (if it's a tower), but from
+// ANY hostile tower whose range circle the straight-line march route passes
+// through. A tower doesn't have to be the destination to shoot a column
+// marching past it. For each such tower, approximate the chord of the march
+// line that falls inside its range circle, convert that to how long the
+// column is exposed (chord length / UNIT_SPEED), and divide by its fire
+// cooldown to get an expected kill count. Deliberately approximate (real
+// units wobble/lane-offset a little near arrival, and fire always targets
+// the single nearest hostile rather than marching lockstep down the column)
+// — this only needs to be in the right ballpark to stop the AI walking
+// straight through a gauntlet it should have gone around or paid for.
+function expectedLosses(g, src, dst, isTeam) {
+  const totalDist = dist(src, dst);
+  if (totalDist < 1) return 0;
+  let losses = 0;
+  for (const d of g.towers) {
+    if (isTeam(d.owner)) continue; // only hostile towers threaten this march
+    const def = d.defs && d.defs[0];
+    if (!def) continue;
+    const firing = d.type === "tower" || def.rateMult > 1 || def.boulder;
+    if (!firing) continue;
+    const range = towerRange(d);
+    const segDist = pointToSegmentDist(d, src, dst);
+    if (segDist >= range) continue; // path never comes into its range at all
+    const half = Math.sqrt(Math.max(0, range * range - segDist * segDist));
+    const exposure = Math.min(2 * half, totalDist); // chord length, clamped to the route's own length
+    const exposureTime = exposure / UNIT_SPEED;
+    const fireCd = towerFireCd(d) / (def.rateMult || 1);
+    losses += exposureTime / fireCd;
+  }
+  return losses;
+}
 
 const FACTIONS = [
   { id: 0, name: "You",        color: "#4ADE5A", dim: "#2FA83C", fill: "rgba(74,222,90,0.46)", human: true },
@@ -346,6 +495,18 @@ function soldierSprite(owner, frame, flip) {
 
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+// Shortest distance from point p to the line segment a-b — used to tell
+// whether a march route passes within a tower's range, not just whether the
+// tower IS the destination.
+function pointToSegmentDist(p, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq < 1e-6) return dist(p, a);
+  let tt = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+  tt = Math.max(0, Math.min(1, tt));
+  return Math.hypot(p.x - (a.x + tt * dx), p.y - (a.y + tt * dy));
+}
 
 // ================= Voronoi (half-plane clipping) =================
 function clipHalfPlane(poly, a, b) {
@@ -497,12 +658,26 @@ function generateMap(numPlayers, W, H, teamMode = false) {
     const midLevel = teamNeutralRings.find((r) => r.key === "mid").level;
     const extraMidLevel = teamNeutralRings.find((r) => r.key === "extraMid")?.level;
     const centerLevel = teamNeutralRings.find((r) => r.key === "center")?.level;
+    // Neutral towers: kept rare and always symmetric so neither team gets an
+    // edge. The true map-center neutral (when present) is always a tower —
+    // one shared, even chokepoint. The mid-axis pair is occasionally also
+    // towers (both together, never just one), for a little more variety
+    // without flooding the map with them.
+    const midIsTower = Math.random() < 0.3;
     const mid = [a0 + Math.PI / 2, a0 - Math.PI / 2];
-    for (const ma of mid) { const p = ell(0.9, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: midLevel }); }
+    for (const ma of mid) { const p = ell(0.9, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: midLevel, type: midIsTower ? "tower" : "castle" }); }
     if (extraMid) for (const ma of mid) { const p = ell(0.44, ma); raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: extraMidLevel }); }
-    if (centerNeutral) raw.push({ x: cx, y: cy, owner: NEUTRAL, level: centerLevel });
+    if (centerNeutral) raw.push({ x: cx, y: cy, owner: NEUTRAL, level: centerLevel, type: "tower" });
 
-    const towers = raw.map((p, i) => ({ id: i, x: p.x, y: p.y, owner: p.owner, troops: START_TROOPS, level: p.level || 1, cell: [] }));
+    const towers = raw.map((p, i) => {
+      const type = p.type || "castle";
+      const level = p.level || 1;
+      return {
+        id: i, x: p.x, y: p.y, owner: p.owner, type,
+        troops: type === "tower" ? towerCapacity({ level }) : START_TROOPS,
+        level, cell: [],
+      };
+    });
     computeCells(towers, W, H);
     recenterCastles(towers, W, H);
     const neutrals = towers.filter((t) => t.owner === NEUTRAL).length;
@@ -570,25 +745,36 @@ function generateMap(numPlayers, W, H, teamMode = false) {
       raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: bufferedLevel });
     }
   }
-  // Inner contested ring (one per wedge → symmetric)
+  // Inner contested ring (one per wedge → symmetric). Occasionally the whole
+  // ring is towers instead of castles — always ALL of it together (n
+  // symmetric instances, same level), never a subset, so no wedge gets an
+  // edge. Kept low-probability so most maps don't start tower-heavy.
+  const innerRingIsTower = innerRing && Math.random() < 0.3;
   if (innerRing) {
     const inF = 0.4 + Math.random() * 0.1;
     const off = buffered ? 0.5 : 0.0;
     for (let k = 0; k < n; k++) {
       const p = ell(inF, a0 + (k + off) * step);
-      raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: innerLevel });
+      raw.push({ x: p.x, y: p.y, owner: NEUTRAL, level: innerLevel, type: innerRingIsTower ? "tower" : "castle" });
     }
   }
-  // Shared center — the only tower allowed to start at level 4
+  // Shared center — the only tower allowed to start at level 4. Always a
+  // tower when present: a single, perfectly even chokepoint every player
+  // is equidistant from.
   if (centerNeutral || (!buffered && !innerRing)) {
-    raw.push({ x: cx, y: cy, owner: NEUTRAL, level: centerLevelVal });
+    raw.push({ x: cx, y: cy, owner: NEUTRAL, level: centerLevelVal, type: "tower" });
   }
 
-  const towers = raw.map((p, i) => ({
-    id: i, x: p.x, y: p.y,
-    owner: p.owner, troops: START_TROOPS, level: p.level || 1,
-    cell: [],
-  }));
+  const towers = raw.map((p, i) => {
+    const type = p.type || "castle";
+    const level = p.level || 1;
+    return {
+      id: i, x: p.x, y: p.y,
+      owner: p.owner, type,
+      troops: type === "tower" ? towerCapacity({ level }) : START_TROOPS,
+      level, cell: [],
+    };
+  });
 
   computeCells(towers, W, H);
   recenterCastles(towers, W, H);
@@ -742,6 +928,7 @@ const SoundEngine = (() => {
     towerDefense: (vol = 1) => { tone(300, 0.1, "square", 0.22 * vol); tone(450, 0.12, "square", 0.18 * vol, 0.06); },
     towerDefense2: (vol = 1) => { noiseBurst(0.3, 0.32 * vol, 300); tone(80, 0.35, "sawtooth", 0.3 * vol); },
     speed: (vol = 1) => sweep(300, 900, 0.25, "sine", 0.22 * vol),
+    slow: (vol = 1) => sweep(700, 220, 0.35, "sine", 0.2 * vol),
     win: () => { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.25, "triangle", 0.26, i * 0.14)); },
     lose: () => { [392, 349, 311, 262].forEach((f, i) => tone(f, 0.3, "sawtooth", 0.2, i * 0.16)); },
     click: () => tone(600, 0.04, "square", 0.08),
@@ -787,8 +974,8 @@ const TUTORIAL_STEPS = [
     settleFor: 1.5, // let them see the castle actually flip to their color
   },
   {
-    title: "Regions & Defense Towers",
-    body: "Every region, even neutral ones, has a defense tower that shoots hostile troops crossing it. Marching through enemy or unclaimed land costs you soldiers, so plan your routes.",
+    title: "Castles & Towers",
+    body: "There are two building types. Castles grow troops over time and can be upgraded, but don't shoot back. Towers never regrow troops, but fire at hostiles passing through — range grows with level. Hold down on any building you own to bring up the option to convert it (costs 10 troops, resets it to level 1) — you'll be asked to confirm.",
     waitFor: null,
   },
   {
@@ -803,14 +990,14 @@ const TUTORIAL_STEPS = [
     },
   },
   {
-    title: "Special: Tower Defense",
-    body: "Your specials share one loading bar. Tower Defense makes every one of your towers fire twice as fast for a while. We've charged the bar for you — and sent a few scouts your way so you can watch it work.",
-    hint: "Tap the Tower Defense segment to cast it",
-    waitFor: "castStorm",
-    settleFor: TOWER_DEF_DURATION, // hold the step open for the buff's full active window
+    title: "Special: Slow Down",
+    body: "Your specials share one loading bar. Slow Down instantly slows every marching enemy soldier by 25% for the rest of their trip — cheap and quick to reload, so it's worth using early and often. We've charged the bar for you — and sent a few scouts your way so you can watch it work.",
+    hint: "Tap the Slow Down segment to cast it",
+    waitFor: "castSlow",
+    settleFor: 3, // brief pause so the effect on the marching scouts is visible
     tutorialWave: true, // keep a small enemy trickle marching at the player for the demo
     onEnter: (g) => {
-      g.trainProgress = trainThreshold("storm");
+      g.trainProgress = trainThreshold("slow");
       const attacker = g.towers.filter((t) => t.owner === 1)
         .sort((a, b) => a.troops - b.troops)[0];
       if (attacker) attacker.troops = towerMax(attacker); // make sure it has plenty to send
@@ -825,19 +1012,36 @@ const TUTORIAL_STEPS = [
     onEnter: (g) => { g.trainProgress = trainThreshold("speed"); },
   },
   {
-    title: "Special: Tower Defense 2.0",
-    body: "The strongest special — your towers lob splash-damage boulders, each hit crushing up to 4 enemies. Fully charged for you — and we've sent a few scouts your way so you can watch it work.",
-    hint: "Tap the Tower Defense 2.0 segment to cast it",
-    waitFor: "castFire",
+    title: "Special: Tower Defense",
+    body: "The strongest special in the rotation — every one of your towers fires twice as fast for a while. Fully charged for you — and we've sent a few scouts your way so you can watch it work.",
+    hint: "Tap the Tower Defense segment to cast it",
+    waitFor: "castStorm",
     settleFor: TOWER_DEF_DURATION, // hold the step open for the buff's full active window
     tutorialWave: true, // keep a small enemy trickle marching at the player for the demo
     onEnter: (g) => {
-      g.trainProgress = trainThreshold("fire");
+      g.trainProgress = trainThreshold("storm");
       const attacker = g.towers.filter((t) => t.owner === 1)
         .sort((a, b) => a.troops - b.troops)[0];
       if (attacker) attacker.troops = towerMax(attacker); // make sure it has plenty to send
     },
   },
+  // Tower Defense 2.0 is currently pulled from the active rotation (see the SPECIAL_STAGE
+  // note near the specials constants) — its tutorial step is preserved here, commented
+  // out, so restoring the special is a matter of un-commenting this plus its UI/AI entries:
+  // {
+  //   title: "Special: Tower Defense 2.0",
+  //   body: "The strongest special — your towers lob splash-damage boulders, each hit crushing up to 4 enemies. Fully charged for you — and we've sent a few scouts your way so you can watch it work.",
+  //   hint: "Tap the Tower Defense 2.0 segment to cast it",
+  //   waitFor: "castFire",
+  //   settleFor: TOWER_DEF_DURATION,
+  //   tutorialWave: true,
+  //   onEnter: (g) => {
+  //     g.trainProgress = trainThreshold("fire");
+  //     const attacker = g.towers.filter((t) => t.owner === 1)
+  //       .sort((a, b) => a.troops - b.troops)[0];
+  //     if (attacker) attacker.troops = towerMax(attacker);
+  //   },
+  // },
   {
     title: "You're Ready",
     body: "That covers territory, upgrades, and specials. In a real match rivals fight back and can beat you — this one just can't. Good luck out there, General.",
@@ -875,20 +1079,24 @@ function TowerConquest() {
   }, [paused]);
   const [soundOn, setSoundOn] = useState(true);
   useEffect(() => { SoundEngine.setMuted(!soundOn); }, [soundOn]);
-  const [showPlayers, setShowPlayers] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [tutorialStep, setTutorialStep] = useState(0);
+  // Hold-to-convert confirmation bubble: { id, x, y, toType } in canvas-relative
+  // screen coords, or null when closed. Holding a building no longer converts
+  // it instantly — it just opens this prompt; the actual conversion only
+  // happens if the player taps Confirm.
+  const [convertConfirm, setConvertConfirm] = useState(null);
   const tutorialStepRef = useRef(0);
   useEffect(() => { tutorialStepRef.current = tutorialStep; }, [tutorialStep]);
   const [fireInfo, setFireInfo] = useState({
-    fireSecs: TRAIN_STAGE * 3, stormSecs: TRAIN_STAGE * 1, speedSecs: TRAIN_STAGE * 2,
-    fireCd: 0, stormCd: 0, speedCd: 0,
+    fireSecs: TRAIN_STAGE * 3, stormSecs: TRAIN_STAGE * 3, speedSecs: TRAIN_STAGE * 2, slowSecs: TRAIN_STAGE * 1,
+    fireCd: 0, stormCd: 0, speedCd: 0, slowCd: 0,
     trainProgress: 0,
   });
 
   // Pulse each special button once, right when it comes off cooldown.
-  const [pulse, setPulse] = useState({ fire: false, storm: false, speed: false });
-  const prevSecsRef = useRef({ fire: TRAIN_STAGE * 3, storm: TRAIN_STAGE * 1, speed: TRAIN_STAGE * 2 });
+  const [pulse, setPulse] = useState({ fire: false, storm: false, speed: false, slow: false });
+  const prevSecsRef = useRef({ fire: TRAIN_STAGE * 3, storm: TRAIN_STAGE * 3, speed: TRAIN_STAGE * 2, slow: TRAIN_STAGE * 1 });
   useEffect(() => {
     const prev = prevSecsRef.current;
     // "Ready to tap" needs BOTH the train loaded and the special's own cooldown clear —
@@ -897,24 +1105,27 @@ function TowerConquest() {
       fire: Math.max(fireInfo.fireSecs, fireInfo.fireCd),
       storm: Math.max(fireInfo.stormSecs, fireInfo.stormCd),
       speed: Math.max(fireInfo.speedSecs, fireInfo.speedCd),
+      slow: Math.max(fireInfo.slowSecs, fireInfo.slowCd),
     };
     const justReady = {
       fire: prev.fire > 0 && next.fire <= 0,
       storm: prev.storm > 0 && next.storm <= 0,
       speed: prev.speed > 0 && next.speed <= 0,
+      slow: prev.slow > 0 && next.slow <= 0,
     };
     prevSecsRef.current = next;
-    if (justReady.fire || justReady.storm || justReady.speed) {
+    if (justReady.fire || justReady.storm || justReady.speed || justReady.slow) {
       setPulse((p) => ({
         fire: p.fire || justReady.fire,
         storm: p.storm || justReady.storm,
         speed: p.speed || justReady.speed,
+        slow: p.slow || justReady.slow,
       }));
-      for (const k of ["fire", "storm", "speed"]) {
+      for (const k of ["fire", "storm", "speed", "slow"]) {
         if (justReady[k]) setTimeout(() => setPulse((p) => ({ ...p, [k]: false })), 650);
       }
     }
-  }, [fireInfo.fireSecs, fireInfo.stormSecs, fireInfo.speedSecs, fireInfo.fireCd, fireInfo.stormCd, fireInfo.speedCd]);
+  }, [fireInfo.fireSecs, fireInfo.stormSecs, fireInfo.speedSecs, fireInfo.slowSecs, fireInfo.fireCd, fireInfo.stormCd, fireInfo.speedCd, fireInfo.slowCd]);
 
   useEffect(() => { pctRef.current = pct; }, [pct]);
 
@@ -971,7 +1182,7 @@ function TowerConquest() {
       teams,
       mode: gameMode,
       tutorial,          // if true, the player can never lose (see outcome check)
-      tutorialFlags: { captured: false, upgraded: false, castStorm: false, castSpeed: false, castFire: false },
+      tutorialFlags: { captured: false, upgraded: false, castStorm: false, castSpeed: false, castFire: false, castSlow: false },
       tutorialWaitStart: null, // g.pulse timestamp when the current step's waitFor flag tripped;
                                // null while still waiting. Used to hold the step open for
                                // `settleFor` seconds so the player actually sees the effect.
@@ -991,6 +1202,13 @@ function TowerConquest() {
       pointer: { x: W / 2, y: H / 2 },
       uidSeq: 1,
       numPlayers: nPlayers,
+      // Momentum: each player's current combat-strength multiplier, baseline
+      // 1.0 (100%). Shifts by MOMENTUM_KILL_STEP per attacker killed by a
+      // tower/castle defense (defender +, attacker -) and by
+      // MOMENTUM_CAPTURE_BONUS when a player captures a building (capturer
+      // only — losing a building costs nothing extra). See unitArrives,
+      // applyMomentumKill, applyMomentumCapture, momentumMult.
+      momentum: Array.from({ length: nPlayers }, () => 1),
       drag: null,       // {src, x, y, sx, sy} while pointer is held down
       lastTap: null,    // {id, time} for double-tap upgrade detection
       hover: null,
@@ -1005,7 +1223,6 @@ function TowerConquest() {
     };
     buildTerrainTexture(gameRef.current);
     setOutcome(null);
-    setShowPlayers(false);
     setMenuOpen(false);
     setShowHelp(false);
     if (tutorial) {
@@ -1182,9 +1399,11 @@ function TowerConquest() {
       fireSecs: Math.ceil(Math.max(0, trainThreshold("fire") - g.trainProgress)),
       stormSecs: Math.ceil(Math.max(0, trainThreshold("storm") - g.trainProgress)),
       speedSecs: Math.ceil(Math.max(0, trainThreshold("speed") - g.trainProgress)),
+      slowSecs: Math.ceil(Math.max(0, trainThreshold("slow") - g.trainProgress)),
       fireCd: Math.ceil(cooldownRemaining(g, "fire")),
       stormCd: Math.ceil(cooldownRemaining(g, "storm")),
       speedCd: Math.ceil(cooldownRemaining(g, "speed")),
+      slowCd: Math.ceil(cooldownRemaining(g, "slow")),
       trainProgress: g.trainProgress,
     });
 
@@ -1215,9 +1434,13 @@ function TowerConquest() {
     }
   };
 
-  // No new towers added — "storm" slot speeds up every existing defense tower the
-  // caster's team owns (2x fire rate, TOWER_DEF_DURATION seconds). "fire" slot swaps
-  // those towers to fire splash-damage boulders instead, at their normal fire rate.
+  // "storm" slot speeds up every tower the caster's team owns to 2x fire rate for
+  // TOWER_DEF_DURATION seconds; "fire" slot swaps them to splash-damage boulders at
+  // normal rate. Crucially, setting rateMult/boulder here is also what temporarily
+  // "activates" firing capability in a CASTLE — castles have no defense of their own
+  // otherwise (see the firing-eligibility check in the game loop) — so casting this
+  // on a team that's mostly castles briefly turns every one of them into a working
+  // tower for the buff's duration.
   function castTowerDefense(g, owner, kind) {
     const boulder = kind === "fire";
     for (const t of g.towers) {
@@ -1258,6 +1481,25 @@ function TowerConquest() {
     setCd(g, "speed", owner);
   }
 
+  // "slow" slot — the new 1st-stage special. Mirror image of castSpeed: global, instant,
+  // no radius/targeting, but applies to every currently-marching HOSTILE soldier (anyone
+  // not on the caster's team) instead of the caster's own — -25% speed for the rest of
+  // their trip.
+  function castSlow(g, owner) {
+    for (const u of g.units) {
+      if (!(sameTeam(g, u.owner, owner) || u.owner === owner)) u.speedMul = SLOW_DEBUFF;
+    }
+    // Visual feedback: a quick pulse ring at every castle the caster owns, same language
+    // as castSpeed/castTowerDefense.
+    for (const t of g.towers) {
+      if (sameTeam(g, t.owner, owner) || t.owner === owner) {
+        g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.5, color: "#8FA3C7" });
+      }
+    }
+    SoundEngine.slow(owner === 0 ? 1 : 0.4);
+    setCd(g, "slow", owner);
+  }
+
   const readyFor = (g, kind, owner = 0) =>
     trainOf(g, owner) >= trainThreshold(kind) && cooldownRemaining(g, kind, owner) <= 0;
 
@@ -1270,10 +1512,12 @@ function TowerConquest() {
     if (kind === "speed") castSpeed(g, 0);
     else if (kind === "storm") castTowerDefense(g, 0, "storm");
     else if (kind === "fire") castTowerDefense(g, 0, "fire");
+    else if (kind === "slow") castSlow(g, 0);
     if (g.tutorial) {
       if (kind === "speed") g.tutorialFlags.castSpeed = true;
       else if (kind === "storm") g.tutorialFlags.castStorm = true;
       else if (kind === "fire") g.tutorialFlags.castFire = true;
+      else if (kind === "slow") g.tutorialFlags.castSlow = true;
     }
   };
 
@@ -1282,13 +1526,14 @@ function TowerConquest() {
     if (!g || g.over || paused) return;
     SoundEngine.resume(); // real user gesture — Safari only reliably resumes a suspended context from here
     e.currentTarget.setPointerCapture?.(e.pointerId);
+    setConvertConfirm(null); // a new press on the map dismisses any pending convert prompt
     const sp = canvasPos(e);
     const p = unproj(g, sp.x, sp.y);
     g.pointer = p;
     const region = regionAt(g, p);
     // Drag endpoint (x, y) lives in world coords; (ssx, ssy) keeps the screen
     // start so the tap-vs-drag threshold is measured in screen pixels.
-    if (region && region.owner === 0) g.drag = { src: region.id, x: p.x, y: p.y, ssx: sp.x, ssy: sp.y };
+    if (region && region.owner === 0) g.drag = { src: region.id, x: p.x, y: p.y, ssx: sp.x, ssy: sp.y, t0: performance.now() };
   };
 
   const handleMove = (e) => {
@@ -1314,9 +1559,22 @@ function TowerConquest() {
     const src = g.towers[drag.src];
     const moved = Math.hypot(sp.x - drag.ssx, sp.y - drag.ssy); // screen px
 
-    // A tap (little movement) that lands back on your own castle → double-tap upgrades it
+    // A tap (little movement) that lands back on your own building → double-tap
+    // upgrades it, or a long press-and-hold (no movement, held past HOLD_MS)
+    // opens a confirm prompt to convert it between castle and tower — holding
+    // no longer converts instantly, it just offers the option.
     if (moved < 14 && target && target.id === src.id && src.owner === 0) {
       const now = performance.now();
+      if (drag.t0 != null && now - drag.t0 >= HOLD_MS) {
+        g.lastTap = null;
+        if (canConvert(src)) {
+          const rect = canvasRef.current.getBoundingClientRect();
+          const bx = Math.min(rect.width - 90, Math.max(90, sp.x));
+          const by = Math.min(rect.height - 20, Math.max(70, sp.y));
+          setConvertConfirm({ id: src.id, x: bx, y: by, toType: src.type === "tower" ? "castle" : "tower" });
+        }
+        return;
+      }
       if (g.lastTap && g.lastTap.id === src.id && now - g.lastTap.time < 350) {
         g.lastTap = null;
         if (canStartUpgrade(src)) {
@@ -1363,11 +1621,14 @@ function TowerConquest() {
       if (g.eliminated.has(pid)) continue;
       const isTeam = (owner) => owner === pid || sameTeam(g, owner, pid);
 
-      // Tower Defense 2.0 — save the boulder barrage for serious incoming pressure.
-      if (readyFor(g, "fire", pid)) {
-        if (incomingThreat(g, pid, isTeam) >= 10) castTowerDefense(g, pid, "fire");
-      }
-      // Tower Defense — worth it against moderate pressure.
+      // Tower Defense 2.0 — pulled from the active rotation (see SPECIAL_STAGE note),
+      // so the AI no longer casts it. Left here, commented out, so restoring it is a
+      // one-line uncomment once it's back in the specials UI array below.
+      // if (readyFor(g, "fire", pid)) {
+      //   if (incomingThreat(g, pid, isTeam) >= 10) castTowerDefense(g, pid, "fire");
+      // }
+      // Tower Defense — now the strongest ACTIVE special (3rd/top tier) — worth it
+      // against moderate pressure.
       if (readyFor(g, "storm", pid)) {
         if (incomingThreat(g, pid, isTeam) >= 5) castTowerDefense(g, pid, "storm");
       }
@@ -1376,12 +1637,26 @@ function TowerConquest() {
         const marching = g.units.reduce((n, u) => n + (isTeam(u.owner) ? 1 : 0), 0);
         if (marching >= 5) castSpeed(g, pid);
       }
+      // Slow Down — the cheapest, fastest-to-reload tier (1st stage): worth using
+      // against even a modest incoming push, since it costs little train progress and
+      // buys the defender extra tower exposure time / reinforcement time either way.
+      if (readyFor(g, "slow", pid)) {
+        if (incomingThreat(g, pid, isTeam) >= 3) castSlow(g, pid);
+      }
     }
   }
 
   function aiAct(g, pid) {
     const own = g.towers.filter((t) => t.owner === pid);
     if (own.length === 0) return;
+
+    // Own momentum, computed once — used throughout to size attacks correctly
+    // (an attacker on a losing streak hits for less, per unitArrives' dmg
+    // formula, so needs proportionally more troops to take anything) and to
+    // shift posture toward defense when it's low (see MOMENTUM_CAUTIOUS below).
+    const myMomentum = momentumMult(g, pid);
+    const MOMENTUM_CAUTIOUS = 0.9; // below this, play it safer — react to smaller threats, demand a bigger margin before attacking, consolidate instead of gambling on expansion
+    const cautious = myMomentum < MOMENTUM_CAUTIOUS;
 
     // Tally troops in flight toward every tower, split into "my team" vs "enemy".
     const isTeam = (owner) => owner === pid || sameTeam(g, owner, pid);
@@ -1428,12 +1703,18 @@ function TowerConquest() {
 
     // ---- 1) Defend a teammate (mine or an ally's, including the human) ----
     // Consider all towers on my team; find the one most likely to fall.
+    // When I'm on a losing streak (cautious), react to smaller shortfalls
+    // instead of waiting for a clear-cut one — better to overreact defensively
+    // while weak than lose more ground and feed the spiral.
+    const defendSensitivity = cautious ? 0.4 : 1;
     let defend = null, worst = 0;
     for (const t of g.towers) {
       if (!isTeam(t.owner)) continue;
-      const defense = t.troops + inc[t.id].team;
+      // A defender's own momentum makes their buildings tougher across the board
+      // (see momentumMult/unitArrives) — no more flat type-based bonus.
+      const defense = (t.troops + inc[t.id].team) * momentumMult(g, t.owner);
       const shortfall = inc[t.id].enemy - defense;   // >0 → projected to fall
-      if (shortfall > 1 && shortfall > worst) { worst = shortfall; defend = t; }
+      if (shortfall > defendSensitivity && shortfall > worst) { worst = shortfall; defend = t; }
     }
     if (defend) {
       const helper = helperFor(defend, defend.owner === pid ? defend : null);
@@ -1450,21 +1731,49 @@ function TowerConquest() {
     }
 
     // ---- 2) Reinforce a teammate's attack that's coming up short ----
+    // Deliberately simple: base the requirement directly on what's actually IN
+    // the target right now (plus any reinforcements already inbound to it) —
+    // no regen/travel projection. Layered projection math kept producing
+    // subtly-wrong estimates that undershot in practice (see project notes).
+    // Require at least 50% more attackers than that — comfortably clears the
+    // castle-capture math (20% bonus, see unitArrives) plus regen/arrow
+    // uncertainty in one flat, robust margin.
+    const ATTACK_MARGIN = 1.5;
     let push = null, bestDeficit = 0;
     for (const t of g.towers) {
       if (isTeam(t.owner)) continue;                 // enemy or neutral
       const assault = inc[t.id].team;
       if (assault <= 0) continue;                     // nobody on my team is attacking it
-      const garrison = Math.min(towerMax(t), t.troops + towerRegen(t) * 0.5);
-      const deficit = garrison - assault;             // >0 → the assault falls short
+      // A defender on a momentum streak is tougher than their raw troop count
+      // suggests (see momentumMult/unitArrives) — account for that here too.
+      // Also divide by OUR momentum: real damage per attacker is
+      // attackerMomentum / defenderMomentum (see unitArrives), so a losing
+      // streak means each of our marching troops is individually weaker and
+      // we need more of them for the same effect — this was previously
+      // missing here, letting a weakened AI underestimate what an assault
+      // actually needs.
+      const currentDefense = (t.troops + inc[t.id].enemy) * momentumMult(g, t.owner);
+      const required = (currentDefense * ATTACK_MARGIN) / myMomentum;
+      const deficit = required - assault;             // >0 → the assault falls short
       if (deficit > 0.5 && deficit > bestDeficit) { bestDeficit = deficit; push = t; }
     }
     if (push) {
       const helper = helperFor(push, null);
       if (helper) {
+        // Any hostile tower the helper's march route passes within range of
+        // (the target itself, if it's a tower, or another tower along the
+        // way) will pick off some of these reinforcements before they ever
+        // arrive — send extra to cover that, not just the raw deficit.
+        const losses = expectedLosses(g, helper, push, isTeam);
         const canSend = spareFrom(helper);
-        const need = bestDeficit + 1;
-        if (canSend >= Math.min(need, 2)) {
+        const need = bestDeficit + losses + 1;
+        // Only commit if it's not a waste: require covering most of the
+        // deficit, same standard as the defend case above. The old check
+        // here — canSend >= Math.min(need, 2) — collapses to "canSend >= 2"
+        // for any need of 2 or more, so a helper with only a handful of
+        // spare troops would pile them into an assault that needed dozens
+        // more, e.g. reinforcing with 5 when 40 were actually required.
+        if (canSend >= need * 0.6) {
           const pct = bracket(helper.troops, Math.min(need, canSend)) || ATTACK_CAP;
           issueOrder(g, helper, push, pct);
           return;
@@ -1479,46 +1788,50 @@ function TowerConquest() {
     if (targets.length === 0) return;
 
     const REVENGE_COOLDOWN = 8; // seconds before we'll consider retaking a castle we just lost
+    // Same deliberately-simple rule as section 2 above: what's actually in the
+    // target right now (+ its own inbound reinforcements, − our team's own
+    // inbound attackers already committed), times ATTACK_MARGIN (50% more) —
+    // plus expected losses to any hostile tower the march route passes
+    // through (the target itself, if it's a tower, or another one en route).
+    // Also divided by our own momentum — see the note in section 2 above;
+    // same reasoning, this is what actually accounts for "the AI itself is on
+    // a losing streak" when sizing a fresh attack.
     const evalTarget = (t) => {
-      const travel = dist(src, t) / UNIT_SPEED;
-      // Reinforcements already inbound to this castle (from its owner, or anyone
-      // else hostile to us) count toward its defense — otherwise we'll throw an
-      // attack at a castle that's about to be re-garrisoned and lose for nothing.
-      const garrison = Math.min(towerMax(t), t.troops + towerRegen(t) * travel) + inc[t.id].enemy;
-      const rawNeed = garrison - inc[t.id].team; // don't pile onto what the team already has covered
-      // The defense tower itself whittles down an approaching force — every shot
-      // it gets off during the march (and during the time it takes to actually
-      // deploy that many troops, since orders trickle out at SPAWN_RATE) kills
-      // one attacker before they ever reach the garrison fight. Without this the
-      // AI routinely sends forces that look sufficient on paper but arrive short
-      // by exactly the number of arrows fired en route — the classic "attacked
-      // and lost for nothing" case.
-      if (t.defs && t.defs.length && rawNeed > 0) {
-        const fireCd = towerFireCd(t) / (t.defs[0].rateMult || 1);
-        const spawnDuration = rawNeed / SPAWN_RATE;
-        const shots = (travel + spawnDuration) / fireCd;
-        return rawNeed + shots;
-      }
-      return rawNeed;
+      const currentDefense = (t.troops + inc[t.id].enemy) * momentumMult(g, t.owner);
+      const losses = expectedLosses(g, src, t, isTeam);
+      const need = (currentDefense * ATTACK_MARGIN) / myMomentum - inc[t.id].team + losses;
+      return Math.max(0, need);
     };
-    // A castle we just lost is a trap unless we can hit it hard: demand a much
-    // bigger margin during the cooldown window instead of pecking at it again
-    // the moment it looks weak.
+    // A castle we just lost is a trap unless we can hit it hard: demand extra
+    // caution on top of the already-baked-in 50% margin during the cooldown
+    // window instead of pecking at it again the moment it looks weak. Being on
+    // a losing streak generally demands the same kind of extra caution, not
+    // just against a specific castle — a weakened AI shouldn't be gambling on
+    // expansion, so it insists on a bigger margin before committing anywhere.
     const revengeMargin = (t) =>
-      (t.lostBy === pid && g.pulse - t.lostAt < REVENGE_COOLDOWN) ? 2 : 1.3;
+      ((t.lostBy === pid && g.pulse - t.lostAt < REVENGE_COOLDOWN) ? 1.3 : 1) * (cautious ? 1.25 : 1);
 
     let best = null, bestScore = Infinity;
     for (const t of targets) {
-      const score = evalTarget(t) + dist(src, t) * 0.02;
+      const need = evalTarget(t);
+      // A target we've already committed enough in-flight force to (need <=
+      // 0, i.e. our own already-marching troops cover it) isn't a reason to
+      // send MORE — the previous bug here was that a clamped-to-0 need still
+      // trivially passed the smallest attack bracket's ">= 0" check below, so
+      // the AI kept firing off minimum-size orders at an already-covered
+      // target forever. Skip it from consideration entirely instead.
+      if (need <= 0) continue;
+      const score = need + dist(src, t) * 0.02;
       if (score < bestScore) { bestScore = score; best = t; }
     }
-    if (!best) return;
+    if (!best) return; // nothing currently worth attacking
 
     const need = evalTarget(best);
     // Only worth attacking if the force sent clears the defense with real room to
     // spare — sending barely more than the garrison means the attack can fail to
     // arithmetic rounding, regen ticks, or reinforcements landing a beat early.
     const minSend = need * revengeMargin(best);
+    if (minSend < 1) return; // nothing meaningful actually required right now
     const choice = [25, 50, ATTACK_CAP].find(
       (o) => Math.floor((src.troops * o) / 100) >= minSend
     );
@@ -1541,9 +1854,13 @@ function TowerConquest() {
       }
     }
 
-    if (Math.random() < 0.25 && own.length > 1) {
+    // Nothing qualified as worth attacking. Normally that's just idle — but
+    // while cautious (losing streak), proactively shore up the weakest castle
+    // instead of leaving it to chance: consolidating strength is the point of
+    // playing defensively, not just declining to attack.
+    if ((cautious || Math.random() < 0.25) && own.length > 1) {
       const weak = own.reduce((a, b) => (a.troops < b.troops ? a : b));
-      if (weak.id !== src.id) issueOrder(g, src, weak, 25);
+      if (weak.id !== src.id) issueOrder(g, src, weak, cautious ? 50 : 25);
     }
   }
 
@@ -1557,14 +1874,51 @@ function TowerConquest() {
   const canStartUpgrade = (t) =>
     t.level < MAX_LEVEL && !t.upgrading && t.troops >= towerMax(t);
 
+  // ----- Castle <-> tower conversion -----
+  // Press-and-hold (no drag) on your own building past HOLD_MS opens a
+  // confirm bubble (see convertConfirm state + its JSX) rather than
+  // converting right away — the actual flip only happens if the player taps
+  // Confirm there. Costs CONVERT_COST troops and resets the building back to
+  // level 1 — you're trading its accumulated levels for the other building
+  // type's abilities.
+  const canConvert = (t) => !t.upgrading && t.troops >= CONVERT_COST;
+  function convertBuilding(g, t) {
+    if (!canConvert(t)) return;
+    t.troops = Math.max(0, t.troops - CONVERT_COST);
+    t.type = t.type === "tower" ? "castle" : "tower";
+    t.level = 1;
+    applyMomentumBuild(g, t.owner);
+    if (t.defs && t.defs[0]) {
+      t.defs[0].rateMult = 1; t.defs[0].rateExpiresAt = 0;
+      t.defs[0].boulder = false; t.defs[0].boulderExpiresAt = 0;
+      const p = defenderPoint(t);
+      t.defs[0].x = p.x; t.defs[0].y = p.y;
+    }
+    g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.6, color: "#8AD1FF" });
+    for (let i = 0; i < 10; i++) {
+      const a = (i / 10) * Math.PI * 2;
+      g.sparks.push({ x: t.x + Math.cos(a) * 20, y: t.y + Math.sin(a) * 20, life: 0.5, color: "#8AD1FF" });
+    }
+  }
+
   // ----- Arrival / capture -----
+  // No building type gets an automatic defense bonus anymore (see the
+  // momentum block up top). Damage dealt per hostile arrival is simply the
+  // attacker's momentum divided by the defender's — at baseline (both 1.0)
+  // that's exactly 1, so an N-troop building falls to N attackers, same as an
+  // unbuffed tower always did. A player who's been winning fights (momentum >
+  // 1) hits harder and defends better; one who's been losing (momentum < 1)
+  // does worse at both, until they land a kill or capture of their own.
+  // Whether a unit's damage finishes the garrison off is checked AFTER
+  // applying it (garrison <= 0 → that arrival is the one that captures).
   function unitArrives(g, u, t) {
     if (sameTeam(g, t.owner, u.owner) || t.owner === u.owner) {
-      t.troops += 1; // reinforce own or allied garrison (may exceed 100)
-    } else if (t.troops >= 1) {
-      t.troops -= 1;
+      t.troops += 1; // reinforce own or allied garrison — no per-building limit; see MAX_POPULATION (regen step) for the actual population budget
+    } else if ((t.troops -= momentumMult(g, u.owner) / momentumMult(g, t.owner)) > 0) {
+      applyMomentumKill(g, u.owner, t.owner); // this attacker died without finishing the defense — a kill "by castle"
       t.underAttackFlashAt = g.pulse; // hostile contact — flash the region (see draw())
     } else {
+      applyMomentumCapture(g, u.owner); // the capturer alone gains — losing a building costs the loser nothing extra
       t.lostBy = t.owner;      // who just lost this castle
       t.lostAt = g.pulse;      // game clock at the moment of capture
       t.owner = u.owner;
@@ -1602,10 +1956,57 @@ function TowerConquest() {
         // Battle heat decays continuously; feeds the ambient battle bed below.
         if (g.battleHeat > 0) g.battleHeat = Math.max(0, g.battleHeat - BATTLE_HEAT_DECAY * dt);
 
-        // Regeneration — every tower, neutral included, climbs back toward 100
+        // Momentum revert — everyone drifts back toward baseline (1.0) on
+        // their own over time, from EITHER side: below it climbs up, above it
+        // settles down, both at MOMENTUM_REVERT_STEP per
+        // MOMENTUM_REVERT_INTERVAL seconds (applied as a continuous rate
+        // rather than a discrete 5s tick, for smoothness — equivalent in
+        // aggregate). Never overshoots past 1.0 in either direction — a kill
+        // or capture during the same tick can still push it back out from
+        // there, this is just steady background pressure toward the middle.
+        if (g.momentum) {
+          const revertRate = MOMENTUM_REVERT_STEP / MOMENTUM_REVERT_INTERVAL;
+          for (let pid = 0; pid < g.numPlayers; pid++) {
+            if (g.momentum[pid] < 1) g.momentum[pid] = Math.min(1, g.momentum[pid] + revertRate * dt);
+            else if (g.momentum[pid] > 1) g.momentum[pid] = Math.max(1, g.momentum[pid] - revertRate * dt);
+          }
+        }
+
+        // Regeneration — every non-tower building climbs back toward its own
+        // towerCapacity (towerMax's upgrade threshold + CAPACITY_BONUS
+        // headroom: 25/35/45/55) — a building not yet upgraded can still
+        // passively regen a bit past its upgrade-ready point if left alone.
+        // On top of that, each PLAYER has a total-population budget that
+        // scales with how much territory they hold: buildingCount(player) *
+        // MAX_POPULATION — e.g. 10 buildings → 550 total. Regen simply
+        // contributes nothing further once a player's empire-wide total hits
+        // their (building-count-scaled) budget, even if a particular building
+        // is still below its own capacity. This budget only throttles regen —
+        // reinforcement (unitArrives) is completely unbounded per-building (a
+        // single building CAN hold far more than MAX_POPULATION troops if the
+        // player marches/consolidates them in from elsewhere), since moving
+        // troops between your own buildings doesn't create population, it
+        // just redistributes it, so it never needs to respect this budget
+        // itself.
+        const buildingCount = new Array(g.numPlayers).fill(0);
+        const totalPop = new Array(g.numPlayers).fill(0);
         for (const t of g.towers) {
-          if (t.troops < towerMax(t)) {
-            t.troops = Math.min(towerMax(t), t.troops + towerRegen(t) * dt);
+          if (t.owner === NEUTRAL) continue;
+          buildingCount[t.owner]++;
+          totalPop[t.owner] += t.troops;
+        }
+        for (const t of g.towers) {
+          const cap = towerCapacity(t);
+          if (t.troops >= cap) continue;
+          let room = cap - t.troops; // this building's own capacity still allows this much
+          if (t.owner !== NEUTRAL) {
+            const budget = buildingCount[t.owner] * MAX_POPULATION;
+            room = Math.min(room, Math.max(0, budget - totalPop[t.owner]));
+          }
+          const grown = Math.min(room, towerRegen(t) * dt);
+          if (grown > 0) {
+            t.troops += grown;
+            if (t.owner !== NEUTRAL) totalPop[t.owner] += grown; // keep the running total accurate within this tick
           }
         }
 
@@ -1616,6 +2017,7 @@ function TowerConquest() {
           if (t.upgrading.time >= t.upgrading.dur) {
             t.level += 1;
             t.upgrading = null;
+            applyMomentumBuild(g, t.owner);
             // The defense tower lives on the right turret, which moves as the
             // silhouette grows — keep it attached at the new level's position.
             if (t.defs && t.defs[0]) {
@@ -1732,9 +2134,12 @@ function TowerConquest() {
           }
         }
 
-        // Defensive towers: every region (including neutrals) shoots hostile troops
-        // passing through it. Tower Defense speeds up firing; Tower Defense 2.0 swaps
-        // to slower, splash-killing boulders at the normal rate — neither adds towers.
+        // Defensive fire: only TOWER-type buildings shoot hostile troops passing
+        // through them by default — castles no longer have a built-in defense
+        // tower. A castle temporarily gains firing capability while a Tower
+        // Defense (rateMult) or Tower Defense 2.0 (boulder) buff is active on it
+        // — the specials "activate" tower behavior in a castle for the buff's
+        // duration. Range grows with level (see towerRange()).
         const byUid = new Map();
         for (const u of g.units) byUid.set(u.uid, u);
         for (const t of g.towers) {
@@ -1743,9 +2148,11 @@ function TowerConquest() {
             // Expire either buff once its window is up
             if (d.rateMult && d.rateExpiresAt <= g.pulse) { d.rateMult = 1; d.rateExpiresAt = 0; }
             if (d.boulder && d.boulderExpiresAt <= g.pulse) { d.boulder = false; d.boulderExpiresAt = 0; }
+            const canFire = t.type === "tower" || d.rateMult > 1 || d.boulder;
+            if (!canFire) continue;
             d.cd -= dt;
             if (d.cd > 0) continue;
-            let nearest = null, nd = ARROW_RANGE;
+            let nearest = null, nd = towerRange(t);
             for (const u of g.units) {
               if (sameTeam(g, u.owner, t.owner)) continue;
               const dd = Math.hypot(u.x - t.x, u.y - t.y);
@@ -1767,10 +2174,29 @@ function TowerConquest() {
         // Defense 2.0) fly slower and crush a small cluster on impact instead of
         // just the one target.
         const arrowKilled = new Set();
+        const momentumKills = []; // {attacker, defender} — one per unit killed by this volley, for momentum
+        const RETARGET_RADIUS = 160; // px — how far an arrow will "snap" to a fresh target
         for (let i = g.arrows.length - 1; i >= 0; i--) {
           const a = g.arrows[i];
           a.life -= dt;
-          const tgt = byUid.get(a.targetUid);
+          let tgt = byUid.get(a.targetUid);
+          // Original target died (clash, another arrow) or arrived at its
+          // destination between the frame this arrow launched and now. Left
+          // alone the arrow would keep coasting toward that now-empty point
+          // and simply vanish on arrival with no impact — reading as a
+          // "miss" even though nothing was ever there to hit. Snap onto the
+          // nearest still-living hostile instead, once per arrow, so a shot
+          // is only wasted when there's genuinely nothing left nearby.
+          if ((!tgt || arrowKilled.has(tgt.uid)) && !a.retargeted) {
+            a.retargeted = true;
+            let cand = null, cd = RETARGET_RADIUS;
+            for (const u of g.units) {
+              if (arrowKilled.has(u.uid) || sameTeam(g, u.owner, a.owner)) continue;
+              const dd = Math.hypot(u.x - a.x, u.y - a.y);
+              if (dd < cd) { cd = dd; cand = u; }
+            }
+            if (cand) { a.targetUid = cand.uid; tgt = cand; }
+          }
           if (tgt && !arrowKilled.has(tgt.uid)) { a.lx = tgt.x; a.ly = tgt.y; }
           const d = Math.hypot(a.lx - a.x, a.ly - a.y) || 1;
           const v = (a.boulder ? BOULDER_SPEED : ARROW_SPEED) * dt;
@@ -1779,6 +2205,7 @@ function TowerConquest() {
           if (d <= v + 4) {
             if (tgt && !arrowKilled.has(tgt.uid)) {
               arrowKilled.add(tgt.uid);
+              momentumKills.push({ attacker: tgt.owner, defender: a.owner });
               g.sparks.push({ x: tgt.x, y: tgt.y, life: 0.35, color: "#FFD27A" });
               if (a.boulder) {
                 SoundEngine.boulderHit();
@@ -1792,6 +2219,7 @@ function TowerConquest() {
                   .slice(0, BOULDER_SPLASH_COUNT - 1);
                 for (const u of splashed) {
                   arrowKilled.add(u.uid);
+                  momentumKills.push({ attacker: u.owner, defender: a.owner });
                   g.sparks.push({ x: u.x, y: u.y, life: 0.35, color: "#C99060" });
                 }
                 // Dust-cloud burst at the impact point
@@ -1812,6 +2240,7 @@ function TowerConquest() {
             g.arrows.splice(i, 1);
           }
         }
+        for (const k of momentumKills) applyMomentumKill(g, k.attacker, k.defender);
         if (arrowKilled.size) {
           g.units = g.units.filter((u) => !arrowKilled.has(u.uid));
           gainTrainTime(g, arrowKilled.size);
@@ -1919,6 +2348,7 @@ function TowerConquest() {
             towers: mine.length,
             troops: Math.floor(mine.reduce((s, t) => s + t.troops, 0) + marching),
             dead: g.eliminated.has(pid),
+            momentum: momentumMult(g, pid),
           });
         }
         setHud(stats);
@@ -1926,9 +2356,11 @@ function TowerConquest() {
           fireSecs: Math.ceil(Math.max(0, trainThreshold("fire") - g.trainProgress)),
           stormSecs: Math.ceil(Math.max(0, trainThreshold("storm") - g.trainProgress)),
           speedSecs: Math.ceil(Math.max(0, trainThreshold("speed") - g.trainProgress)),
+          slowSecs: Math.ceil(Math.max(0, trainThreshold("slow") - g.trainProgress)),
           fireCd: Math.ceil(cooldownRemaining(g, "fire")),
           stormCd: Math.ceil(cooldownRemaining(g, "storm")),
           speedCd: Math.ceil(cooldownRemaining(g, "speed")),
+          slowCd: Math.ceil(cooldownRemaining(g, "slow")),
           trainProgress: g.trainProgress,
         });
       }
@@ -1958,7 +2390,7 @@ function TowerConquest() {
     ctx.beginPath();
     ctx.roundRect(-plateW / 2, -9, plateW, 18, 5);
     ctx.fill();
-    ctx.strokeStyle = t.troops > towerMax(t) ? col : "rgba(138,147,171,0.5)";
+    ctx.strokeStyle = t.troops > towerCapacity(t) ? col : "rgba(138,147,171,0.5)";
     ctx.lineWidth = 1;
     ctx.stroke();
     ctx.fillStyle = "#E8EBF2";
@@ -2261,6 +2693,190 @@ function TowerConquest() {
       ctx.moveTo(x, ay - 5); ctx.lineTo(x + 5, ay + 2); ctx.lineTo(x - 5, ay + 2);
       ctx.closePath(); ctx.fill();
     }
+
+    // Hold-to-convert hint — only while hovering your own building (and not
+    // mid-drag or mid-build), so it doesn't clutter the board otherwise.
+    if (!t.upgrading && t.owner === 0 && !dragging && g.hover === t.id && canConvert(t)) {
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.font = "600 10px 'Oxanium', sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("hold for convert-to-tower option", x, topY - 34);
+    }
+    ctx.restore();
+  }
+
+  // A watchtower: the standalone defensive building. Never regenerates troops,
+  // but passively fires at hostiles in range (range grows with level — see
+  // towerRange()). Deliberately a distinct silhouette from a castle (tall,
+  // narrow, tapered) so the two building types read apart at a glance.
+  function drawWatchtowerSprite(ctx, t, g) {
+    const owned = t.owner !== NEUTRAL;
+    const col = owned ? FACTIONS[t.owner].color : NEUTRAL_COLOR;
+    const B = proj(g, t.x, t.y);
+    ctx.save();
+    ctx.translate(B.x, B.y);
+    ctx.scale(B.s, B.s);
+    ctx.translate(-t.x, -t.y);
+    const x = t.x, y = t.y;
+    const lvl = Math.min(t.level || 1, 4);
+    const cfg = TOWER_CFG[lvl];
+    const groundY = y + 14;
+
+    const def = t.defs && t.defs[0];
+    const buff2 = def && def.rateMult === TOWER_DEF_RATE_MULT;
+    const boulder = def && !!def.boulder;
+    const buffed = buff2 || boulder;
+    const baseW = cfg.w * (buffed ? 1.2 : 1);
+    const topW = baseW * 0.72;
+    const h = cfg.h * (buffed ? 1.1 : 1);
+    const topY = groundY - h;
+    const midY = groundY - h / 2;
+
+    ctx.translate(x, groundY);
+    ctx.scale(CASTLE_SCALE, CASTLE_SCALE);
+    ctx.translate(-x, -groundY);
+
+    const litLeft = LIGHT_DIR.x < 0;
+
+    // Ground shadow
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.beginPath();
+    ctx.ellipse(x - LIGHT_DIR.x * 5, groundY + 3 - LIGHT_DIR.y * 2, baseW * 0.85, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Team ring (2v2 only)
+    if (owned && g.mode === "2v2") {
+      const myTeam = g.teams[0];
+      const ringCol = g.teams[t.owner] === myTeam ? "#FFD23F" : "#E4534A";
+      ctx.strokeStyle = ringCol; ctx.lineWidth = 2.4;
+      ctx.beginPath(); ctx.ellipse(x, groundY + 3, baseW * 0.85 + 5, 8.5, 0, 0, Math.PI * 2); ctx.stroke();
+    }
+
+    // Buff glow — same idea as a castle's buffed turret: grows + glows so an
+    // active Tower Defense buff reads at a glance across the map.
+    if (buffed) {
+      const glowR = baseW * (boulder ? 2.6 : 2.1);
+      const glow = ctx.createRadialGradient(x, midY, 0, x, midY, glowR);
+      if (boulder) { glow.addColorStop(0, "rgba(255,40,20,0.34)"); glow.addColorStop(1, "rgba(255,40,20,0)"); }
+      else { glow.addColorStop(0, "rgba(255,216,106,0.3)"); glow.addColorStop(1, "rgba(255,216,106,0)"); }
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(x, midY, glowR, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // Tapered stone shaft
+    const grad = ctx.createLinearGradient(x - baseW / 2, 0, x + baseW / 2, 0);
+    let [c1, c2, c3] = boulder ? ["#8A5A44", "#5A4438", "#3A2A22"] : buff2 ? ["#FFE38A", "#FFD86A", "#C98A2E"] : ["#6E7AA0", "#525d80", "#3b4463"];
+    if (!litLeft) { [c1, c3] = [c3, c1]; }
+    grad.addColorStop(0, c1); grad.addColorStop(0.55, c2); grad.addColorStop(1, c3);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(x - baseW / 2, groundY);
+    ctx.lineTo(x - topW / 2, topY);
+    ctx.lineTo(x + topW / 2, topY);
+    ctx.lineTo(x + baseW / 2, groundY);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 1; ctx.stroke();
+
+    // Crenellations at the top
+    ctx.fillStyle = boulder ? "#3A2A22" : buff2 ? "#FFD86A" : "#6E7AA0";
+    const m = topW / 5;
+    for (let i = 0; i < 3; i++) ctx.fillRect(x - topW / 2 + i * 2 * m, topY - 4, m, 4);
+
+    // One narrow window per level, faction-lit
+    for (let i = 0; i < lvl; i++) {
+      const wy = groundY - 12 - i * ((h - 20) / Math.max(1, lvl));
+      ctx.fillStyle = "#20263c"; ctx.fillRect(x - 2, wy - 3, 4, 6);
+      ctx.fillStyle = col; ctx.globalAlpha = 0.9; ctx.fillRect(x - 1.4, wy - 2.2, 2.8, 4.4); ctx.globalAlpha = 1;
+    }
+
+    // Beacon at the apex — this is where defenderPoint() anchors, i.e. where
+    // arrows/boulders actually originate from.
+    const beaconY = topY - 2;
+    if (boulder) {
+      const slitGlow = ctx.createRadialGradient(x, beaconY, 0, x, beaconY, 7);
+      slitGlow.addColorStop(0, "rgba(255,190,110,0.95)");
+      slitGlow.addColorStop(0.6, "rgba(255,90,30,0.75)");
+      slitGlow.addColorStop(1, "rgba(255,90,30,0)");
+      ctx.fillStyle = slitGlow;
+      ctx.beginPath(); ctx.arc(x, beaconY, 7, 0, Math.PI * 2); ctx.fill();
+    } else {
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.arc(x, beaconY, 3.2, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // One flag per level
+    const flagY = topY - 6;
+    const flagOffs = lvl === 1 ? [0] : Array.from({ length: lvl }, (_, i) => -baseW * 0.3 + (i / (lvl - 1)) * baseW * 0.6);
+    flagOffs.forEach((ox, i) => {
+      const fx = x + ox, dir = i % 2 === 0 ? 1 : -1;
+      ctx.strokeStyle = "#8a93ab"; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(fx, flagY); ctx.lineTo(fx, flagY - 10); ctx.stroke();
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.moveTo(fx, flagY - 10); ctx.lineTo(fx + 8 * dir, flagY - 7.7); ctx.lineTo(fx, flagY - 5.6);
+      ctx.closePath(); ctx.fill();
+    });
+
+    // Upgrade build dust (condensed version of the castle's)
+    if (t.upgrading) {
+      const bp = t.upgrading.time / t.upgrading.dur;
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x - baseW / 2 - 2, topY - 10, baseW + 4, h + 20); ctx.clip();
+      ctx.fillStyle = "rgba(255,214,120,0.12)";
+      ctx.fillRect(x - baseW / 2, groundY - h * bp, baseW, h * bp);
+      ctx.restore();
+      for (let k = 0; k < 5; k++) {
+        const seed = k * 12.9898;
+        const rnd = (o) => { const s = Math.sin(seed + o) * 43758.5453; return s - Math.floor(s); };
+        const ph = (g.pulse * (0.45 + rnd(1) * 0.5) + rnd(2)) % 1;
+        const sway = Math.sin(g.pulse * 2 + k) * (3 + ph * 5);
+        const px = x + (rnd(3) - 0.5) * baseW * 0.6 + sway * (rnd(4) - 0.5) * 2;
+        const py = groundY + 4 - ph * 26;
+        const r = 3 + ph * (6 + rnd(5) * 4);
+        const a = 0.45 * (1 - ph * 0.85) * (0.55 + rnd(6) * 0.45);
+        const g1 = 150 + (1 - ph) * 60, b1 = 118 + (1 - ph) * 34;
+        ctx.fillStyle = `rgba(${(205 - ph * 45) | 0},${g1 | 0},${b1 | 0},${a})`;
+        ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    // Drag source / drop target / hover rings
+    const ringR = Math.max(baseW * 0.62, h * 0.55) + 8;
+    const dragging = g.drag != null;
+    if (dragging && g.drag.src === t.id) {
+      const p = 2 + Math.sin(g.pulse * 5) * 1.5;
+      ctx.strokeStyle = "#FFFFFF"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, midY, ringR + p, 0, Math.PI * 2); ctx.stroke();
+    } else if (dragging && g.hover === t.id) {
+      ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.arc(x, midY, ringR, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+    } else if (!dragging && g.hover === t.id && t.owner === 0) {
+      ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(x, midY, ringR, 0, Math.PI * 2); ctx.stroke();
+    }
+
+    // Upgrade-ready hint
+    if (!t.upgrading && t.owner === 0 && canStartUpgrade(t)) {
+      const pulse = 0.5 + 0.5 * Math.sin(g.pulse * 5);
+      ctx.strokeStyle = `rgba(255,216,106,${0.5 + 0.4 * pulse})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, midY, ringR + 4 + pulse * 3, 0, Math.PI * 2); ctx.stroke();
+      const ay = topY - 20;
+      ctx.fillStyle = "#FFD86A";
+      ctx.beginPath();
+      ctx.moveTo(x, ay - 5); ctx.lineTo(x + 5, ay + 2); ctx.lineTo(x - 5, ay + 2);
+      ctx.closePath(); ctx.fill();
+    }
+
+    // Hold-to-convert hint
+    if (!t.upgrading && t.owner === 0 && !dragging && g.hover === t.id && canConvert(t)) {
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.font = "600 10px 'Oxanium', sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("hold for convert-to-castle option", x, topY - 34);
+    }
     ctx.restore();
   }
 
@@ -2364,9 +2980,26 @@ function TowerConquest() {
     }
 
 
-    // Tower range rings were removed entirely per feedback (they were previously
-    // drawn here as a dashed circle around each defended castle). ARROW_RANGE
-    // still governs actual defense-tower reach — just no longer visualized.
+    // Range rings: a dashed circle around every tower-type building (they're
+    // always armed), and around any castle currently under an active Tower
+    // Defense buff (the special temporarily activates the same firing
+    // behavior in it). Radius grows with level — see towerRange().
+    for (const t of g.towers) {
+      const def = t.defs && t.defs[0];
+      const buffed = def && (def.rateMult === TOWER_DEF_RATE_MULT || def.boulder);
+      if (t.type !== "tower" && !buffed) continue;
+      const C = P(t.x, t.y);
+      const r = towerRange(t) * C.s;
+      ctx.save();
+      ctx.strokeStyle = t.owner === NEUTRAL ? "rgba(255,255,255,0.35)" : FACTIONS[t.owner].color + "55";
+      ctx.lineWidth = 1.4;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      ctx.ellipse(C.x, C.y, r, r * TILT, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
 
     // "This is you" ring — a pulsing yellow marching-ants circle around the
     // player's own castles, only for the first few seconds of a match, so it's
@@ -2526,7 +3159,10 @@ function TowerConquest() {
     // drawTowerSprite's right turret), so there's just one entry per castle.
     const sprites = g.towers.map((t) => ({ wy: t.y, t }));
     sprites.sort((a, b) => a.wy - b.wy);
-    for (const s of sprites) drawTowerSprite(ctx, s.t, g);
+    for (const s of sprites) {
+      if (s.t.type === "tower") drawWatchtowerSprite(ctx, s.t, g);
+      else drawTowerSprite(ctx, s.t, g);
+    }
 
     // Smoke at the base of any castle currently under attack — only once hostile
     // troops are actually at the walls, not while they're still marching in.
@@ -2597,6 +3233,53 @@ function TowerConquest() {
           style={{ position: "absolute", inset: 0, cursor: "crosshair", touchAction: "none" }}
         />
 
+        {screen === "play" && convertConfirm && (
+          <div
+            style={{
+              position: "absolute",
+              left: convertConfirm.x, top: convertConfirm.y,
+              transform: "translate(-50%, -100%)",
+              zIndex: 60,
+              background: "rgba(20,28,46,0.97)",
+              border: "1px solid #3a4d72",
+              borderRadius: 10,
+              padding: "10px 12px",
+              display: "flex", flexDirection: "column", gap: 8,
+              boxShadow: "0 6px 20px rgba(0,0,0,0.45)",
+              fontFamily: "'Oxanium', sans-serif",
+            }}
+          >
+            <div style={{ color: "#E8EBF2", fontSize: 13, textAlign: "center", whiteSpace: "nowrap" }}>
+              Convert to {convertConfirm.toType}? (−{CONVERT_COST} troops, resets to Lv1)
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={() => {
+                  const g = gameRef.current;
+                  const t = g && g.towers[convertConfirm.id];
+                  if (t && t.owner === 0) convertBuilding(g, t);
+                  setConvertConfirm(null);
+                }}
+                style={{
+                  flex: 1, background: "#2FA83C", border: "none", borderRadius: 6,
+                  color: "#fff", fontWeight: 700, fontSize: 13, padding: "8px 10px", cursor: "pointer",
+                }}
+              >
+                Confirm
+              </button>
+              <button
+                onClick={() => setConvertConfirm(null)}
+                style={{
+                  flex: 1, background: "rgba(255,255,255,0.08)", border: "1px solid #3a4d72", borderRadius: 6,
+                  color: "#8a93ab", fontWeight: 700, fontSize: 13, padding: "8px 10px", cursor: "pointer",
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
       {screen === "menu" && (
         <div style={{
           position: "absolute", inset: 0,
@@ -2658,17 +3341,20 @@ function TowerConquest() {
                     paddingLeft: 20, display: "flex", flexDirection: "column", gap: 8, margin: 0,
                   }}>
                     <li>Drag from your region to any territory to send troops.</li>
-                    <li>Every region — even neutral ones — has a defense tower that shoots troops crossing it.</li>
-                    <li>Castles hold up to 10 troops. Double-tap a full castle to upgrade it: costs half its troops, adds +10 capacity, and speeds up regen and firing.</li>
+                    <li>Two building types: castles grow troops but don't shoot; towers never regrow troops but fire at hostiles passing through, at increasing range per level.</li>
+                    <li>No building gets an automatic defense bonus — instead, every player has <b style={{ color: "#E8EEF9" }}>momentum</b> (shown top-right): win fights and it climbs above 100%, making you hit harder and defend better; lose them and it drops. Killing an attacker with a tower/castle shifts 0.25% either way; capturing a building is worth 15% to the capturer alone — losing one costs nothing extra. Upgrading or converting a building adds 5%. Momentum quietly drifts back toward 100% on its own over time, from either side.</li>
+                    <li>Hold down on a building you own to bring up a convert prompt (confirm to switch it to the other type): costs 10 troops and resets it to level 1.</li>
+                    <li>Double-tap a full castle or tower to upgrade it: costs half its troops, raises capacity, and speeds up regen (castles) or firing/range (towers).</li>
                     <li>
                       Specials share one loading bar and fire instantly with a tap —
-                      no aiming. <span style={{ color: "#9DBBFF" }}>Tower defense</span> doubles
-                      your fire rate, <span style={{ color: "#57E0C6" }}>speed</span> boosts every
-                      marching soldier, and <span style={{ color: "#FF7A4A" }}>tower defense 2.0</span> fires
-                      boulders that splash nearby enemies. Deaths on the battlefield refill the
+                      no aiming. <span style={{ color: "#8FA3C7" }}>Slow Down</span> slows
+                      every marching enemy soldier by 25%. <span style={{ color: "#57E0C6" }}>Speed</span> boosts
+                      every marching soldier of yours. <span style={{ color: "#9DBBFF" }}>Tower defense</span> doubles
+                      the fire rate of every tower you own — and temporarily gives your castles
+                      the same firing power. Deaths on the battlefield refill the
                       bar for everyone. Enemies play by the same rules.
                     </li>
-                    <li>Everyone starts even. Take every rival's last castle to win.</li>
+                    <li>Everyone starts even, with castles only. Take every rival's last building to win.</li>
                   </ul>
                 </div>
               </div>
@@ -2751,25 +3437,18 @@ function TowerConquest() {
           {/* Top HUD */}
           <div style={{
             position: "absolute", top: 10, left: 12, right: 12,
-            display: "flex", alignItems: "center",
+            display: "flex", alignItems: "flex-start",
             justifyContent: "flex-start", pointerEvents: "none",
           }}>
             <div style={{ display: "flex", gap: 8, pointerEvents: "auto", position: "relative" }}>
-              <button onClick={() => { SoundEngine.click(); setMenuOpen(false); setShowPlayers((v) => !v); }}
-                title="Show players" aria-label="Show players"
-                style={chip({
-                  padding: "6px 10px", fontSize: 15,
-                  borderColor: showPlayers ? "#FFD23F" : "#46577d",
-                  color: showPlayers ? "#FFD23F" : "#E8EBF2",
-                })}>
-                👥
-              </button>
-              <button onClick={() => { SoundEngine.pause(); setPaused((p) => !p); }}
-                title={paused ? "Resume" : "Pause"} aria-label={paused ? "Resume" : "Pause"}
-                style={chip({ padding: "6px 12px", fontSize: 15 })}>
-                {paused ? "▶" : "⏸"}
-              </button>
-              <button onClick={() => { setShowPlayers(false); setMenuOpen((v) => !v); }}
+              <button onClick={() => {
+                SoundEngine.click();
+                setMenuOpen((v) => {
+                  const next = !v;
+                  setPaused(next); // the menu doubles as the pause control — open it to pause, close it to resume
+                  return next;
+                });
+              }}
                 style={chip({
                   padding: "6px 14px", fontSize: 13,
                   borderColor: menuOpen ? "#FFD23F" : "#46577d",
@@ -2778,80 +3457,10 @@ function TowerConquest() {
                 ☰ Menu
               </button>
 
-              {showPlayers && (
-                <>
-                  {/* Tap outside to close */}
-                  <div onClick={() => setShowPlayers(false)}
-                    style={{ position: "fixed", inset: 0, zIndex: 40 }} />
-                  <div style={{
-                    position: "absolute", top: "115%", left: 0, zIndex: 50,
-                    display: "flex", flexDirection: "column", gap: 8,
-                    background: "#1c2942", border: "1px solid #3a4d72", borderRadius: 10,
-                    padding: 10, width: 300,
-                    boxShadow: "0 8px 20px rgba(0,0,0,0.35)",
-                  }}>
-                    {(() => {
-                      const renderChip = (s) => (
-                        <div key={s.pid} style={{
-                          display: "flex", alignItems: "center", gap: 6, minWidth: 0,
-                          background: "rgba(28,41,66,0.82)",
-                          border: `1px solid ${s.dead ? "#232a3d" : FACTIONS[s.pid].dim}`,
-                          borderRadius: 8, padding: "5px 8px",
-                          opacity: s.dead ? 0.35 : 1,
-                          textDecoration: s.dead ? "line-through" : "none",
-                        }}>
-                          <span style={{
-                            width: 9, height: 9, borderRadius: "50%", flexShrink: 0,
-                            background: FACTIONS[s.pid].color, display: "inline-block",
-                          }} />
-                          <span style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                            {FACTIONS[s.pid].name}
-                          </span>
-                          <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "#8a93ab", marginLeft: "auto", flexShrink: 0 }}>
-                            {s.towers}⛫{s.troops}
-                          </span>
-                        </div>
-                      );
-                      // 2 players per row, whichever mode — keeps the panel short
-                      // so it doesn't cover the battlefield.
-                      const grid = (list) => (
-                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-                          {list.map(renderChip)}
-                        </div>
-                      );
-
-                      if (gameRef.current?.mode !== "2v2") return grid(hud);
-
-                      const myTeam = hud.find((s) => s.pid === 0)?.team ?? 0;
-                      return [myTeam, myTeam === 0 ? 1 : 0].map((teamId, idx) => (
-                        <React.Fragment key={teamId}>
-                          {idx === 1 && (
-                            <div style={{ textAlign: "center", fontSize: 11, fontWeight: 800, color: "#8a93ab", letterSpacing: 1 }}>VS</div>
-                          )}
-                          <div style={{
-                            display: "flex", flexDirection: "column", gap: 6,
-                            padding: "6px", borderRadius: 10,
-                            border: `1px solid ${teamId === myTeam ? "rgba(255,210,63,0.4)" : "rgba(228,83,74,0.35)"}`,
-                          }}>
-                            <span style={{
-                              fontSize: 10, letterSpacing: 1, fontWeight: 700,
-                              color: teamId === myTeam ? "#FFD23F" : "#E4534A", padding: "0 2px",
-                            }}>
-                              {teamId === myTeam ? "YOUR TEAM" : "ENEMY"}
-                            </span>
-                            {grid(hud.filter((s) => s.team === teamId))}
-                          </div>
-                        </React.Fragment>
-                      ));
-                    })()}
-                  </div>
-                </>
-              )}
-
               {menuOpen && (
                 <>
-                  {/* Tap outside to close */}
-                  <div onClick={() => setMenuOpen(false)}
+                  {/* Tap outside to close (and resume) */}
+                  <div onClick={() => { setMenuOpen(false); setPaused(false); }}
                     style={{ position: "fixed", inset: 0, zIndex: 40 }} />
                   <div style={{
                     position: "absolute", top: "115%", left: 0, zIndex: 50,
@@ -2864,7 +3473,7 @@ function TowerConquest() {
                       style={chip({ padding: "8px 12px", fontSize: 13, textAlign: "left", width: "100%" })}>
                       {soundOn ? "🔊 Sound: On" : "🔇 Sound: Off"}
                     </button>
-                    <button onClick={() => { SoundEngine.click(); setMenuOpen(false); setScreen("menu"); }}
+                    <button onClick={() => { SoundEngine.click(); setMenuOpen(false); setPaused(false); setScreen("menu"); }}
                       style={chip({ padding: "8px 12px", fontSize: 13, textAlign: "left", width: "100%" })}>
                       🗺️ New map
                     </button>
@@ -2872,24 +3481,43 @@ function TowerConquest() {
                 </>
               )}
             </div>
-          </div>
 
-          {/* Paused overlay (regular games only — tutorial has its own below) */}
-          {paused && !outcome && !gameRef.current?.tutorial && (
-            <div style={{
-              position: "absolute", inset: 0,
-              display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-              gap: 14, background: "rgba(10,14,24,0.72)", backdropFilter: "blur(2px)",
-            }}
-              onClick={() => setPaused(false)}
-            >
-              <div style={{ fontSize: 26, fontWeight: 800, letterSpacing: 3, color: "#E8EEF9" }}>PAUSED</div>
-              <button onClick={(e) => { e.stopPropagation(); SoundEngine.pause(); setPaused(false); }}
-                style={chip({ background: "#FFD23F", color: "#0A0E18", fontWeight: 800, border: "1px solid #FFD23F", padding: "9px 20px", fontSize: 14 })}>
-                Resume
-              </button>
-            </div>
-          )}
+            {/* Momentum — shown automatically, no toggle needed. Kept small and
+                translucent so it reads at a glance without covering the map. */}
+            {!gameRef.current?.tutorial && (
+              <div style={{
+                marginLeft: "auto", display: "flex", flexDirection: "column",
+                alignItems: "flex-end", gap: 4, pointerEvents: "none",
+              }}>
+                {hud.filter((s) => !s.dead).map((s) => {
+                  const pct = Math.round(s.momentum * 100);
+                  const tint = pct > 100 ? "#4ADE5A" : pct < 100 ? "#FF6B6B" : "#8a93ab";
+                  return (
+                    <div key={s.pid} style={{
+                      display: "flex", alignItems: "center", gap: 6,
+                      background: "rgba(10,14,24,0.32)",
+                      border: `1px solid ${FACTIONS[s.pid].dim}55`,
+                      borderRadius: 999, padding: "3px 9px",
+                    }}>
+                      <span style={{
+                        width: 7, height: 7, borderRadius: "50%", flexShrink: 0,
+                        background: FACTIONS[s.pid].color, display: "inline-block",
+                      }} />
+                      <span style={{ fontSize: 11, color: "rgba(232,235,242,0.85)", whiteSpace: "nowrap" }}>
+                        {FACTIONS[s.pid].name}
+                      </span>
+                      <span style={{
+                        fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, fontWeight: 700,
+                        color: tint, minWidth: 30, textAlign: "right",
+                      }}>
+                        {pct}%
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
 
           {/* Tutorial step overlay — explains the current step, then either lets
               the player try it live (unpausing) or advances straight to the next
@@ -3014,24 +3642,32 @@ function TowerConquest() {
         }}>
           {/* Specials: one merged "train" — each of the first 3 segments is both its own
               load-progress fill AND the tap target for that special. Fills left-to-right
-              in load order (Tower Defense → Speed → Tower Defense 2.0); a segment only
-              becomes tappable once it (and everything before it) has fully loaded —
-              tapping it casts instantly, no aiming/targeting step. A 4th segment (no
-              special of its own) visibly fills after that, banking reserve capacity —
-              enough that casting Tower Defense 2.0 from a full bar still leaves enough
-              to immediately follow up with Tower Defense. */}
+              in load order (Slow Down → Speed → Tower Defense); a segment only becomes
+              tappable once it (and everything before it) has fully loaded — tapping it
+              casts instantly, no aiming/targeting step. A 4th segment (no special of its
+              own) visibly fills after that, banking reserve capacity — enough that casting
+              Tower Defense from a full bar still leaves enough to immediately follow up
+              with Slow Down. (Tower Defense 2.0 is currently pulled from this rotation —
+              see the SPECIAL_STAGE note near the specials constants.) */}
           <div style={{
             display: "flex", width: "100%", maxWidth: 460,
             borderRadius: 12, overflow: "hidden", border: "1px solid #3a4d72",
           }}>
             {(() => {
               const specials = [
-                { kind: "storm", icon: "🛡️", name: "Tower Defense", secs: fireInfo.stormSecs, cd: fireInfo.stormCd,
-                  readyTxt: "#D2E0FF", readyBg: "rgba(92,124,196,0.34)", fillTint: "#8FB4FF" },
+                { kind: "slow", icon: "🐢", name: "Slow Down", secs: fireInfo.slowSecs, cd: fireInfo.slowCd,
+                  readyTxt: "#D7E8FF", readyBg: "rgba(70,110,168,0.34)", fillTint: "#8FA3C7" },
                 { kind: "speed", icon: "💨", name: "Speed", secs: fireInfo.speedSecs, cd: fireInfo.speedCd,
                   readyTxt: "#B8F5EA", readyBg: "rgba(46,158,138,0.34)", fillTint: "#57E0C6" },
-                { kind: "fire", icon: "🪨", name: "Tower Defense 2.0", secs: fireInfo.fireSecs, cd: fireInfo.fireCd,
-                  readyTxt: "#FFC7B0", readyBg: "rgba(180,40,25,0.42)", fillTint: "#FF3B30" },
+                { kind: "storm", icon: "🛡️", name: "Tower Defense", secs: fireInfo.stormSecs, cd: fireInfo.stormCd,
+                  readyTxt: "#D2E0FF", readyBg: "rgba(92,124,196,0.34)", fillTint: "#8FB4FF" },
+                // Tower Defense 2.0 ("fire") is currently pulled from the active rotation
+                // (see the SPECIAL_STAGE note near the specials constants) — its entry is
+                // removed from this array so it doesn't render/tap, but everything it
+                // needs (castTowerDefense's boulder branch, sounds, arrow splash logic) is
+                // still intact. Restore with:
+                // { kind: "fire", icon: "🪨", name: "Tower Defense 2.0", secs: fireInfo.fireSecs, cd: fireInfo.fireCd,
+                //   readyTxt: "#FFC7B0", readyBg: "rgba(180,40,25,0.42)", fillTint: "#FF3B30" },
               ];
               return [
                 ...specials.map((s, i) => {
@@ -3090,7 +3726,7 @@ function TowerConquest() {
                 (() => {
                   // 4th segment: pure reserve capacity, no special of its own. Fills
                   // from the 3rd special's threshold (60s) up to TRAIN_MAX (80s) —
-                  // banking this is what lets you follow up Tower Defense 2.0 with
+                  // banking this is what lets you follow up Tower Defense with
                   // Tower Defense right away instead of starting from empty.
                   const start = 3 * TRAIN_STAGE;
                   const fillPct = Math.max(0, Math.min(100, ((fireInfo.trainProgress - start) / TRAIN_STAGE) * 100));
