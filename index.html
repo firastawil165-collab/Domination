@@ -46,7 +46,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.179"; // bump by 0.001 each update
+const APP_VERSION = "0.181"; // bump by 0.001 each update
 const START_TROOPS = 3;      // every castle begins with 3 troops
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -208,8 +208,8 @@ const MOMENTUM_CAPTURE_BONUS = 0.10; // +10% for the player who captures a build
 const MOMENTUM_BUILD_BONUS = 0.05;   // +5% for completing an upgrade OR a castle<->tower conversion
 const MOMENTUM_REVERT_STEP = 0.01;       // 1% per MOMENTUM_REVERT_INTERVAL, pulling momentum back toward baseline from either side
 const MOMENTUM_REVERT_INTERVAL = 5;      // seconds — applied continuously (see the revert step), not as a discrete tick
-const MOMENTUM_MIN = 0.4;            // floor — keeps the damage ratio (see unitArrives) sane at the low end
-const MOMENTUM_MAX = 2.5;            // ceiling — same, at the high end
+const MOMENTUM_MIN = 0.75;           // floor — keeps the damage ratio (see unitArrives) sane at the low end
+const MOMENTUM_MAX = 1.5;            // ceiling — same, at the high end
 const clampMomentum = (v) => Math.max(MOMENTUM_MIN, Math.min(MOMENTUM_MAX, v));
 // A player's current momentum multiplier; NEUTRAL (and anything else out of
 // range) is always exactly 1.0 — it isn't a player and can't build or lose it.
@@ -1011,7 +1011,7 @@ const TUTORIAL_STEPS = [
   },
   {
     title: "Castles & Towers",
-    body: "There are two building types. Castles grow troops over time and can be upgraded, but don't shoot back. Towers never regrow troops, but fire at hostiles passing through — range grows with level. Hold down on any building you own to bring up the option to convert it (costs 10 troops, resets it to level 1) — you'll be asked to confirm.",
+    body: "There are two building types. Castles grow troops over time and can be upgraded, but don't shoot back. Towers never regrow troops, but fire at hostiles passing through — range grows with level. Hold down on any building you own to bring up the option to convert it (costs 10 troops and a 5-second build, resets it to level 1) — you'll be asked to confirm.",
     waitFor: null,
   },
   {
@@ -1903,38 +1903,31 @@ function TowerConquest() {
   // ----- Castle upgrade -----
   // Kick off a 5-second upgrade. Cost (half the max) is paid up front; the level
   // (and its bigger cap, faster regen & arrow fire) lands when the build finishes.
+  const UPGRADE_DUR = 5;   // seconds
   function startUpgrade(g, t) {
     t.troops = Math.max(0, t.troops - towerMax(t) / 2);
-    t.upgrading = { time: 0, dur: 5 };
+    t.upgrading = { time: 0, dur: UPGRADE_DUR, kind: "upgrade" };
   }
   const canStartUpgrade = (t) =>
     t.level < MAX_LEVEL && !t.upgrading && t.troops >= towerMax(t);
 
   // ----- Castle <-> tower conversion -----
   // Press-and-hold (no drag) on your own building past HOLD_MS opens a
-  // confirm bubble (see convertConfirm state + its JSX) rather than
-  // converting right away — the actual flip only happens if the player taps
-  // Confirm there. Costs CONVERT_COST troops and resets the building back to
-  // level 1 — you're trading its accumulated levels for the other building
-  // type's abilities.
+  // confirm bubble (see convertConfirm state + its JSX); tapping Confirm
+  // there starts a CONVERT_DUR-second build — same shape as an upgrade, and
+  // sharing its "t.upgrading" build-in-progress state (so the two are
+  // mutually exclusive and both show the same under-construction dust/hammer
+  // animation): cost is paid up front, but the actual flip (type, reset to
+  // level 1, defense tower reset) only lands once the build finishes — see
+  // the build-completion loop below, which branches on t.upgrading.kind.
+  // Previously this applied instantly on confirm; changed this session so
+  // converting costs real time too, not just troops, matching upgrading.
+  const CONVERT_DUR = 5;   // seconds — intentionally the same as UPGRADE_DUR
   const canConvert = (t) => !t.upgrading && t.troops >= CONVERT_COST;
-  function convertBuilding(g, t) {
+  function startConversion(g, t) {
     if (!canConvert(t)) return;
     t.troops = Math.max(0, t.troops - CONVERT_COST);
-    t.type = t.type === "tower" ? "castle" : "tower";
-    t.level = 1;
-    applyMomentumBuild(g, t.owner);
-    if (t.defs && t.defs[0]) {
-      t.defs[0].rateMult = 1; t.defs[0].rateExpiresAt = 0;
-      t.defs[0].boulder = false; t.defs[0].boulderExpiresAt = 0;
-      const p = defenderPoint(t);
-      t.defs[0].x = p.x; t.defs[0].y = p.y;
-    }
-    g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.6, color: "#8AD1FF" });
-    for (let i = 0; i < 10; i++) {
-      const a = (i / 10) * Math.PI * 2;
-      g.sparks.push({ x: t.x + Math.cos(a) * 20, y: t.y + Math.sin(a) * 20, life: 0.5, color: "#8AD1FF" });
-    }
+    t.upgrading = { time: 0, dur: CONVERT_DUR, kind: "convert", toType: t.type === "tower" ? "castle" : "tower" };
   }
 
   // ----- Arrival / capture -----
@@ -2046,11 +2039,31 @@ function TowerConquest() {
           }
         }
 
-        // Upgrade builds finishing
+        // Upgrade / conversion builds finishing
         for (const t of g.towers) {
           if (!t.upgrading) continue;
           t.upgrading.time += dt;
           if (t.upgrading.time >= t.upgrading.dur) {
+            if (t.upgrading.kind === "convert") {
+              t.type = t.upgrading.toType;
+              t.level = 1;
+              t.upgrading = null;
+              applyMomentumBuild(g, t.owner);
+              // The defense tower lives on the right turret; reset any active
+              // buffs and re-attach it at the new building type's position.
+              if (t.defs && t.defs[0]) {
+                t.defs[0].rateMult = 1; t.defs[0].rateExpiresAt = 0;
+                t.defs[0].boulder = false; t.defs[0].boulderExpiresAt = 0;
+                const p = defenderPoint(t);
+                t.defs[0].x = p.x; t.defs[0].y = p.y;
+              }
+              g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.6, color: "#8AD1FF" });
+              for (let i = 0; i < 10; i++) {
+                const a = (i / 10) * Math.PI * 2;
+                g.sparks.push({ x: t.x + Math.cos(a) * 20, y: t.y + Math.sin(a) * 20, life: 0.5, color: "#8AD1FF" });
+              }
+              continue;
+            }
             t.level += 1;
             t.upgrading = null;
             applyMomentumBuild(g, t.owner);
@@ -3314,14 +3327,14 @@ function TowerConquest() {
             }}
           >
             <div style={{ color: "#E8EBF2", fontSize: 13, textAlign: "center", whiteSpace: "nowrap" }}>
-              Convert to {convertConfirm.toType}? (−{CONVERT_COST} troops, resets to Lv1)
+              Convert to {convertConfirm.toType}? (−{CONVERT_COST} troops, {CONVERT_DUR}s build, resets to Lv1)
             </div>
             <div style={{ display: "flex", gap: 8 }}>
               <button
                 onClick={() => {
                   const g = gameRef.current;
                   const t = g && g.towers[convertConfirm.id];
-                  if (t && t.owner === 0) convertBuilding(g, t);
+                  if (t && t.owner === 0) startConversion(g, t);
                   setConvertConfirm(null);
                 }}
                 style={{
@@ -3407,7 +3420,7 @@ function TowerConquest() {
                     <li>Drag from your region to any territory to send troops.</li>
                     <li>Two building types: castles grow troops but don't shoot; towers never regrow troops but fire at hostiles passing through, at increasing range per level.</li>
                     <li>No building gets an automatic defense bonus — instead, every player has <b style={{ color: "#E8EEF9" }}>momentum</b> (shown top-right): win fights and it climbs above 100%, making you hit harder and defend better; lose them and it drops. Killing an attacker with a tower/castle shifts 0.15% either way; capturing a building is worth 10% to the capturer alone — losing one costs nothing extra. Upgrading or converting a building adds 5%. Momentum quietly drifts back toward 100% on its own over time, from either side.</li>
-                    <li>Hold down on a building you own to bring up a convert prompt (confirm to switch it to the other type): costs 10 troops and resets it to level 1.</li>
+                    <li>Hold down on a building you own to bring up a convert prompt (confirm to switch it to the other type): costs 10 troops and a 5-second build, and resets it to level 1.</li>
                     <li>Double-tap a full castle or tower to upgrade it: costs half its troops, raises capacity, and speeds up regen (castles) or firing/range (towers).</li>
                     <li>
                       Specials share one loading bar and fire instantly with a tap —
