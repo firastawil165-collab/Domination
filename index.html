@@ -22,6 +22,18 @@
     35%  { box-shadow: 0 0 0 10px rgba(255,210,63,0); transform: scale(1.08); }
     100% { box-shadow: 0 0 0 0 rgba(255,210,63,0); transform: scale(1); }
   }
+  /* "Denied" feedback for tapping a special before it's actually ready — see
+     castPlayerSpecial's not-ready branch. A native disabled button eats the
+     tap with zero visible response, which reads identically to a genuinely
+     broken ability; this makes "not ready yet" visibly distinct from "did
+     nothing." */
+  @keyframes specialDenied {
+    0%, 100% { transform: translateX(0); }
+    20% { transform: translateX(-3px); }
+    40% { transform: translateX(3px); }
+    60% { transform: translateX(-2px); }
+    80% { transform: translateX(2px); }
+  }
 </style>
 <!-- React + Babel from CDN so this single file runs by just opening it -->
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
@@ -46,7 +58,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.236"; // bump by 0.001 each update
+const APP_VERSION = "0.241"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -388,9 +400,10 @@ const trainThreshold = (kind) => SPECIAL_STAGE[kind] * TRAIN_STAGE;
 // Hero portrait art — bust-crop illustrations, embedded as base64 JPEG data URIs so the
 // whole game stays a single self-contained index.html file (no external image assets).
 // Sourced from user-provided artwork; not AI/procedurally generated like the rest of the
-// game's visuals. Used in the hero-picker screen only — the small in-HUD badges elsewhere
-// still use HEROES[id].icon (an emoji) since those slots are too small (11-20px) for a
-// portrait to read clearly.
+// game's visuals. Used at small inline sizes everywhere hero identity is shown (16-64px,
+// see each usage site) rather than as large standalone panels — kept deliberately tiny in
+// the top standings row specifically so it adds zero extra height there and can't shrink
+// the map's flex:1 area any further than the row already did before portraits existed.
 const PORTRAITS = {
   tempo: "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIjJSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCT/wAARCADcANwDASIAAhEBAxEB/8QAHQABAAEFAQEBAAAAAAAAAAAAAAYBAwQFBwgCCf/EAEIQAAEDAwIDBQYFAQYFBAMAAAECAwQABREGEiExQQcTUWFxFCIjMoGRFUJSobEIM0NicsHRJDRTY+EWJVSSsvDx/8QAGQEBAAMBAQAAAAAAAAAAAAAAAAIDBAEF/8QAIhEAAgMAAgMAAwEBAAAAAAAAAAECAxESIQQxQRMUImEy/9oADAMBAAIRAxEAPwD1RSmaUApSlAKUpQClKUApSlAKUpQClKUApSlAKUpQClKUApSlAKUpQFc1SlKAUpSgFKUoBSlKAUpSgFKUoBSlKAUpSgFKUoBSlKAUpSgFKUoBSlKAUpSgFKUoBSlKAUpSgFKUoBSlKAUpSgFKUoBSqZpmgK5qmaUoCtKpSgK0pmlAKUpQClKUApSlAKUpQClKUApSlAKUpQClKUAqhNVqhoBTNKUAqmasTp0a3RVypbyGWWxlTizgCoBde0W6XRJb0tDZQ3/82fkI9UoHE/cVCVkY+ySi36OjZHjTNcPuFx1K0rv5+qZueGTHShCE8eWMV9xZGpr68l6JeZrUMKxvdcBW5/lAAwKz/tw+Fn4JeztuR40rkCrnqu3PkQ9QrcKDxYlNpWlXl0P71u7Z2sssONx9QwXIKjgGU37zGfE9U/vU4+RCXRF1SR0WmatR5DUllDzLiXG1gKStJyFDxBq7WgrGarVKrmgFKZpQClKUApSlAKUqmaArSlKAUpSgFKUNAUNKVTNAVrX3y+QNO21+5XKQiPFYG5a1fwB1PlWeTgVxPtPmO6m1sLIpR9gtTSHVDoXldT44GMetV22KEeROuHKWGuv2q7nr2YXHAYdqQf8Ah454lQ/Wsfq8B0ra2MGOyGzkk8io5IFa+2xO/k+wRUhKGQC+4OKhnkn1PWt/IkWywR1P3CS2jYM7SeCB4efrXlbKcuUjbLEuMSK6qaX7QC6padygNyTkFOc8RWz0nLlrGUR31JB5lwIAHknHKtO7rHT2q7jGiwJG55LvBJPBVSG13jT9oL7Uie2h5xZ7xb5xx8B4CopZI7LeOYZ94WkSErcaAJHuuc8+Wa01ybbfbKSob1DAC/lV5ZrImSEMxXJttlCdETlTrIUF+71KSOo8KjdwvzSEkKT3kdYBChxGD1qE/Z2EXhIey7V6tO3tOmJjqhb5ayIYcP8AyzvVv/KeldsBrylPkqkK7hl744AfhPnnuScgHzBFejtDaiRqnS9vugI7x1oB5P6XBwUPvXpeJa5LizN5NfF6iQUpVt59thCnHVpbQnipSjgD1rYZi5VRXylSVpCkkEEZBHWq0BWlKUApSlAUNKUoCtKUoBSlKAVQ1WqUBSucTb/dtDasciSd9ws9xJfY3q+Kyr86EfqxzCeddIqMdoOk29XaeeiAFMxr40R0HCm3RyINQnudE4ZvZtrdeYN3gJnRH0usEEkjmnHMEdD5GuBvXpbiLzfFgKLz7jo8VkHakfsK+rNq64IEtgLTC1A00ttxK+DM8BJBCx0cHiPWtJDaek2iyW8jCn3u8kDwSk5P74rzvJu5xSNtVDrk9N9J1VF7O9JNOvfFusz4igOJ3q4/7D6Vz+DbdQdp94CJrymY599bKSdqE+Kj1PlVq7Sv/VerZT4UlUeEssMgnAK+p+ldn0NYEWG0oRhJddO9xY6nwz5VXFFkmq479MWwdl2n7F3LjcfvZDRyHTw4+VX7n2cacuhWqRAytZJKws5zUsAGK+VirOKMn5ZbunEbhYrl2V3tudBecftDqsOIVy29cjxrZ3SE1FfdbY9+I+gSWMf9NXzJ+hNdCv5tbkNcS6vRm2nht2vLCc+mahEWOhFpYYccS4bZIVD3g7tzSvkOaosRqhY32Q8KVIihlJw80SWV/pWnp6EV1nsAvxkLvFsBJay3NbH6Crgsf/auPOqNvmXJtWcsq7xI9KkHZU9dLW/dLs1ITBt8pstpeX86k7t2U+A86n48+EtfolfDnHEehNQ61t9iX7KndLnqHuxmeJH+Y8kj1rndtM/tcvpRMluGyW90KkIjqKWXHAchoHmvH5jyqBKn3LtBvadOaa72LbnFlMiX/eyvFRVzCB+9ejdLachaWskW1QGwhlhAGccVK6qPma3wlKx78Mllaqjj9m1QkISEpASAMADkK+qUrSZStKUoBQ0oaApSlKArSlKAUpSgFUqtUoBVDVapQHBO2TSgtmohc2UFEe5kErHDupCf43D+Kjdylfhke5zjgGBbghs/9xfOuif1BSFGHp+GkqIfngqQOSgkZyfSuW6yUpemC0M77jKSFeaeP+1eT5MVGzr6enRNzgk/hyKJcIkJSI9whypS3h3iAhRTuJ6jHM1uLHr65WSQkWC/TYvvf8nP99pR8MnjUu07otOqLDCdjyRDuUB1XcP7c7VA8j5GpbY+yacQgXGPYwnduU622VLWc5zg9edXwcGv9K75NNJro3+htfz9RwFfidqVElNAZLZ3NOjxSenpUc7Q9eapjTBb7KWIrSk8XUp3vH/RNTyBYYdhWtiE33bBTkIznHpWiOl4mpGJ7Eha21SMoLqPmSPAeVU8mpCMYZp5+m6qgNyVLmNPXibn33ZDqnBnyA4fap32VXxvULOoISIqopSw2+G+OAUnmM1KLj2SXZh1a7bNtHdlgRwl2KE7EDwA61kaQ0m1pOcUyZQlzp25Mh4J2gjHBIHgKldwUevZ2ucpP/CK6pjBUlp0/K8vuXcdQeVY1zuy73JYgwlKTb4bgQ4lHALwP/xHKtrq2EXYE+Is7VoOUqzjaQedRZ4t6fei2RtRU/cylhTxGAlHVQ8yetZ61qNSkkj0z2R6Ia0xYW5bqUmdMQFqIH9mjokV0ADAqMdm0/8AEdEWh1Ry4hgMrzz3I4H+Kk4r2K0lFYeTbJyk2ytBSqiplYpSlAKoarVDQClKUBWlKUApSlAKoarVDQCqEVWqHAHGgONdtwcnags0ds/8uhSjjoVnGfsk/eoReWW7itDaUjuYqgEnpuIx/wDvrW91rd3bxqx0McVOvFhkD9IwCf5qs+w+yxGmOOVvpwepxzNeHfNzsbPUpShFJka0Ss26dKjKBb749+lB6Y90/wACuq2+YFtgZ41wrUmqYls7UYcdDoLbLRjPFPyp3cRn64rqlouKWwC4sJSBxJPAVOOxzfpK6CsjqL951ZabbelQpsvuXG2e8IweR61o9C6ki3a4zWokhTzaVFQKk4ODyrB1frHQ8yeiHcXEvOp90yWk5S35FY/itdpvtA0TbHlwYa/ZMK2h5aDtc891SfsRryvpHTbjOS0yePSoBcLqW7tGezkJdFbi6z++aC0LyhYykjqK5vrC/t2yTBZSsGQ7JbO3qEBQyTVctk8RbTWoQbZLNWFqTAcujCe9Q4wsqSPzEDiK5uwHdUQ350oJE8kOsFHJkI+VKftXU5sdKZ9ztyR8JaC+2noNw4gfXjXOdBtoXZkOn523VoPkMkVGMmovCMVrO6/0/wCpPxC1vw3TjvcS2k55Z4LA9FZrr4rynoa+O6SvcgoSo/hsj2pCBzcjL+cDxxXqaHKamxWpLCwtp5AWhQ6gjIr1PGs5Rw87yIcZaX6A0pWkzlaVQVWgFUNVzVKAVZckIbVhS0J68TiqyX24rDj7yw202krWo8kgcya8Ydp3ble9SavlybBNXDtjOI8dPVxKSffPqSa43h1I9q0pSunBSlKAVShpQCtPq24m1aZuc4E5ZjrUMeOMD+a3FQPtquKrf2f3BLed0hTcfIPLcsZ/ioTeRZKC1o49YHVOajghR3LQykqUehIyo/vWXqrUz6ri7HYX77aQlP8AgB61j6ajFU+bcFf3rhQ3/hbR7v7nNR1Icmanvz5JLaX0Mp8BtTxrwl7PXUU2cwtbC5t1nS5Cu8WZC0qKualZ511bQOsmUzWrJdlpy4MMOr5Of4D5/wA1zW0KSt64KTjAmO4+9fUhSXLg20TghpR4cwcjl51qa2WM6uoHZb32bPGQ5IsTcLunzuciyE+4FeKfD0rFs/Z1LjyRKvhir7vi2wyn3AfE1qdM9rUy0wURLtHdl92NqH2xkqHTcPGreo+1m5XhkxrTFMQL4F54e8B/hHjUeLJRnbnH4bPWerItm+A3h+WR7jKenmfAVxy4Pvzb0/IkuFx7ak7vDyFSlqyliOudcZHs6VZUt+SfiOHyHM1FW3WZl5kOR0rSypbaUBfMjxNWQjibK5zXUdO+e2olT4UpRAUY7aVHxCk8M1z/AEM33ce4tj5UzXUj7mpFPlm0SbMlfEKjNsOeuMio1oKSlxFyazn/AIpTg8wo1ma/l4dj7RuL045BXHvkRHeuwhh1of3zJ+ZJrtPYxqhmRBFk78us7PaYLijxUyeaPVJ4elcGtU7ublNt8k8EqJAV1QfCsvS1zlaQlKS04oJgP+1MK/7RPvD6dR4VZRY62Qvr5RPYANVrVafvsa/29uXHWkhSQSAc4/8AFbWvXi01qPKax4xTNKVI4KUqmRQGFe7W3e7PNtjq1oblsLYUpPNIUMZH3rxXqj+n7XWmrw7b4NsVdYqRuZlMKwFpJOMg8j4165152iWLs+sj91u8ttOxPw2ErHePK6JSK8y3b+r3WEmaty22u1xIvJDbqStXqT41xklp7EpSldIilKGgKUpVM0AJrnfbujf2cXBwDKmltuJ9d2Af3r57WtZewRRpq1yNt2uCCpakHjGjj53CenDgK5Jf9eSrLpqTpab7RdbRdWkC1TVL3utObknY4o/MOoNQs/5ZKD/pG1syfZYDjajkshtH7bj+5qISpaLTp+5XJZAUtTz+fEk7U/xUsu7pt8Warbx7tB4dVlOK5b2kzHDFi2CLx7hCXpZzzPRH3JrxaoOcsR6spcU2RnTJLUB9bmdxcK1epGavKjMFvEth1ieFFaZDasgJPy5/2qxb0yI7BZQEqcWrvCo8Ej1qVwrGPZHHHnFOvqQVFfnjgB5V6EIvk2zNbYuKSMKyRnrlF7xexoNAl91R9xsDr/4rJeuMS1JCo+xk/lfdTudX5pT0q/aYEqTaLbBUhbLSwuRJWofOoKwM+XhUwgdlU6TbvxCK20ncTucdI3YqddK3WQt8p5xTw5XcJEqdveWy6oq5PSVcfoKs6YgLkakjRDlXeKQoHHzEHiKl2qNKSrelDjshCxnB2ngKyOzS2hFzl3VaQtMNGxk44F1X+wpe0oMjQ25abTtDSmOyvcr4jRbSjyVyFQnT8lVhu5akAoQ6kgnxHQ/etrqG+xpWqlxpMr4MTisqztcdPn5V8zW4E5CR7SySg7kLCh9QfKvPxqPFr2ehDH3p96iStp1q7MDc5FOVpH52zzH+tbe3SmpG0HCglsuJP62iPeT9qisOXKU49BioE1hsEOOqVhtgeClnn/NbzTmhJt7aDLMpl0MpynvN20D0HOrI+PKRCzyIxOidjmtUWt9y1ty0vtRHAhCwrIWwo+4fpyPhXoeLITJaS6g8Dz8j4V5B/C73pu4JkvIiSGo7Ko5bit90raTkEDrg16X7PdT2/U1jZlwJSHiW0h5vOFtOAYUFDmONbKU4S4/DBa1JckS3NUW4htJUpSUpHMk4AqxNmx7fEdlynUtMMoK3HFHASkcya8b9sHa/de0y6LhWqU9B08wopaQhRSqSf1qx0PQVpbwoSPQHan28WLs4htFkNXic46WzGjvpBbAHEqPSuE9oH9SuptasNxtNB/T8ZIy93ToL7h/zDkn0rmDellE71EOA8zniaq5p1sK3MOLYdHLjUORLo10q4SLpLLt2kSJb5P8AaSHCs/vV0WhtXFJODWw7nKAzc2kKB4B9Ax9/CrCrJcGTtiSUqZPFOTXNO6fozSlKtICqHnVapQCoz2i6yZ0JpOde3E9440naw1/1HTwSn71Jq4b/AFKTFLe0rbN3wlynJDif1bEjb9jXGERPTMlDaZt11A+ZV4uZK5r6uSU4Pw0+CQOlaO0IXq56IhiE3DsMV8ORkrOVuFGQCnwBqOaknzXGpjDLm1Jj4SAeZPM/apraZ0W2WJk7ghliEHnFfpbAH7k8Kw+TbJLEaqKk3yZZ1xq2NaW3ZzuFEr2xmf8ArLHDd/lFctjSXLyHG1lZmrc7x7vBgqz1Hjwq7qO7plOxp06MqQJT24Mci20n5Up8Oea2MDTrGpCmXapIltg7lR9/dvNnyPTFPGrUI6Tvn3hutOaQj3AKaemezSPypcR8NXkeoqUxNKyLVCciqtslzvUlCXo7gdSM9ccwKj1ncusJ0trW1KbYVtLc8d06M9AscD9alYv0SA6Y86y39h9ABUIykvJGeXLFakkzHJv4XLPpeYzK76SJUlpDSG22tmASOOT4VKxdbhb7Q9ELbDAcUT3shwe6PICtA1qCAoLSm1akeUlO4pUUt4GOvOvh16XJaLltsEJCiMpclvGSvPkkYFSTz0VvX7I1e2mrgpQS3KvDw/KhJSynz/8A7X1GlKsXZ45c1hCHXyp5KcYCcnCR9Ku6utNwZsb8q93ZxgFokMIWGwVY+UITjP71863S01omIgtBUdlhtxSB1CSDjFYfJetRZt8ZdNo5eH2V5DIcluqO5ZQjO4nmSa+X7fLUz3xtrSAohKSviVE8AOFbRXaDLeSGbHplsjPBboKiT6CsaLd9SXPVFqt19CIzDjnehltsJGBWrCGsn0vSlwt+nY1ms9sVNdtyEvTyMBK5KxuG7xCRU17ItFOW+E3qK5SnX7hNaICd3uNoPTHLNQTTWrX2NTKZiSZLrDi3DLW4ctqA+XnyUOXpU205qx6PYmm2iMBbmAeg3HFdjJfSqaZsu0O1dztuLSRsV7roHj0Ncn/F7jpq7JvFimLiTEEHKT7rw/SsciDU/verHpkVxp7BBGPSuX3h5Mbv1rPw0ArHp4VGTW9Eq087J92y9treqdB2q0Wtfcyrq33lyaSeLCUnBQfUg/SuJQGSpwADh/FWWGC4Vvuf2jqt6vLwFbGHhpXgKlJ6RfRtmkhIAxXy+lt1aW1DJPXrVWiSnOedWlpzLbIIz19KiQPh+E4gEAd6g8wRxrXKhvIURGmOsN/oAyAfKt0ZgSsAgBJ61kd2057xSk58qaNPc9KUrQdKGlKUBSvOv9TNwRG1VptCjxTHeUEjmSTgYrtur9ZWrRltEy5v7SslLLSRlby8fKkV5E1Zel6j1kdQX2a/JkpdCm40VsrSwgH3WwrgPXFRkzqRf1NFi2KwKm3RAcnSG1IZYBxsBHHPiRWBItdwtekIrs+4xnWZraEBptzcpDYAICj9TwrU64vT2p7m0oxnGGwlDTLKzlXFfEn1re3Nth9lyPEYaDkuQGgQjg2hOApRxyAxz86yXNLEa6Nxss2e0G+TWpxYWmPHRsYDicbieagPCp9aezeBMUmWlb0Of0kxjtI9RyV9ayUWqTb9rpQ29CATh6P720f4k88VKY1wjQYaTGU3MfWCUISrA9VH8qR4mrq5Rwy2uTZF7lGvmnw2i8WuNqGG6sNoejjY+onkCg8CfTFYZ1Po6I++p2JeY8rfseaDSlKCk8Np58q2sa+yVum+TpDa5HvtQGkfIgclPf6J+prCanLjXP2xIU81JIElpAytK+jqR1z1+lT6K+y1D1RFW+85YtE3ue++Nq3ZHw0qHnk4x9K3ca29o17a2IbtOmIh4AJHfOgeQ4JH2rf2+fDW2Fe1NJz0cVsI+isVImLpb22ADOiDA6vI/wB6liRHkzjFx7K3J8yaoXOZcrlFYLoelLzuV4JHJIrBkXV/UNjYtVsiqfnoQpspVgJOB5njUw1TqUWiQ+qBJjOP3A+xhKVhRTu5K4eFQey6qgWGyqhxrY1Pu53IL2QEtDPzE8wKxXxTnrN/jSagy5Zn0JtkZdqhOTLoWO7koSAhLZz/AHh/KQegqH3mBNtOr7RcbnLYceee7ottcmknl9POt/ctS3jRipVtdKX5F0KHo8xSQEoVjCyoDmfCuczUTnZjsl9wyXQorSpavecweB8hWiMlKOoolFwnkjrVh03+Noejx5CWnGXl95kcUgnII8fCt1MsVw07DSQoTY7afe2J2rQPHHWuSjX01dyXNtcKS0U7UOLQ9t4npjrxqaaT7Ubi9cWrdfI8hKH/AHUKdwQT5EDnXYrrGck3vTM2a+h+N3jawpKxkK8RUF1c/lLMcHi4cqx+kVK7g6iBcpkBDbqkFzewltBVlKuPDyzXP73MEy7vqCVJS1hkBQwQRz/eq0uyafQYTuRnxrJbYJxmviIUoZG7A9ave2MZ2lWfSpFbZ9qfWn4TXFX7CvppsoJwrc4r5lHwqjJYA9w4z9zVHpzbI2o4mhErO4NgDkK+ok1TbCUqycVghbstwDJJ6DoKzw2hoBG9IIHHhQM970pStAKGlDSgIb2m9nEXtHtEeC9Mcgux5CXm5LScrSPzJHqK4b249k9i7PdNWmVZFzUOOTAw+4t7KnEkftx8K9SV54/qlujs6dp7TUZCVLyua4SeCB8qSfrmovDqOCRU/wDuKFRGnJDrKfhoRlaluq4DPpXXNGdlVxk9xLmz34RZb2nuMe8TxKePPjxJrbdk+g40eAmcpnOTtC1DirHM/eurFtKEBKQAB0FQjUn/AExK5pcUcou8S8WhK0mQmc0k8HG/guj1xwP2qIyLlGdteqPaTJEj4O1AXtU4skgb8fk/nhXSdTuIjO7H1hKCo/U+Arn13aYttwZuTqmEGSoR3YhO5Xckg73MfKQcEZqFlcI9oVzlL2R03J7T8RyK4+l56OQgE8hkA49BmtrZo5/FlXVd3dcjMqSW5biu7SoY4hPLlnGayJdqFlYMOE0xMmuu735UhO5DeeIGPzKxyArGi6Y/ErpsmuOykoQFqW78qc8khA4CopufRY8j2TJ7W2nZrqW1Oqu7yOALcfvVffA/mtjBkSZ+fYdHJS2kZLstKGk49OJrM0nYGWUpbisoQB+kYqby7aDaZbLZKVqjuJSocwSk4NT/AF1H2yr8rl6RxvUU7UK9MvXOLYrUWS2XQY5HebAcKwNo44z1qMXZyNC0gubGYQFS4zSdyRgkk+NdYjGFC0lY0urShHdFK0g8SOP+tcpvtsTEM2yOyAq2yDmC/j+wczuShXkaz30rpo0+Nd7izVypzWptDh6V8SXbFBEhB+YJPDIP75rnzk1cN0B/LiQSgOeI86kkJTkWc8wsd2JLa4zyDy4jh9jUduKBICgMe9hQ9etW0rOkctfLGyQ2ZtuJZIruEpBWHFqPrzNZV3nCZHHsLbzrzag40tKcAKB4cTWn08t+6xmLRBZcmSVpO9vHuNpHMmsxr8cuiFCMw6Qg4whOEjHio8MVN5pn4vdNrK7UGolsUhdreFySQhalnCAfDh0qIKWt55bqgAtxRWrHLJOayb5b5UNbMSUuMovq7xxLTwWpO39WOAr6YZSfeIrnS9FrZaDDjuOJNZDcIIGVHPpX27IQwOfHoBWMX3pBwDsRQh2XXHAk7EferkeA477y/dT59a+orLTfH5leJrM7zHMjFDmn00yhlO1HA9VHnV1MdGOIyasGW0jqPU18G5MZ4uZ+lDmNnvulKVoBQ0qpqlAY1wnxrXCfmzHkMRmEFxx1ZwEJHMmvHXaFrVGsdb3O6Q3g7CcWhiM4OG5pI5jyJya9kSY7MthyPIaQ6y4koWhYylQPMEV4d1bBj2nWV9gwmwzGjz1oabTyQnPIeVV2PosrWs6f2f69/D2EQ33PhdEn8tdAk6sZUyhbAS4D83Hp5V55b93iOBrNZvM+N7rUlYSemajG3rCM6e9R0LVl1Tc2V8QytC0uNOZyW1pOQagNw1L3jk+M5MiLkS3cv7WgnvSrGD48COnKsKXcJUw7Xn1kHoDitTHisjUTQLaTxZOSM/3lRclJk4V8USx+cVXFy1l5pa2kN98hRyhfAYWCOIWOVSS2OBAW4XO8ccVuWrxNcznNBGspRSVAlx7r4KGK3Lcx9n5HFD60i+IlDTrdq1I5Abw0lJB4kmthK7R2WEbSUKWRjamuOm5S3RsLygnwHCqx3Fb0knPGuubIxrw+5d/cYghC1lakFSUJJ5cTWkeuciY0ppxQUhRCiPMDFYsxZdku7uQcVgVdhoSpYyKhKW+y2EEjDviEsFqSBhWUk+eDUZuzCodyejj5EOcD5HjUr1V/Ysp6FQH71G9RDfd5qSTt7zl9KlWcmbjReqY2jo896JG9qukxWxKV8EMoHU+OT0rJMTUesnQJk51bZPBpn4TKB6J51ForIa3K3KUpRGSo5NdX0SrDDQwOJ4/au8V7ON4jnN5srVgvS4SClSmmk7yn9R418h0hOEYz51W6SXJt5uEl47nHJC9x9DgftX02hO0cK4QZjK2IJWs7ledWi4tw7jwSPoKynEJHQVZ2BZwfHFAVM4IA2gk+NfCpL7vIK+grZMQmE8dgPrR7CBhIA9KHNRrkMuuH3zj/ADVmt2kLSCX0/SrZ4njWSyPc5mmhn//Z",
   saboteur: "data:image/jpeg;base64,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",
@@ -799,10 +812,25 @@ function recenterCastles(towers, W, H) {
 // Attach each region's defense tower directly to its castle's own right
 // turret (see defenderPoint) — it's not a separate structure elsewhere in
 // the cell anymore, so there's nothing further to compute here.
+//
+// CRITICAL: this must REPOSITION the existing def object, never replace it.
+// It's called from computeCells, which the resize handler runs on any layout
+// change (iOS URL-bar collapse, the map box resizing when the top HUD settles,
+// orientation change...). Assigning a fresh `{...}` here silently wiped every
+// live buff on it — rateMult/rateExpiresAt (Tower Defense) and boulder/
+// boulderExpiresAt (Barrage) — plus the fire cooldown, which is exactly why
+// Tower Defense appeared to do nothing: the cast landed correctly, then the
+// next resize erased it before a single arrow could fire. Only allocate when
+// there's genuinely nothing there yet (first placement at map gen).
 function placeDefenders(towers) {
   for (const t of towers) {
     const p = defenderPoint(t);
-    t.defs = [{ x: p.x, y: p.y, cd: Math.random() * ARROW_FIRE_CD }];
+    const prev = t.defs && t.defs[0];
+    if (prev) {
+      prev.x = p.x; prev.y = p.y; // keep cd + any active buff flags intact
+    } else {
+      t.defs = [{ x: p.x, y: p.y, cd: Math.random() * ARROW_FIRE_CD }];
+    }
   }
 }
 
@@ -1339,6 +1367,19 @@ function TowerConquest() {
 
   // Pulse each special button once, right when it comes off cooldown.
   const [pulse, setPulse] = useState({ 1: false, 2: false, 3: false });
+  // "Denied" shake — set briefly when a tap lands on a special that LOOKS
+  // tappable but isn't actually ready yet (still loading or on its own 20s
+  // cooldown). See castPlayerSpecial: without this, a too-early tap on a
+  // native disabled button produces literally zero feedback, which is
+  // indistinguishable from the ability itself doing nothing.
+  const [shake, setShake] = useState({ 1: false, 2: false, 3: false });
+  // Surfaces a message if a cast function itself throws — e.g. a building
+  // with an unexpectedly missing `.defs` array. Without this, an exception
+  // inside a cast fn aborts silently (uncaught in a React event handler) and
+  // looks IDENTICAL to "the ability ran and had no effect" — see the Tower
+  // Defense investigation in DOMINATION_PROJECT.md. There's no reliable
+  // devtools access on a phone, so this has to be on-screen, not console-only.
+  const [castError, setCastError] = useState(null);
   const prevSecsRef = useRef({ 1: TRAIN_STAGE * 1, 2: TRAIN_STAGE * 2, 3: TRAIN_STAGE * 3 });
   useEffect(() => {
     const prev = prevSecsRef.current;
@@ -1753,7 +1794,14 @@ function TowerConquest() {
   function castTowerDefense(g, owner) {
     for (const t of g.towers) {
       if (!(sameTeam(g, t.owner, owner) || t.owner === owner)) continue;
-      for (const d of t.defs) {
+      // Defensive: t.defs should always exist (placeDefenders sets it at map
+      // gen for every building), but an unguarded `for...of` on a genuinely
+      // missing array would throw here and silently abort the ENTIRE cast —
+      // no ring, no rateMult, on every remaining building too, not just this
+      // one — since the throw propagates straight out of castPlayerSpecial's
+      // onClick handler with no visible error. Matches the resize handler's
+      // existing `if (t.defs)` guard a few hundred lines up.
+      for (const d of (t.defs || [])) {
         d.rateMult = TOWER_DEF_RATE_MULT;
         d.rateExpiresAt = g.pulse + TOWER_DEF_DURATION;
       }
@@ -1967,7 +2015,7 @@ function TowerConquest() {
     for (const t of g.towers) {
       if (t.type !== "tower") continue; // towers only — castles are untouched, unlike Tower Defense
       if (!(sameTeam(g, t.owner, owner) || t.owner === owner)) continue;
-      for (const d of t.defs) {
+      for (const d of (t.defs || [])) {
         d.boulder = true;
         d.boulderExpiresAt = g.pulse + TOWER_DEF_DURATION;
       }
@@ -2103,10 +2151,31 @@ function TowerConquest() {
   const castPlayerSpecial = (kind) => {
     const g = gameRef.current;
     if (!g || g.over || paused) return;
-    if (!readyFor(g, kind)) return;
+    if (!readyFor(g, kind)) {
+      // Looked tappable (button isn't natively disabled anymore — see the
+      // specials-train button below) but the live check says otherwise:
+      // train hasn't reached this tier's threshold yet, or it's still on
+      // its own cooldown. Shake it so the tap visibly registers as
+      // "not yet" instead of silently doing nothing.
+      const tier = SPECIAL_STAGE[kind];
+      setShake((s) => ({ ...s, [tier]: true }));
+      setTimeout(() => setShake((s) => ({ ...s, [tier]: false })), 300);
+      return;
+    }
     SoundEngine.resume();
     const fn = CAST_FNS[kind];
-    if (fn) fn(g, 0);
+    try {
+      if (fn) fn(g, 0);
+    } catch (err) {
+      // Log for anyone who DOES have devtools, but don't rely on it — put it
+      // on screen too (see castError state) since this is primarily tested
+      // on a phone. Deliberately doesn't re-throw: one broken cast shouldn't
+      // crash the render loop for the rest of the match.
+      console.error(`[castPlayerSpecial] "${kind}" threw:`, err);
+      setCastError(`${kind} failed: ${err.message}`);
+      setTimeout(() => setCastError(null), 5000);
+      return;
+    }
     if (g.tutorial) {
       // The tutorial script (see TUTORIAL_STEPS) only ever hands the player
       // Tempo's kit — see startGame, which forces heroes[0]="tempo" whenever
@@ -2534,7 +2603,7 @@ function TowerConquest() {
     // A captured castle loses any active Tower Defense / 2.0 buff — it doesn't
     // carry over to benefit whoever just took it. It also just changed level,
     // so re-attach the defender to the (now smaller) right turret.
-    for (const d of t.defs) {
+    for (const d of (t.defs || [])) {
       d.rateMult = 1; d.rateExpiresAt = 0;
       d.boulder = false; d.boulderExpiresAt = 0;
     }
@@ -4125,7 +4194,16 @@ function TowerConquest() {
                     width: 7, height: 7, borderRadius: "50%", flexShrink: 0,
                     background: FACTIONS[s.pid].color, display: "inline-block",
                   }} />
-                  <span style={{ fontSize: 11 }}>{hero.icon}</span>
+                  {/* Tiny inline portrait — kept at 16px so it costs zero extra
+                      vertical space in the pill (same row as the dot/icon/name),
+                      deliberately NOT stacked below as its own line. A bigger
+                      portrait lives in the tap-to-inspect popup below instead,
+                      where it's a one-off overlay rather than permanent map-eating
+                      real estate — see the "player bars" note in the project doc. */}
+                  <img src={hero.portrait} alt="" style={{
+                    width: 16, height: 16, borderRadius: "50%", objectFit: "cover",
+                    flexShrink: 0, border: `1px solid ${FACTIONS[s.pid].color}88`,
+                  }} />
                   <span style={{ fontSize: 11, color: "rgba(232,235,242,0.85)", whiteSpace: "nowrap" }}>
                     {FACTIONS[s.pid].name}
                   </span>
@@ -4188,8 +4266,14 @@ function TowerConquest() {
                     background: "#1c2942", border: "1px solid #3a4d72", borderRadius: 10,
                     padding: "8px 10px", boxShadow: "0 8px 20px rgba(0,0,0,0.4)",
                   }}>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: FACTIONS[s.pid].color, marginBottom: 4 }}>
-                      {hero.icon} {hero.name}
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                      <img src={hero.portrait} alt="" style={{
+                        width: 28, height: 28, borderRadius: "50%", objectFit: "cover",
+                        border: `1px solid ${FACTIONS[s.pid].color}`, flexShrink: 0,
+                      }} />
+                      <div style={{ fontSize: 11, fontWeight: 700, color: FACTIONS[s.pid].color }}>
+                        {hero.icon} {hero.name}
+                      </div>
                     </div>
                     {[1, 2, 3].map((tier) => {
                       const kind = hero.kit[tier];
@@ -4483,7 +4567,11 @@ function TowerConquest() {
                   display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
                   margin: "0 auto", padding: "10px 18px",
                 })}>
-                <span style={{ fontSize: 20 }}>{HEROES[selectedHero].icon}</span>
+                <img src={HEROES[selectedHero].portrait} alt="" style={{
+                  width: 26, height: 26, borderRadius: "50%", objectFit: "cover",
+                  border: `1px solid ${readableAccent(HEROES[selectedHero].color, 0.55)}`,
+                  flexShrink: 0,
+                }} />
                 <span style={{ fontWeight: 700 }}>{HEROES[selectedHero].name}</span>
                 <span style={{ fontSize: 15, opacity: 0.85 }}>
                   {[1, 2, 3].map((tier) => ABILITY_META[HEROES[selectedHero].kit[tier]].icon).join(" ")}
@@ -4757,6 +4845,16 @@ function TowerConquest() {
               above now takes — structural/vertical dimensions got the full 30% cut since
               those are what actually drive this panel's height; text sizes were trimmed
               more gently (e.g. icon 18->14, not 18->13) to stay legible on a phone screen. */}
+          {castError && (
+            <div style={{
+              width: "100%", maxWidth: 460, textAlign: "center",
+              fontSize: 11, fontWeight: 700, color: "#FF6B6B",
+              background: "rgba(255,107,107,0.12)", border: "1px solid #FF6B6B55",
+              borderRadius: 8, padding: "4px 8px",
+            }}>
+              ⚠ {castError}
+            </div>
+          )}
           <div style={{
             display: "flex", width: "100%", maxWidth: 460,
             borderRadius: 12, overflow: "hidden", border: "1px solid #3a4d72",
@@ -4789,9 +4887,9 @@ function TowerConquest() {
                   const displaySecs = Math.max(s.secs, s.cd);
                   const onCooldown = s.secs <= 0 && s.cd > 0;
                   const pulsing = pulse[s.tier];
+                  const shaking = shake[s.tier];
                   return (
                     <button key={s.kind} className="special" onClick={() => castPlayerSpecial(s.kind)}
-                      disabled={!ready}
                       style={{
                         position: "relative",
                         fontFamily: "'Oxanium', sans-serif",
@@ -4802,7 +4900,7 @@ function TowerConquest() {
                         background: "#1c2942",
                         overflow: "hidden",
                         cursor: ready ? "pointer" : "default",
-                        animation: pulsing ? "specialReady 0.6s ease-out" : "none",
+                        animation: shaking ? "specialDenied 0.3s ease-in-out" : pulsing ? "specialReady 0.6s ease-out" : "none",
                       }}>
                       {/* Fill — this stage's own load progress; covers 100% once ready.
                           Once loaded but still on its own cooldown, the fill goes a flat
