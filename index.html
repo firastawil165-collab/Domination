@@ -46,8 +46,8 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.207"; // bump by 0.001 each update
-const START_TROOPS = 3;      // every castle begins with 3 troops
+const APP_VERSION = "0.230"; // bump by 0.001 each update
+const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
 // Extra headroom above a level's upgrade threshold (towerMax) that a building
@@ -64,8 +64,8 @@ const CAPACITY_BONUS = 5;
 // towerCapacity is purely level-based and doesn't care about building type.
 const MAX_CASTLES = 12;      // hard cap on total towers (players + neutrals) per map
 const REGEN_RATE = 0.6;      // troops/sec at level 1 (grows with level)
-const UNIT_SPEED = 72;       // base px/sec per soldier
-const SPAWN_RATE = 9;        // soldiers marching out per second, per order
+const UNIT_SPEED = 64.8;     // base px/sec per soldier — 10% slower this session (was 72)
+const SPAWN_RATE = 16;       // soldiers marching out per second, per order — raised this session (was 9) specifically to shrink the time gap between row releases (see the rows-of-4 spawn loop): troops start marching the instant they spawn, so the real visual gap between rows is mostly "how much time passes between releases × march speed," not the small static offset below. A row releases every accum/SPAWN_RATE=4/16=0.25s now (was 0.44s), closing most of the gap. Orders also drain somewhat faster overall as a side effect of this.
 const UNIT_R = 3;            // legacy dot radius (soldiers now render as sprites; kept for reference)
 const COLLIDE_R = 6.5;       // kill distance between opposing soldiers
 const TOWER_HIT_R = 20;      // arrival radius
@@ -186,20 +186,20 @@ const BOULDER_SPEED = 200;   // px/sec — slower, heavier flight for Barrage
 const CONVERT_COST = 10;           // troops spent converting castle<->tower
 const HOLD_MS = 550;               // press-and-hold duration that triggers conversion instead of a tap
 // ----- Momentum (replaces the old flat CASTLE_DEFENSE_BONUS) -----
-// No building type gets an automatic defense bonus anymore — ATTACKING
-// strength is dynamic, tracked per PLAYER as a "momentum" multiplier
-// (baseline 1.0 = 100%, at game start and whenever neither side has an edge).
-// Winning fights builds momentum; losing them erodes it — see unitArrives
-// (the actual combat resolution), momentumMult, applyMomentumKill,
-// applyMomentumCapture, and applyMomentumBuild (upgrade/convert). Momentum
-// also passively reverts toward baseline on its own over time, from EITHER
-// side — see the revert step in the game loop. Momentum is earned/lost by
-// BOTH attacker and defender exactly as before (a successful defense still
-// builds the defender's momentum) — what changed is that momentum only ever
-// scales the ATTACKER's side of the damage formula now. A building's own
-// DEFENSIVE strength comes from levelDefenseMult (below) instead: a flat,
-// static bonus based on the building's level, not a fluctuating per-player
-// stat — see unitArrives for how the two combine.
+// Tracked per PLAYER as a "momentum" multiplier (baseline 1.0 = 100%, at game
+// start and whenever neither side has an edge). Winning fights builds
+// momentum; losing them erodes it — see unitArrives (the actual combat
+// resolution), momentumMult, applyMomentumKill, applyMomentumCapture, and
+// applyMomentumBuild (upgrade/convert). Momentum also passively reverts
+// toward baseline on its own over time, from EITHER side — see the revert
+// step in the game loop. Momentum affects THREE things for its owner: attack
+// damage dealt (unitArrives' numerator), march speed (the movement formula,
+// via momentumMult(u.owner) — a losing streak literally marches slower, not
+// just weaker), AND defense (unitArrives' denominator, alongside
+// levelDefenseMult below — a defender's own momentum still makes their
+// buildings tougher, on top of the building's level). A building's level
+// also contributes a small, static defense bonus of its own regardless of
+// momentum — see levelDefenseMult.
 const MOMENTUM_KILL_STEP = 0.002;    // ±0.2% per attacker killed by a tower/castle defense
 const MOMENTUM_CAPTURE_BONUS = 0.05; // +5% for the player who captures a building (loser: no penalty)
 const MOMENTUM_BUILD_BONUS = 0.05;   // +5% for completing an upgrade OR a castle<->tower conversion
@@ -212,12 +212,15 @@ const clampMomentum = (v) => Math.max(MOMENTUM_MIN, Math.min(MOMENTUM_MAX, v));
 // range) is always exactly 1.0 — it isn't a player and can't build or lose it.
 const momentumMult = (g, owner) =>
   owner >= 0 && owner < g.numPlayers && g.momentum ? g.momentum[owner] : 1;
-// A building's DEFENSIVE strength multiplier, based purely on its own level —
-// 1.1/1.2/1.3/1.4 for levels 1-4 (`1 + level * 0.1`). Static and per-building,
-// unlike momentum: a level-4 castle defends the same whether its owner just
-// won or lost their last ten fights. Neutral buildings still have a real
-// level (set at map generation) so this applies to them too, same as before.
-const levelDefenseMult = (t) => 1 + (t.level || 1) * 0.1;
+// A building's DEFENSIVE strength multiplier from its own level alone —
+// 1/1.05/1.1/1.15 for levels 1-4 (`1 + (level-1) * 0.05`). Static and
+// per-building, unlike momentum: this part of a building's defense is the
+// same whether its owner just won or lost their last ten fights. Combines
+// multiplicatively with the owner's momentum in unitArrives — level is a
+// small, level-based floor; momentum is the larger, dynamic swing on top of
+// it. Neutral buildings still have a real level (set at map generation) so
+// this applies to them too.
+const levelDefenseMult = (t) => 1 + ((t.level || 1) - 1) * 0.05;
 function applyMomentumKill(g, attackerOwner, defenderOwner) {
   if (!g.momentum) return;
   if (attackerOwner >= 0 && attackerOwner < g.numPlayers) {
@@ -473,16 +476,20 @@ const RAGE_STRENGTH_MULT = 1.5; // +50%
 // through. A tower doesn't have to be the destination to shoot a column
 // marching past it. For each such tower, approximate the chord of the march
 // line that falls inside its range circle, convert that to how long the
-// column is exposed (chord length / UNIT_SPEED), and divide by its fire
-// cooldown to get an expected kill count. Deliberately approximate (real
-// units wobble/lane-offset a little near arrival, and fire always targets
-// the single nearest hostile rather than marching lockstep down the column)
-// — this only needs to be in the right ballpark to stop the AI walking
-// straight through a gauntlet it should have gone around or paid for.
+// column is exposed (chord length / actual march speed — UNIT_SPEED scaled
+// by the SENDER's own momentum, since a losing streak now marches slower and
+// therefore sits in a tower's range longer, not just hits weaker when it
+// arrives), and divide by its fire cooldown to get an expected kill count.
+// Deliberately approximate (real units wobble/lane-offset a little near
+// arrival, and fire always targets the single nearest hostile rather than
+// marching lockstep down the column) — this only needs to be in the right
+// ballpark to stop the AI walking straight through a gauntlet it should have
+// gone around or paid for.
 function expectedLosses(g, src, dst, isTeam) {
   const totalDist = dist(src, dst);
   if (totalDist < 1) return 0;
   let losses = 0;
+  const marchSpeed = UNIT_SPEED * momentumMult(g, src.owner);
   for (const d of g.towers) {
     if (isTeam(d.owner)) continue; // only hostile towers threaten this march
     const def = d.defs && d.defs[0];
@@ -494,7 +501,7 @@ function expectedLosses(g, src, dst, isTeam) {
     if (segDist >= range) continue; // path never comes into its range at all
     const half = Math.sqrt(Math.max(0, range * range - segDist * segDist));
     const exposure = Math.min(2 * half, totalDist); // chord length, clamped to the route's own length
-    const exposureTime = exposure / UNIT_SPEED;
+    const exposureTime = exposure / marchSpeed;
     const fireCd = towerFireCd(d) / (def.rateMult || 1);
     losses += exposureTime / fireCd;
   }
@@ -598,6 +605,52 @@ function soldierSprite(owner, frame, flip) {
 
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+// Clamps a hex color's HSL lightness down to maxLight, preserving hue/saturation —
+// used to derive readable text/border variants of HEROES[id].color and
+// ABILITY_META[kind].color for the light-themed home/hero screens. Those color
+// tables are tuned bright/pastel on purpose (built to read on the dark in-game
+// UI — train bar glow, momentum chips), so on a white background they need
+// real darkening, not just a flat percentage cut: a flat multiply leaves
+// already-mid-tone colors (e.g. Warlord's #FF6B4A) barely touched while
+// barely denting near-white ones (e.g. Frost's #BFE9FF), so contrast against
+// white ends up wildly inconsistent hero to hero. Clamping lightness instead
+// (verified via a standalone contrast simulation against white across the
+// full 13-color roster) gives every hero/ability a text color with a WCAG
+// contrast ratio of ~4.3:1 or better, while still preserving its own hue so
+// each one stays visually distinct rather than collapsing to one flat color.
+function readableAccent(hex, maxLight = 0.3) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h = 0, s = 0;
+  let l = (max + min) / 2;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h /= 6;
+  }
+  l = Math.min(l, maxLight);
+  const hue2rgb = (p, q, t) => {
+    if (t < 0) t += 1;
+    if (t > 1) t -= 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  let r2, g2, b2;
+  if (s === 0) { r2 = g2 = b2 = l; }
+  else {
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    r2 = hue2rgb(p, q, h + 1 / 3); g2 = hue2rgb(p, q, h); b2 = hue2rgb(p, q, h - 1 / 3);
+  }
+  return `rgb(${Math.round(r2 * 255)},${Math.round(g2 * 255)},${Math.round(b2 * 255)})`;
+}
 
 // Shortest distance from point p to the line segment a-b — used to tell
 // whether a march route passes within a tower's range, not just whether the
@@ -1118,24 +1171,24 @@ const SoundEngine = (() => {
 const TUTORIAL_STEPS = [
   {
     title: "Welcome, General",
-    body: "This is a private training ground — your rival here can never defeat you. Take your time and try everything.",
+    body: "This is a training ground. Your rival can't beat you here. Try everything!",
     waitFor: null,
   },
   {
     title: "Sending Troops",
-    body: "Drag from any castle you own to another region — enemy, neutral, or your own — to send troops there.",
-    hint: "Drag from one of your castles onto a rival castle to capture it",
+    body: "Drag from your castle to send troops anywhere — enemy, neutral, or your own.",
+    hint: "Drag from your castle onto a rival castle to capture it",
     waitFor: "captured",
     settleFor: 1.5, // let them see the castle actually flip to their color
   },
   {
     title: "Castles & Towers",
-    body: "There are two building types. Castles grow troops over time and can be upgraded, but don't shoot back. Towers never regrow troops, but fire at hostiles passing through — range grows with level. Hold down on any building you own to bring up the option to convert it (costs 10 troops and a 5-second build, resets it to level 1) — you'll be asked to confirm.",
+    body: "Two building types. Castles grow troops but don't shoot. Towers don't grow troops, but shoot enemies nearby. Hold a building to convert it (costs troops).",
     waitFor: null,
   },
   {
     title: "Upgrading Castles",
-    body: "When a castle is full, double-tap it to upgrade — it costs half the garrison but raises capacity and speeds up regen and firing. We've topped one off for you.",
+    body: "Double-tap a full castle to upgrade it. It costs half your troops, but grows stronger. We've topped one off for you.",
     hint: "Double-tap your topped-off castle to upgrade it",
     waitFor: "upgraded",
     settleFor: 1.5, // let them see the new level before moving on
@@ -1146,17 +1199,17 @@ const TUTORIAL_STEPS = [
   },
   {
     title: "Special: Rally",
-    body: "Your specials share one loading bar. Rally instantly boosts your Attack Strength by 10%, making your attacking troops hit harder for the rest of the match — cheap and quick to reload, so it's worth using early and often. Watch your Attack Strength (bottom-right of the bar) tick up when you cast it. We've charged the bar for you.",
+    body: "Specials share one loading bar. Rally boosts your Momentum — stronger attacks, faster troops, better defense. Try it now.",
     hint: "Tap the Rally segment to cast it",
     waitFor: "castRally",
-    settleFor: 1.5, // brief pause so the Attack Strength bump is visible before moving on
+    settleFor: 1.5, // brief pause so the Momentum bump is visible before moving on
     onEnter: (g) => {
       g.trainProgress = trainThreshold("rally");
     },
   },
   {
     title: "Special: Speed",
-    body: "Speed instantly boosts every marching soldier on your team for the rest of their trip. Charged and ready.",
+    body: "Speed makes your marching troops faster. Try it now.",
     hint: "Tap the Speed segment to cast it",
     waitFor: "castSpeed",
     settleFor: 3, // brief pause so the pulse and any boosted march are visible
@@ -1164,7 +1217,7 @@ const TUTORIAL_STEPS = [
   },
   {
     title: "Special: Tower Defense",
-    body: "The strongest special in the rotation — every one of your towers fires 25% faster for a while. Fully charged for you — and we've sent a few scouts your way so you can watch it work.",
+    body: "The strongest special. Your towers fire 25% faster for a while. We sent scouts your way so you can watch it work.",
     hint: "Tap the Tower Defense segment to cast it",
     waitFor: "castStorm",
     settleFor: TOWER_DEF_DURATION, // hold the step open for the buff's full active window
@@ -1178,7 +1231,7 @@ const TUTORIAL_STEPS = [
   },
   {
     title: "You're Ready",
-    body: "That covers territory, upgrades, and specials. In a real match rivals fight back and can beat you — this one just can't. Good luck out there, General.",
+    body: "You know the basics. Real rivals fight back — this one couldn't. Good luck, General!",
     waitFor: null,
     final: true,
   },
@@ -1324,6 +1377,12 @@ function TowerConquest() {
       // Keep the tutorial forgiving: every castle except the player's own starts at
       // level 1, so nothing the player attacks is beefed up beyond the baseline.
       for (const t of map.towers) if (t.owner !== 0) t.level = 1;
+      // The enemy's own castle(s) also start with half their troops (floored
+      // at 1, in case START_TROOPS is ever small enough for a straight halving
+      // to hit 0) — makes the scripted capture step an easy, fast win instead
+      // of a real fight. Neutral buildings and the player's own castle are
+      // untouched.
+      for (const t of map.towers) if (t.owner === 1) t.troops = Math.max(1, Math.floor(t.troops / 2));
     }
     // Hero assignment: the human (owner 0) gets whatever's picked on the menu
     // screen. During the tutorial, EVERY player is forced to Tempo — not just
@@ -1513,7 +1572,7 @@ function TowerConquest() {
   function issueOrder(g, src, dst, percent) {
     const n = Math.floor(src.troops * (percent / 100));
     if (n < 1) return;
-    g.orders.push({ owner: src.owner, src: src.id, dst: dst.id, remaining: n, accum: 0 });
+    g.orders.push({ owner: src.owner, src: src.id, dst: dst.id, remaining: n, accum: 0, spawned: 0 });
   }
 
   // Tutorial-only: during the two Tower Defense special steps, the AI's own
@@ -1537,7 +1596,7 @@ function TowerConquest() {
     const n = Math.min(3, Math.floor(attacker.troops) - 1);
     if (n < 1) return;
     attacker.troops -= n;
-    g.orders.push({ owner: attacker.owner, src: attacker.id, dst: target.id, remaining: n, accum: 0 });
+    g.orders.push({ owner: attacker.owner, src: attacker.id, dst: target.id, remaining: n, accum: 0, spawned: 0 });
   }
 
   // ----- Input: press a tower, drag to the target, release to march -----
@@ -1728,7 +1787,7 @@ function TowerConquest() {
     for (const t of mine) {
       const inc = incoming[t.id];
       if (inc <= 0) continue; // not under attack at all
-      const deficit = inc - t.troops * levelDefenseMult(t) * fortifyMult(g, t); // positive = currently losing this fight
+      const deficit = inc - t.troops * momentumMult(g, t.owner) * levelDefenseMult(t) * fortifyMult(g, t); // positive = currently losing this fight
       if (deficit > worstDeficit) { worstDeficit = deficit; target = t; }
     }
     if (!target) {
@@ -2207,11 +2266,10 @@ function TowerConquest() {
     let defend = null, worst = 0;
     for (const t of g.towers) {
       if (!isTeam(t.owner)) continue;
-      // A building's own level makes it tougher across the board (see
-      // levelDefenseMult/unitArrives) — momentum no longer factors into
-      // defense at all, only into the attacker's side of a fight. Fortify
+      // A defender's own momentum and building level both make a building
+      // tougher (see momentumMult/levelDefenseMult/unitArrives). Fortify
       // (if active on this building) adds further on top — see fortifyMult.
-      const defense = (t.troops + inc[t.id].team) * levelDefenseMult(t) * fortifyMult(g, t);
+      const defense = (t.troops + inc[t.id].team) * momentumMult(g, t.owner) * levelDefenseMult(t) * fortifyMult(g, t);
       const shortfall = inc[t.id].enemy - defense;   // >0 → projected to fall
       if (shortfall > defendSensitivity && shortfall > worst) { worst = shortfall; defend = t; }
     }
@@ -2243,16 +2301,15 @@ function TowerConquest() {
       if (isTeam(t.owner)) continue;                 // enemy or neutral
       const assault = inc[t.id].team;
       if (assault <= 0) continue;                     // nobody on my team is attacking it
-      // A higher-level defender is tougher than their raw troop count
-      // suggests (see levelDefenseMult/unitArrives) — account for that here
+      // A defender's own momentum AND a higher building level both make them
+      // tougher than their raw troop count suggests (see
+      // momentumMult/levelDefenseMult/unitArrives) — account for both here
       // too. Fortify (if active) adds further on top — see fortifyMult.
       // Also divide by OUR momentum: real damage per attacker is
-      // attackerMomentum / levelDefenseMult (see unitArrives), so a losing
-      // streak means each of our marching troops is individually weaker and
-      // we need more of them for the same effect — this was previously
-      // missing here, letting a weakened AI underestimate what an assault
-      // actually needs.
-      const currentDefense = (t.troops + inc[t.id].enemy) * levelDefenseMult(t) * fortifyMult(g, t);
+      // attackerMomentum / (defenderMomentum * levelDefenseMult) (see
+      // unitArrives), so a losing streak means each of our marching troops
+      // is individually weaker and we need more of them for the same effect.
+      const currentDefense = (t.troops + inc[t.id].enemy) * momentumMult(g, t.owner) * levelDefenseMult(t) * fortifyMult(g, t);
       const required = (currentDefense * ATTACK_MARGIN) / myMomentum;
       const deficit = required - assault;             // >0 → the assault falls short
       if (deficit > 0.5 && deficit > bestDeficit) { bestDeficit = deficit; push = t; }
@@ -2297,7 +2354,7 @@ function TowerConquest() {
     // same reasoning, this is what actually accounts for "the AI itself is on
     // a losing streak" when sizing a fresh attack.
     const evalTarget = (t) => {
-      const currentDefense = (t.troops + inc[t.id].enemy) * levelDefenseMult(t) * fortifyMult(g, t);
+      const currentDefense = (t.troops + inc[t.id].enemy) * momentumMult(g, t.owner) * levelDefenseMult(t) * fortifyMult(g, t);
       const losses = expectedLosses(g, src, t, isTeam);
       const need = (currentDefense * ATTACK_MARGIN) / myMomentum - inc[t.id].team + losses;
       return Math.max(0, need);
@@ -2434,9 +2491,10 @@ function TowerConquest() {
   // Rolling Stone and/or RAGE_STRENGTH_MULT (1.5x) if it's Rage-boosted (see
   // castRollingStones/castRage) — the two stack multiplicatively if a unit
   // somehow carries both (possible in 2v2 if one ally casts each). Momentum
-  // then scales the ATTACKER's side of that on top (momentumMult(u.owner)) —
-  // the defender's side uses levelDefenseMult(t) instead, a static bonus
-  // from the building's own level rather than the defender's momentum.
+  // scales the ATTACKER's side of that on top (momentumMult(u.owner)) —
+  // the defender's side uses momentumMult(t.owner) * levelDefenseMult(t)
+  // together: the defender's own momentum (dynamic, can swing either way)
+  // multiplied by a small static bonus from the building's level.
   function unitArrives(g, u, t) {
     const strength = (u.rollingStone ? ROLLING_STONE_STRENGTH_MULT : 1) * (u.rageBoosted ? RAGE_STRENGTH_MULT : 1);
     if (sameTeam(g, t.owner, u.owner) || t.owner === u.owner) {
@@ -2446,10 +2504,10 @@ function TowerConquest() {
       // but this arrival can never be the one that flips ownership — clamped
       // at 1 troop instead of letting the capture branch trigger. A non-stone
       // unit (or a later wave) is still needed to actually finish it off.
-      t.troops = Math.max(1, t.troops - (strength * momentumMult(g, u.owner)) / (levelDefenseMult(t) * fortifyMult(g, t)));
+      t.troops = Math.max(1, t.troops - (strength * momentumMult(g, u.owner)) / (momentumMult(g, t.owner) * levelDefenseMult(t) * fortifyMult(g, t)));
       applyMomentumKill(g, u.owner, t.owner);
       t.underAttackFlashAt = g.pulse;
-    } else if ((t.troops -= (strength * momentumMult(g, u.owner)) / (levelDefenseMult(t) * fortifyMult(g, t))) > 0) {
+    } else if ((t.troops -= (strength * momentumMult(g, u.owner)) / (momentumMult(g, t.owner) * levelDefenseMult(t) * fortifyMult(g, t))) > 0) {
       applyMomentumKill(g, u.owner, t.owner); // this attacker died without finishing the defense — a kill "by castle"
       t.underAttackFlashAt = g.pulse; // hostile contact — flash the region (see draw())
     } else {
@@ -2540,7 +2598,11 @@ function TowerConquest() {
             const team = g.teams[t.owner];
             room = Math.min(room, Math.max(0, budgetCapacity[team] - totalPop[team]));
           }
-          const grown = Math.min(room, towerRegen(t) * dt);
+          // Tutorial: the enemy regenerates at half speed (owner 0, the human,
+          // and neutral buildings are unaffected) — keeps the AI's economy
+          // from quietly outpacing a player who's still reading each step.
+          const tutorialRegenMult = (g.tutorial && t.owner !== 0 && t.owner !== NEUTRAL) ? 0.5 : 1;
+          const grown = Math.min(room, towerRegen(t) * dt * tutorialRegenMult);
           if (grown > 0) {
             t.troops += grown;
             if (t.owner !== NEUTRAL) totalPop[g.teams[t.owner]] += grown; // keep the running total accurate within this tick
@@ -2589,28 +2651,46 @@ function TowerConquest() {
           }
         }
 
-        // Orders trickle soldiers out of the gate
+        // Orders release soldiers out of the gate — a full row of 4 at a
+        // time (or a smaller final row, if fewer than 4 remain), not one
+        // trickling out individually. A row used to just be a pre-assigned
+        // destination that filled in asynchronously over several spawn
+        // ticks, which didn't actually read as an organized formation —
+        // this makes the whole rank appear together in one instant.
         for (let i = g.orders.length - 1; i >= 0; i--) {
           const o = g.orders[i];
           const src = g.towers[o.src];
           if (o.remaining <= 0 || src.owner !== o.owner) { g.orders.splice(i, 1); continue; }
           o.accum += SPAWN_RATE * dt;
-          while (o.accum >= 1 && o.remaining > 0 && src.troops >= 1) {
-            o.accum -= 1;
-            o.remaining -= 1;
-            src.troops -= 1;
+          while (o.accum >= 4 && o.remaining > 0 && src.troops >= 1) {
+            const rowSize = Math.min(4, o.remaining, Math.floor(src.troops));
+            if (rowSize <= 0) break;
+            o.accum -= 4; // always consumed as a full row's worth, even for a smaller final row
             const dstT = g.towers[o.dst];
             const ang = Math.atan2(dstT.y - src.y, dstT.x - src.x);
-            g.units.push({
-              uid: g.uidSeq++,
-              owner: o.owner,
-              x: src.x + Math.cos(ang) * 18 + (Math.random() - 0.5) * 8,
-              y: src.y + Math.sin(ang) * 18 + (Math.random() - 0.5) * 8,
-              dst: o.dst,
-              off: (Math.random() - 0.5) * 26,   // marching-lane offset
-              speed: UNIT_SPEED * (0.85 + Math.random() * 0.3),
-              phase: Math.random() * Math.PI * 2,
-            });
+            const px = -Math.sin(ang), py = Math.cos(ang); // perpendicular to the march direction
+            const row = Math.floor(o.spawned / 4) % 3; // cycle after 3 ranks — keeps even a huge order's spawn point tight near the gate instead of drifting arbitrarily far back
+            const gateDist = 18 - row * 1; // later rows start further back, catching up as they march — reduced further this session (was 2.5, then 5, originally 10); the bigger contributor to row spacing was actually SPAWN_RATE (time between releases), addressed above
+            const rowPhase = Math.random() * Math.PI * 2; // one shared sway phase for the whole row, so its 4 members sway in sync instead of independently wobbling out of step
+            for (let c = 0; c < rowSize; c++) {
+              // Centered on the row regardless of rowSize, so a smaller final
+              // row (1-3 stragglers) still lines up centered rather than
+              // bunched to one side.
+              const lateral = (c - (rowSize - 1) / 2) * 9;
+              o.spawned++;
+              o.remaining--;
+              src.troops -= 1;
+              g.units.push({
+                uid: g.uidSeq++,
+                owner: o.owner,
+                x: src.x + Math.cos(ang) * gateDist + px * lateral,
+                y: src.y + Math.sin(ang) * gateDist + py * lateral,
+                dst: o.dst,
+                off: lateral,   // marching-lane offset — matches the spawn column, so the row-of-4 formation holds during the march
+                speed: UNIT_SPEED, // uniform — no per-unit variance, so a row doesn't drift apart from itself as it marches (momentum still scales this per-owner in the March step)
+                phase: rowPhase,
+              });
+            }
           }
           // Cutoff: an order's percentage is deliberately computed from
           // whatever the garrison shows at the moment it's issued (so
@@ -2634,7 +2714,13 @@ function TowerConquest() {
           if (u.frozenUntil && g.pulse >= u.frozenUntil) { u.frozenUntil = 0; u.frozen = false; }
         }
 
-        // March
+        // March. Speed is affected by u.speedMul (Speed/Slow Down specials),
+        // u.frozen (Frost — a hard override, takes priority over everything
+        // else including momentum: a frozen unit doesn't move no matter how
+        // high its owner's momentum is), AND the owner's own momentum — a
+        // player on a losing streak (momentum < 1) marches slower as well as
+        // hitting weaker, and a winning streak marches faster, same
+        // multiplier as the attack-damage formula in unitArrives uses.
         for (const u of g.units) {
           const t = g.towers[u.dst];
           const d = dist(u, t);
@@ -2643,7 +2729,7 @@ function TowerConquest() {
             const px = -(t.y - u.y) / d, py = (t.x - u.x) / d;
             tx += px * u.off; ty += py * u.off;
           }
-          const spd = u.frozen ? 0 : u.speed * (u.speedMul || 1);
+          const spd = u.frozen ? 0 : u.speed * (u.speedMul || 1) * momentumMult(g, u.owner);
           const dd = Math.hypot(tx - u.x, ty - u.y) || 1;
           const wob = Math.sin(g.pulse * 9 + u.phase) * 6 * dt;
           u.x += ((tx - u.x) / dd) * spd * dt + (-(ty - u.y) / dd) * wob;
@@ -2825,12 +2911,19 @@ function TowerConquest() {
           if (g.puffs[i].age >= g.puffs[i].dur) g.puffs.splice(i, 1);
         }
 
-        // AI turns
+        // AI turns — suppressed during the tutorial. aiAct is what actually
+        // decides to attack (sizes up assaults, sends real armies at the
+        // player's buildings) — the tutorial should never have the AI
+        // opponent do that; the only enemy activity the player should ever
+        // see is the deliberately small, controlled trickle below
+        // (tutorialAutoWave), timed specifically for the Tower Defense demo
+        // steps. Timers/train still advance normally so nothing looks stuck
+        // if the tutorial is ever extended to call aiAct later.
         for (let pid = 1; pid < g.numPlayers; pid++) {
           if (g.eliminated.has(pid)) continue;
           g.aiTimers[pid] -= dt;
           if (g.aiTimers[pid] <= 0) {
-            aiAct(g, pid);
+            if (!g.tutorial) aiAct(g, pid);
             g.aiTimers[pid] = 1.1 + Math.random() * 1.6;
           }
           if (g.aiTrain[pid] < TRAIN_MAX) g.aiTrain[pid] = Math.min(TRAIN_MAX, g.aiTrain[pid] + dt);
@@ -4185,11 +4278,11 @@ function TowerConquest() {
         <div style={{
           position: "absolute", inset: 0,
           overflowY: "auto", WebkitOverflowScrolling: "touch", touchAction: "pan-y",
-          background: "rgba(24,35,58,0.94)",
+          background: "linear-gradient(180deg, #EAF4FF 0%, #FFFFFF 60%)",
         }}>
           <div style={{
             position: "absolute", bottom: 10, right: 14,
-            fontSize: 11, letterSpacing: 1, color: "#4a5570",
+            fontSize: 11, letterSpacing: 1, color: "#B7C2D6",
             fontFamily: "'IBM Plex Mono', monospace",
           }}>
             v{APP_VERSION}
@@ -4200,8 +4293,8 @@ function TowerConquest() {
             padding: "32px 20px",
           }}>
           <div style={{ maxWidth: 560, textAlign: "center" }}>
-            <h1 style={{ fontSize: 46, fontWeight: 800, margin: "0 0 10px", letterSpacing: 1 }}>
-              DOMIN<span style={{ color: "#FFD23F" }}>ATION</span>
+            <h1 style={{ fontSize: 46, fontWeight: 800, margin: "0 0 10px", letterSpacing: 1, color: "#1F2A44" }}>
+              DOMIN<span style={{ color: "#D99A00" }}>ATION</span>
             </h1>
             <button
               onClick={() => { SoundEngine.click(); setShowHelp(true); }}
@@ -4210,8 +4303,9 @@ function TowerConquest() {
                 padding: "6px 14px",
                 fontSize: 13,
                 letterSpacing: 1,
-                color: "#8a93ab",
-                borderColor: "#3a4d72",
+                background: "#FFFFFF",
+                color: "#6B7684",
+                borderColor: "#D7E1EE",
               })}>
               How to play
             </button>
@@ -4220,53 +4314,48 @@ function TowerConquest() {
               <div onClick={() => setShowHelp(false)}
                 style={{
                   position: "fixed", inset: 0, zIndex: 100,
-                  background: "rgba(6,9,16,0.75)", backdropFilter: "blur(2px)",
+                  background: "rgba(31,42,68,0.35)", backdropFilter: "blur(2px)",
                   display: "flex", alignItems: "center", justifyContent: "center",
                   padding: 20,
                 }}>
                 <div onClick={(e) => e.stopPropagation()}
                   style={{
-                    background: "#182238", border: "1px solid #3a4d72", borderRadius: 14,
+                    background: "#FFFFFF", border: "1px solid #E3E9F3", borderRadius: 14,
                     padding: 24, maxWidth: 480, maxHeight: "80vh", overflowY: "auto",
-                    boxShadow: "0 12px 40px rgba(0,0,0,0.5)", textAlign: "left",
+                    boxShadow: "0 12px 40px rgba(31,42,68,0.18)", textAlign: "left",
                   }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
-                    <div style={{ fontSize: 17, fontWeight: 800, color: "#E8EEF9" }}>How to play</div>
+                    <div style={{ fontSize: 17, fontWeight: 800, color: "#1F2A44" }}>How to play</div>
                     <button onClick={() => setShowHelp(false)}
                       style={{ background: "none", border: "none", color: "#8a93ab", fontSize: 20, cursor: "pointer", lineHeight: 1 }}>
                       ✕
                     </button>
                   </div>
                   <ul style={{
-                    color: "#8a93ab", lineHeight: 1.6, fontSize: 15,
+                    color: "#5B6472", lineHeight: 1.6, fontSize: 15,
                     paddingLeft: 20, display: "flex", flexDirection: "column", gap: 8, margin: 0,
                   }}>
                     <li>Drag from your region to any territory to send troops.</li>
-                    <li>Two building types: castles grow troops but don't shoot; towers never regrow troops but fire at hostiles passing through, at increasing range per level.</li>
-                    <li>No building gets an automatic defense bonus from attack strength — instead, every player has an <b style={{ color: "#E8EEF9" }}>Attack Strength</b> rating (shown top-right, and in your own specials bar): win fights and it climbs above 100%, making your ATTACKING troops hit harder; lose them and it drops, making your attacks weaker. It never affects defense — a building's defensive strength instead comes from its own <b style={{ color: "#E8EEF9" }}>level</b> (10% tougher per level, so a level-4 building resists 40% better than level 1), the same regardless of how its owner's Attack Strength is doing. Killing an attacker with a tower/castle shifts it 0.2% either way; capturing a building is worth 5% to the capturer alone — losing one costs nothing extra. Upgrading or converting a building adds 5%. Attack Strength quietly drifts back toward 100% on its own over time, from either side.</li>
-                    <li>Hold down on a building you own to bring up a convert prompt (confirm to switch it to the other type): costs 10 troops and a 5-second build, and resets it to level 1.</li>
-                    <li>Double-tap a full castle or tower to upgrade it: costs half its troops, raises capacity, and speeds up regen (castles) or firing/range (towers).</li>
-                    <li>
-                      Pick a <b style={{ color: "#E8EEF9" }}>hero</b> before deploying — each one
-                      carries 3 abilities (one per tier) that fill your specials bar. They share
-                      one loading bar and fire instantly with a tap — no aiming. Stronger
-                      abilities take longer to load. Deaths on the battlefield refill the bar for
-                      everyone. Enemies are assigned their own hero too and play by the same rules.
-                    </li>
-                    <li>Everyone starts even, with castles only. Take every rival's last building to win.</li>
+                    <li>Castles grow troops but don't shoot. Towers don't grow troops, but shoot enemies passing by.</li>
+                    <li>Win fights and your <b style={{ color: "#1F2A44" }}>Momentum</b> grows — stronger attacks, faster troops, better defense. Lose fights and it drops. Higher-level buildings also defend a bit better on their own.</li>
+                    <li>Hold a building to convert it to the other type (costs troops).</li>
+                    <li>Double-tap a full building to upgrade it (costs half its troops).</li>
+                    <li>Pick a <b style={{ color: "#1F2A44" }}>hero</b> before deploying — each one gives you 3 specials to use in battle.</li>
+                    <li>Everyone starts even. Capture every rival's last building to win.</li>
                   </ul>
                 </div>
               </div>
             )}
             <div style={{ display: "flex", gap: 32, justifyContent: "center", marginTop: 26, flexWrap: "wrap" }}>
               <div>
-                <div style={{ fontSize: 13, letterSpacing: 3, color: "#8a93ab", marginBottom: 14 }}>MODE</div>
+                <div style={{ fontSize: 13, letterSpacing: 3, color: "#8592A8", marginBottom: 14 }}>MODE</div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "stretch" }}>
                   {[["ffa", "Free-for-all"], ["2v2", "Teams · 2v2"], ["random", "Random"]].map(([m, label]) => (
                     <button key={m} onClick={() => setMode(m)}
                       style={chip({
-                        borderColor: mode === m ? "#FFD23F" : "#46577d",
-                        color: mode === m ? "#FFD23F" : "#E8EBF2",
+                        background: mode === m ? "#FFF6DC" : "#F4F7FC",
+                        borderColor: mode === m ? "#E2A100" : "#D7E1EE",
+                        color: mode === m ? "#B87800" : "#3C4658",
                         minWidth: 140,
                       })}>
                       {label}
@@ -4276,7 +4365,7 @@ function TowerConquest() {
               </div>
 
               <div style={{ width: 140 }}>
-                <div style={{ fontSize: 13, letterSpacing: 3, color: "#8a93ab", marginBottom: 14 }}>
+                <div style={{ fontSize: 13, letterSpacing: 3, color: "#8592A8", marginBottom: 14 }}>
                   {mode === "ffa" ? "COMBATANTS" : "\u00A0"}
                 </div>
                 <div style={{ minHeight: 140, display: "flex", flexDirection: "column", justifyContent: "center" }}>
@@ -4285,8 +4374,9 @@ function TowerConquest() {
                       {[2, 3, 4].map((n) => (
                         <button key={n} onClick={() => setNumPlayers(n)}
                           style={chip({
-                            borderColor: numPlayers === n ? "#FFD23F" : "#46577d",
-                            color: numPlayers === n ? "#FFD23F" : "#E8EBF2",
+                            background: numPlayers === n ? "#FFF6DC" : "#F4F7FC",
+                            borderColor: numPlayers === n ? "#E2A100" : "#D7E1EE",
+                            color: numPlayers === n ? "#B87800" : "#3C4658",
                             minWidth: 96,
                           })}>
                           {n} players
@@ -4294,11 +4384,11 @@ function TowerConquest() {
                       ))}
                     </div>
                   ) : mode === "2v2" ? (
-                    <div style={{ fontSize: 12, color: "#5c6580" }}>
+                    <div style={{ fontSize: 12, color: "#6B7684" }}>
                       you + 1 AI ally vs 2 AI enemies
                     </div>
                   ) : (
-                    <div style={{ fontSize: 12, color: "#5c6580" }}>
+                    <div style={{ fontSize: 12, color: "#6B7684" }}>
                       a mode is rolled for you — free-for-all or 2v2 teams
                     </div>
                   )}
@@ -4307,7 +4397,71 @@ function TowerConquest() {
             </div>
 
             <div style={{ marginTop: 26 }}>
-              <div style={{ fontSize: 13, letterSpacing: 3, color: "#8a93ab", marginBottom: 14 }}>HERO</div>
+              <div style={{ fontSize: 13, letterSpacing: 3, color: "#8592A8", marginBottom: 14 }}>HERO</div>
+              {/* Full picker now lives on its own screen (screen === "hero") instead of expanding
+                  inline — see that block further down, right after this menu screen's closing tag.
+                  This is just a summary chip + entry point into it. */}
+              <button onClick={() => { SoundEngine.click(); setScreen("hero"); }}
+                style={chip({
+                  background: "#F4F7FC",
+                  borderColor: readableAccent(HEROES[selectedHero].color, 0.55),
+                  color: readableAccent(HEROES[selectedHero].color, 0.3),
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+                  margin: "0 auto", padding: "10px 18px",
+                })}>
+                <span style={{ fontSize: 20 }}>{HEROES[selectedHero].icon}</span>
+                <span style={{ fontWeight: 700 }}>{HEROES[selectedHero].name}</span>
+                <span style={{ fontSize: 15, opacity: 0.85 }}>
+                  {[1, 2, 3].map((tier) => ABILITY_META[HEROES[selectedHero].kit[tier]].icon).join(" ")}
+                </span>
+                <span style={{ fontSize: 11, color: "#8592A8", marginLeft: 2 }}>change ▸</span>
+              </button>
+            </div>
+
+            <button onClick={() => startGame(numPlayers, mode)}
+              style={chip({
+                marginTop: 28, background: "#FFD23F", color: "#1F2A44",
+                fontWeight: 800, fontSize: 17, padding: "14px 42px", border: "1px solid #E2A100",
+              })}>
+              Deploy
+            </button>
+            <div style={{ marginTop: 10 }}>
+              <button onClick={() => startGame(2, "ffa", true)}
+                style={chip({
+                  padding: "8px 16px", fontSize: 13,
+                  background: "#FFFFFF", color: "#6B7684", borderColor: "#D7E1EE",
+                })}>
+                🎓 Play Tutorial
+              </button>
+            </div>
+          </div>
+          </div>
+        </div>
+      )}
+
+      {screen === "hero" && (
+        <div style={{
+          position: "absolute", inset: 0,
+          overflowY: "auto", WebkitOverflowScrolling: "touch", touchAction: "pan-y",
+          background: "linear-gradient(180deg, #EAF4FF 0%, #FFFFFF 60%)",
+        }}>
+          <button onClick={() => { SoundEngine.click(); setScreen("menu"); }}
+            style={chip({
+              position: "absolute", top: 16, left: 16, zIndex: 5,
+              padding: "8px 14px", fontSize: 13,
+              background: "#FFFFFF", color: "#6B7684", borderColor: "#D7E1EE",
+            })}>
+            ← Back
+          </button>
+          <div style={{
+            minHeight: "100%", boxSizing: "border-box",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: "70px 20px 32px",
+          }}>
+            <div style={{ maxWidth: 560, textAlign: "center" }}>
+              <h2 style={{ fontSize: 22, fontWeight: 800, margin: "0 0 22px", letterSpacing: 1, color: "#1F2A44" }}>
+                Choose your hero
+              </h2>
               <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
                 {HERO_IDS.map((id) => {
                   const h = HEROES[id];
@@ -4315,8 +4469,9 @@ function TowerConquest() {
                   return (
                     <button key={id} onClick={() => { SoundEngine.click(); setSelectedHero(id); }}
                       style={chip({
-                        borderColor: active ? h.color : "#46577d",
-                        color: active ? h.color : "#E8EBF2",
+                        background: active ? "#FFF6DC" : "#F4F7FC",
+                        borderColor: active ? readableAccent(h.color, 0.55) : "#D7E1EE",
+                        color: active ? readableAccent(h.color, 0.3) : "#3C4658",
                         minWidth: 118, display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
                         padding: "10px 12px",
                       })}>
@@ -4330,8 +4485,8 @@ function TowerConquest() {
                 })}
               </div>
               <div style={{
-                marginTop: 12, padding: "10px 14px", borderRadius: 10,
-                background: "rgba(255,255,255,0.03)", border: "1px solid #2e3b5c",
+                marginTop: 16, padding: "10px 14px", borderRadius: 10,
+                background: "#FFFFFF", border: "1px solid #E3E9F3",
                 maxWidth: 460, marginLeft: "auto", marginRight: "auto", textAlign: "left",
               }}>
                 {[1, 2, 3].map((tier) => {
@@ -4340,14 +4495,14 @@ function TowerConquest() {
                   return (
                     <div key={tier} style={{
                       display: "flex", gap: 10, alignItems: "flex-start", padding: "7px 0",
-                      borderTop: tier > 1 ? "1px solid #2e3b5c" : "none",
+                      borderTop: tier > 1 ? "1px solid #E3E9F3" : "none",
                     }}>
                       <div style={{ fontSize: 18, flexShrink: 0, lineHeight: 1.3 }}>{meta.icon}</div>
                       <div>
-                        <div style={{ fontSize: 13, fontWeight: 700, color: meta.color }}>
-                          {meta.name} <span style={{ color: "#5c6580", fontWeight: 400 }}>· Tier {tier}</span>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: readableAccent(meta.color, 0.3) }}>
+                          {meta.name} <span style={{ color: "#8592A8", fontWeight: 400 }}>· Tier {tier}</span>
                         </div>
-                        <div style={{ fontSize: 12, color: "#8a93ab", marginTop: 2, lineHeight: 1.4 }}>
+                        <div style={{ fontSize: 12, color: "#6B7684", marginTop: 2, lineHeight: 1.4 }}>
                           {meta.desc}
                         </div>
                       </div>
@@ -4355,29 +4510,14 @@ function TowerConquest() {
                   );
                 })}
               </div>
-            </div>
-
-            <div style={{ fontSize: 12, color: "#5c6580", marginTop: 14, minHeight: 16 }}>
-              {mode === "ffa" ? `you + ${numPlayers - 1} AI` : "\u00A0"}
-            </div>
-
-            <button onClick={() => startGame(numPlayers, mode)}
-              style={chip({
-                marginTop: 28, background: "#FFD23F", color: "#0A0E18",
-                fontWeight: 800, fontSize: 17, padding: "14px 42px", border: "1px solid #FFD23F",
-              })}>
-              Deploy
-            </button>
-            <div style={{ marginTop: 10 }}>
-              <button onClick={() => startGame(2, "ffa", true)}
+              <button onClick={() => { SoundEngine.click(); setScreen("menu"); }}
                 style={chip({
-                  padding: "8px 16px", fontSize: 13,
-                  color: "#8a93ab", borderColor: "#3a4d72",
+                  marginTop: 26, background: "#FFD23F", color: "#1F2A44",
+                  fontWeight: 800, fontSize: 15, padding: "12px 30px", border: "1px solid #E2A100",
                 })}>
-                🎓 Play Tutorial
+                Done
               </button>
             </div>
-          </div>
           </div>
         </div>
       )}
@@ -4601,22 +4741,19 @@ function TowerConquest() {
                   // Tower Defense right away instead of starting from empty. The
                   // reserve mechanic itself (fill behavior) is unchanged — only
                   // what's DISPLAYED on top of it changed: the player's own
-                  // Attack Strength (formerly labeled "Momentum" — renamed
-                  // this session since it only ever scales attacking troops
-                  // now, see levelDefenseMult/unitArrives; "momentum" implied
-                  // a broader effect it no longer has) — pulled from `hud`'s
-                  // pid-0 entry, same source the Top HUD's opponent pills
-                  // already read from. Now shown alongside the player's own
-                  // troop count (also from that same `hud` entry) rather than
-                  // a generic 🔋 battery icon, since both are things the
-                  // player actively wants to track during a match.
+                  // Momentum (renamed back from "Attack Strength" this session —
+                  // now that momentum affects speed and defense again, not just
+                  // attack damage, "Attack Strength" was no longer an accurate
+                  // name) — pulled from `hud`'s pid-0 entry, same source the Top
+                  // HUD's opponent pills already read from. Shown alongside the
+                  // player's own troop count (also from that same `hud` entry).
                   const start = 3 * TRAIN_STAGE;
                   const fillPct = Math.max(0, Math.min(100, ((fireInfo.trainProgress - start) / TRAIN_STAGE) * 100));
                   const full = fillPct >= 100;
                   const mine = hud.find((h) => h.pid === 0);
                   const myTroops = mine ? mine.troops : 0;
-                  const atkPct = mine ? Math.round(mine.momentum * 100) : 100;
-                  const atkTint = atkPct > 100 ? "#4ADE5A" : atkPct < 100 ? "#FF6B6B" : (full ? "#C7CCDA" : "#8a93ab");
+                  const momPct = mine ? Math.round(mine.momentum * 100) : 100;
+                  const momTint = momPct > 100 ? "#4ADE5A" : momPct < 100 ? "#FF6B6B" : (full ? "#C7CCDA" : "#8a93ab");
                   return (
                     <div key="reserve"
                       style={{
@@ -4647,9 +4784,9 @@ function TowerConquest() {
                         </span>
                         <span style={{
                           fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, fontWeight: 800,
-                          lineHeight: 1, color: atkTint,
+                          lineHeight: 1, color: momTint,
                         }}>
-                          {atkPct}% ATK
+                          {momPct}% MOM
                         </span>
                       </div>
                     </div>
