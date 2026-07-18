@@ -46,7 +46,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.230"; // bump by 0.001 each update
+const APP_VERSION = "0.233"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -256,6 +256,15 @@ const TOWER_CFG = {
 // decaying over time, and drives SoundEngine's ambient combat layer.
 const BATTLE_RADIUS = 140;     // px — combat within this range of a friendly castle counts
 const CASTLE_SCALE = 0.9;      // castle sprite size — 75% base, bumped up per feedback
+// Screen-space height (CSS px, bottom-anchored) of the zone the COMMIT %
+// buttons occupy — used only to decide which garrison plates need the
+// overlay-canvas treatment in draw(g) so they stay readable on top of the
+// buttons instead of hidden behind them. Not load-bearing for the buttons'
+// own layout (that's plain CSS, bottom:10 + intrinsic height) — this is a
+// deliberately generous estimate of that same footprint, safe to be a little
+// too tall (extra plates just get drawn on both layers, harmless) but not
+// safe to be too short (a plate would go back to being hidden).
+const COMMIT_BAR_ZONE_H = 64;
 // Per-level castle geometry (grows more in width than height so tall castles
 // don't hide neighbours' troops). Rebalanced this session: the old level 1
 // tier was dropped entirely (old level 2 now IS level 1 — every level's
@@ -739,6 +748,15 @@ const mapEdgeMarginX = (W) => (W / 2) * (1 - 1 / CAM_X_ZOOM_WORST) + CASTLE_MAX_
 // proj()), so a flat margin comfortably covering a maxed castle's full upward
 // height (~60 world px) is enough on its own.
 const MAP_EDGE_MARGIN_Y = 80;
+// Bottom-only: extra clearance below MAP_EDGE_MARGIN_Y so a castle's garrison
+// troop-count plate (drawGarrisonPlate draws it at t.y+14+17, i.e. 31 world
+// px BELOW the castle's own y, plus ~9 more for the plate's own half-height)
+// never sits under the COMMIT % buttons — a fixed HTML overlay pinned to the
+// bottom of the map view, unlike the vector castle sprite itself which only
+// extends upward from t.y and was already covered by MAP_EDGE_MARGIN_Y alone.
+// No equivalent needed at the top (no overlay there), so this only widens
+// the bottom clamp in recenterCastles, not generateMap's symmetric ellipse.
+const MAP_EDGE_MARGIN_Y_BOTTOM = MAP_EDGE_MARGIN_Y + 45;
 
 // Single-pass Lloyd relaxation: once every castle's Voronoi cell is known
 // (computeCells must already have run), nudge each castle to the centroid of
@@ -760,7 +778,7 @@ function recenterCastles(towers, W, H) {
     if (t.cell.length < 3) continue;
     const c = polyCentroid(t.cell);
     t.x = Math.min(W - marginX, Math.max(marginX, c.x));
-    t.y = Math.min(H - MAP_EDGE_MARGIN_Y, Math.max(MAP_EDGE_MARGIN_Y, c.y));
+    t.y = Math.min(H - MAP_EDGE_MARGIN_Y_BOTTOM, Math.max(MAP_EDGE_MARGIN_Y, c.y));
   }
   computeCells(towers, W, H);
 }
@@ -1247,6 +1265,14 @@ function applyTutorialStep(g, idx) {
 // ================= Component =================
 function TowerConquest() {
   const canvasRef = useRef(null);
+  // Second, transparent, pointer-events-none canvas painted AFTER (visually
+  // on top of) the COMMIT % buttons — see the COMMIT_BAR_ZONE_H comment and
+  // the end of draw(g) for how it's used: when a castle's garrison plate
+  // would otherwise sit right under the COMMIT buttons, it's redrawn here so
+  // the number stays readable, while clicks still pass through to the real
+  // buttons underneath (pointerEvents: "none" on this canvas is what makes
+  // that possible — it's purely visual, never part of hit-testing).
+  const overlayCanvasRef = useRef(null);
   const wrapRef = useRef(null);
   const mapRef = useRef(null);
   const gameRef = useRef(null);
@@ -1411,6 +1437,14 @@ function TowerConquest() {
       teams,
       heroes, // heroes[owner] -> HEROES key; see CAST_FNS/aiSpecials/specials-UI for how this is consumed
       mode: gameMode,
+      selectedMode: tutorial ? "ffa" : gameModeIn, // the RAW menu choice, pre-random-resolution —
+                                                    // see startGame's Redeploy caveat: "random"
+                                                    // must stay "random" here even though `mode`
+                                                    // above is the concrete ffa/2v2 it resolved to
+                                                    // this particular match, or Redeploy would
+                                                    // silently stop re-rolling and just repeat
+                                                    // whatever mode+playercount got rolled once.
+      selectedNumPlayers: tutorial ? 2 : players,  // ditto — the raw pre-resolution player count
       tutorial,          // if true, the player can never lose (see outcome check)
       tutorialFlags: { captured: false, upgraded: false, castStorm: false, castSpeed: false, castRally: false },
       tutorialWaitStart: null, // g.pulse timestamp when the current step's waitFor flag tripped;
@@ -1516,6 +1550,16 @@ function TowerConquest() {
       c.width = W * dpr; c.height = H * dpr;
       c.style.width = W + "px"; c.style.height = H + "px";
       c.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+      // Overlay canvas (COMMIT-bar plate readability, see overlayCanvasRef
+      // above) always matches the main canvas 1:1 — same world<->screen
+      // mapping, just painted later so it can sit visually above the COMMIT
+      // buttons.
+      const oc = overlayCanvasRef.current;
+      if (oc) {
+        oc.width = W * dpr; oc.height = H * dpr;
+        oc.style.width = W + "px"; oc.style.height = H + "px";
+        oc.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
       if (g) {
         const sx = W / g.W, sy = H / g.H;
         if (sx !== 1 || sy !== 1) {
@@ -3970,6 +4014,23 @@ function TowerConquest() {
     // draw over farther ones so overlapping counters still resolve sensibly.
     const plates = g.towers.slice().sort((a, b) => a.y - b.y);
     for (const t of plates) drawGarrisonPlate(ctx, t, g);
+
+    // Any plate that visually falls inside the COMMIT % buttons' screen zone
+    // gets redrawn onto the separate overlay canvas too (see overlayCanvasRef)
+    // — that canvas paints AFTER the COMMIT bar in the DOM, so it appears on
+    // top of the buttons, but has pointerEvents:none, so taps still pass
+    // through to the real buttons underneath. Recomputes the same B/proj math
+    // drawGarrisonPlate does internally rather than changing that function's
+    // signature just for this.
+    const oc = overlayCanvasRef.current;
+    if (oc) {
+      const octx = oc.getContext("2d");
+      octx.clearRect(0, 0, W, H);
+      for (const t of plates) {
+        const B = proj(g, t.x, t.y + 14 + 17);
+        if (B.y + 9 * B.s >= H - COMMIT_BAR_ZONE_H) drawGarrisonPlate(octx, t, g);
+      }
+    }
   }
 
   // ================= UI =================
@@ -4599,7 +4660,7 @@ function TowerConquest() {
                 </div>
               </div>
               <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
-                <button onClick={() => startGame(gameRef.current.numPlayers, gameRef.current.mode)}
+                <button onClick={() => startGame(gameRef.current.selectedNumPlayers, gameRef.current.selectedMode)}
                   style={chip({ background: "#FFD23F", color: "#0A0E18", fontWeight: 800, border: "1px solid #FFD23F", padding: "8px 14px" })}>
                   Redeploy
                 </button>
@@ -4630,6 +4691,16 @@ function TowerConquest() {
               </button>
             ))}
           </div>
+
+          {/* Paints AFTER (visually above) the COMMIT bar above, but
+              pointerEvents:none means it never intercepts taps — those still
+              reach the COMMIT buttons underneath. Only ever has pixels on it
+              where draw(g) decided a garrison plate needed to stay readable
+              over the buttons; empty everywhere else every frame. */}
+          <canvas
+            ref={overlayCanvasRef}
+            style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
+          />
         </>
       )}
       </div>
