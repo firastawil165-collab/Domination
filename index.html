@@ -58,7 +58,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.245"; // bump by 0.001 each update
+const APP_VERSION = "0.249"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -365,7 +365,11 @@ const towerFireCd = (t) => ARROW_FIRE_CD / fireLevelMult(t);
 // derives from it rather than hardcoding 20/40/60/80, so changing it rescales the whole
 // train — per-stage load time, each ability's cast cost (trainThreshold), the reserve
 // stage, and every UI fill percentage — consistently and in one place.
-const DEFAULT_TRAIN_STAGE = 20;
+// Default changed 20 -> 15 (v0.247): 15s per stage is the pacing the game is tuned
+// around now. Note this also re-paces the TUTORIAL, which deliberately forces
+// DEFAULT_TRAIN_STAGE rather than the menu setting (see startGame) — its scripted
+// steps wait on specific abilities becoming ready, so they just become ready sooner.
+const DEFAULT_TRAIN_STAGE = 15;
 const TRAIN_STAGE_OPTIONS = [5, 10, 15, 20, 30, 45];
 let TRAIN_STAGE = DEFAULT_TRAIN_STAGE;   // seconds to load each stage
 // A function, not a const, because TRAIN_STAGE can change between matches — a
@@ -1266,7 +1270,7 @@ const TUTORIAL_STEPS = [
   },
   {
     title: "Castles & Towers",
-    body: "Two building types. Castles grow troops but don't shoot. Towers don't grow troops, but shoot enemies nearby. Hold a building to convert it (costs troops).",
+    body: "Two building types. Castles grow troops but don't shoot. Towers don't grow troops, but shoot enemies nearby. Everything here is a castle — hold one to convert it into a tower (costs troops).",
     waitFor: null,
   },
   {
@@ -1300,7 +1304,7 @@ const TUTORIAL_STEPS = [
   },
   {
     title: "Special: Tower Defense",
-    body: "The strongest special. Your towers fire 25% faster for a while. We sent scouts your way so you can watch it work.",
+    body: "The strongest special. For a while your buildings fire 25% faster — and castles, which never shoot on their own, start shooting too. We sent scouts your way so you can watch it work.",
     hint: "Tap the Tower Defense segment to cast it",
     waitFor: "castStorm",
     settleFor: TOWER_DEF_DURATION, // hold the step open for the buff's full active window
@@ -1310,6 +1314,28 @@ const TUTORIAL_STEPS = [
       const attacker = g.towers.filter((t) => t.owner === 1)
         .sort((a, b) => a.troops - b.troops)[0];
       if (attacker) attacker.troops = towerMax(attacker); // make sure it has plenty to send
+    },
+  },
+  {
+    // Closing lesson: the actual win condition. Every earlier step teaches a
+    // mechanic in isolation; this one makes the player do the thing the whole
+    // game is about — wipe a rival off the board — so they finish the tutorial
+    // having actually won something instead of just being told they're ready.
+    title: "Finish Them Off",
+    body: "Last lesson: a rival is beaten only when they hold nothing at all. Their castles are on their last legs — take every one of them.",
+    hint: "Capture every remaining enemy castle",
+    waitFor: "finished",
+    settleFor: 2, // let the last castle visibly flip before the wrap-up step
+    onEnter: (g) => {
+      // Stack the deck so the finish is quick and can't stall out: gut every
+      // enemy garrison and cancel any build in progress, then top up all the
+      // player's castles so they always have enough to send. Deliberately not
+      // set to 0 — the player should still see a real (if brief) fight at each
+      // castle rather than free-flipping them by walking one soldier over.
+      for (const t of g.towers) {
+        if (t.owner === 1) { t.troops = 3; t.upgrading = null; }
+        else if (t.owner === 0) t.troops = towerMax(t);
+      }
     },
   },
   {
@@ -1508,6 +1534,29 @@ function TowerConquest() {
       // of a real fight. Neutral buildings and the player's own castle are
       // untouched.
       for (const t of map.towers) if (t.owner === 1) t.troops = Math.max(1, Math.floor(t.troops / 2));
+      // No tower-type buildings anywhere in the tutorial (v0.249): generateMap
+      // seeds neutral watchtowers (always one in the center, sometimes more on
+      // the inner ring / mid-pairs), and a board where some buildings shoot back
+      // and don't regenerate is a lot to parse while you're still learning the
+      // drag gesture. Flipping them to castles makes every building on the
+      // tutorial map behave identically.
+      //
+      // Two things have to be fixed up after the flip, because generateMap
+      // already finished with them as towers:
+      //   - troops: a tower spawns at towerCapacity() (a full garrison, since it
+      //     can never regenerate); as a castle that's an absurdly rich neutral
+      //     sitting in the middle of the map. Reset to START_TROOPS.
+      //   - defs[0]: defenderPoint() is type-aware (tower apex beacon vs. castle
+      //     right turret), and placeDefenders already ran inside generateMap, so
+      //     the anchor is still at the old tower's apex. Re-place it.
+      let flipped = false;
+      for (const t of map.towers) {
+        if (t.type !== "tower") continue;
+        t.type = "castle";
+        t.troops = START_TROOPS;
+        flipped = true;
+      }
+      if (flipped) placeDefenders(map.towers);
     }
     // Hero assignment: the human (owner 0) gets whatever's picked on the menu
     // screen. During the tutorial, EVERY player is forced to Tempo — not just
@@ -1553,7 +1602,7 @@ function TowerConquest() {
                                                     // whatever mode+playercount got rolled once.
       selectedNumPlayers: tutorial ? 2 : players,  // ditto — the raw pre-resolution player count
       tutorial,          // if true, the player can never lose (see outcome check)
-      tutorialFlags: { captured: false, upgraded: false, castStorm: false, castSpeed: false, castRally: false },
+      tutorialFlags: { captured: false, upgraded: false, castStorm: false, castSpeed: false, castRally: false, finished: false },
       tutorialWaitStart: null, // g.pulse timestamp when the current step's waitFor flag tripped;
                                // null while still waiting. Used to hold the step open for
                                // `settleFor` seconds so the player actually sees the effect.
@@ -1785,6 +1834,28 @@ function TowerConquest() {
   // ----- Specials -----
   const trainOf = (g, owner) => (owner === 0 ? g.trainProgress : g.aiTrain[owner]);
 
+  // A player who's lost every building, unit and queued order is out of the fight
+  // themselves — but in 2v2 their TEAM can still be standing. Such a player stays
+  // "in" for the specials system alone: their train keeps loading and they keep
+  // casting, so a wiped-out ally can still meaningfully support the surviving
+  // teammate instead of becoming a dead seat for the rest of the match. They still
+  // can't act in any other way (no aiAct turn — they have nothing to send).
+  // In FFA sameTeam() is never true across two different players, so this collapses
+  // to plain !eliminated and nothing changes there.
+  const stillCasting = (g, pid) => {
+    if (!g.eliminated.has(pid)) return true;
+    for (let p = 0; p < g.numPlayers; p++) {
+      if (p !== pid && !g.eliminated.has(p) && sameTeam(g, p, pid)) return true;
+    }
+    return false;
+  };
+
+  // Every special is team-scoped: an ability cast by one player applies to their
+  // whole team's buildings/units in 2v2 (and to just their own in FFA, where
+  // sameTeam only ever matches the player themselves). Single helper so the
+  // dozen cast functions below all ask the question the same way.
+  const alliedTo = (g, who, owner) => who !== NEUTRAL && (who === owner || sameTeam(g, who, owner));
+
   // How much longer until `kind` comes off its own per-caster cooldown (see
   // specialCooldown(), which tracks the SKILL TIMER setting) — separate
   // from train progress — this is what stops spamming the same special back to back).
@@ -1834,7 +1905,10 @@ function TowerConquest() {
     const seconds = deaths * TRAIN_KILL_GAIN;
     g.trainProgress = Math.min(trainMax(), g.trainProgress + seconds);
     for (let pid = 1; pid < g.numPlayers; pid++) {
-      if (g.eliminated.has(pid)) continue;
+      // stillCasting, not !eliminated: a wiped-out player whose 2v2 partner is still
+      // standing keeps loading their train so they can keep casting for the team.
+      // Only a fully-dead team stops accruing.
+      if (!stillCasting(g, pid)) continue;
       g.aiTrain[pid] = Math.min(trainMax(), g.aiTrain[pid] + seconds);
     }
   };
@@ -1847,7 +1921,7 @@ function TowerConquest() {
   // into a working tower for the buff's duration.
   function castTowerDefense(g, owner) {
     for (const t of g.towers) {
-      if (!(sameTeam(g, t.owner, owner) || t.owner === owner)) continue;
+      if (!alliedTo(g, t.owner, owner)) continue;
       // Defensive: t.defs should always exist (placeDefenders sets it at map
       // gen for every building), but an unguarded `for...of` on a genuinely
       // missing array would throw here and silently abort the ENTIRE cast —
@@ -1869,11 +1943,11 @@ function TowerConquest() {
     // Global, instant: every currently-marching soldier on the caster's team gets
     // +50% speed for the rest of its trip.
     for (const u of g.units) {
-      if (sameTeam(g, u.owner, owner) || u.owner === owner) u.speedMul = SPEED_BOOST;
+      if (alliedTo(g, u.owner, owner)) u.speedMul = SPEED_BOOST;
     }
     // Visual feedback: a quick pulse ring at every castle the caster owns.
     for (const t of g.towers) {
-      if (sameTeam(g, t.owner, owner) || t.owner === owner) {
+      if (alliedTo(g, t.owner, owner)) {
         g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.5, color: "#57E0C6" });
       }
     }
@@ -1887,12 +1961,12 @@ function TowerConquest() {
   // their trip.
   function castSlow(g, owner) {
     for (const u of g.units) {
-      if (!(sameTeam(g, u.owner, owner) || u.owner === owner)) u.speedMul = SLOW_DEBUFF;
+      if (!alliedTo(g, u.owner, owner)) u.speedMul = SLOW_DEBUFF;
     }
     // Visual feedback: a quick pulse ring at every castle the caster owns, same language
     // as castSpeed/castTowerDefense.
     for (const t of g.towers) {
-      if (sameTeam(g, t.owner, owner) || t.owner === owner) {
+      if (alliedTo(g, t.owner, owner)) {
         g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.5, color: "#8FA3C7" });
       }
     }
@@ -1922,7 +1996,12 @@ function TowerConquest() {
   // cast is never wasted on nothing.
   const SECOND_WIND_AMOUNT = 15;
   function castSecondWind(g, owner) {
-    const mine = g.towers.filter((t) => t.owner === owner); // strictly this player's own — never a teammate's
+    // Team-scoped (changed this session): in 2v2 a teammate's building is a valid
+    // target too, so an ally under siege can be bailed out — and so a caster with
+    // no buildings left of their own (eliminated but team alive, see stillCasting)
+    // still has somewhere to send the troops. In FFA this is exactly the old
+    // own-buildings-only set.
+    const mine = g.towers.filter((t) => alliedTo(g, t.owner, owner));
     if (mine.length === 0) return;
 
     // Tally hostile troops (marching units + still-queued orders, same two
@@ -1932,13 +2011,13 @@ function TowerConquest() {
     for (const t of mine) incoming[t.id] = 0;
     for (const u of g.units) {
       if (incoming[u.dst] === undefined) continue;
-      if (sameTeam(g, u.owner, owner) || u.owner === owner) continue; // only hostile marches count as "under attack"
+      if (alliedTo(g, u.owner, owner)) continue; // only hostile marches count as "under attack"
       incoming[u.dst]++;
     }
     for (const o of g.orders) {
       if (o.remaining <= 0) continue;
       if (incoming[o.dst] === undefined) continue;
-      if (sameTeam(g, o.owner, owner) || o.owner === owner) continue;
+      if (alliedTo(g, o.owner, owner)) continue;
       incoming[o.dst] += o.remaining;
     }
 
@@ -1974,13 +2053,21 @@ function TowerConquest() {
   // mechanical troop/speed effect.
   const RALLY_MOMENTUM_BOOST = 0.10; // +10% — independently tunable from MOMENTUM_CAPTURE_BONUS (5%), not tied to it
   function castRally(g, owner) {
-    if (g.momentum && owner >= 0 && owner < g.numPlayers) {
-      g.momentum[owner] = clampMomentum(g.momentum[owner] + RALLY_MOMENTUM_BOOST);
+    // Team-scoped (changed this session): every player on the caster's team gets
+    // the momentum boost, not just the caster. In FFA that's still only the caster,
+    // since sameTeam never matches another player there. Also means an eliminated-
+    // but-team-alive caster (see stillCasting) can hand the boost to the ally who
+    // is actually still fighting, which is the whole point of keeping them casting.
+    if (g.momentum) {
+      for (let p = 0; p < g.numPlayers; p++) {
+        if (!alliedTo(g, p, owner)) continue;
+        g.momentum[p] = clampMomentum(g.momentum[p] + RALLY_MOMENTUM_BOOST);
+      }
     }
-    // Visual feedback: a quick pulse ring at every castle the caster owns (not
-    // the team's), same visual language as castSpeed/castSlow.
+    // Visual feedback: a quick pulse ring at every castle the caster's team owns,
+    // same visual language as castSpeed/castSlow.
     for (const t of g.towers) {
-      if (t.owner === owner) g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.5, color: "#FFD86A" });
+      if (alliedTo(g, t.owner, owner)) g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.5, color: "#FFD86A" });
     }
     SoundEngine.rally(owner === 0 ? 1 : 0.4);
     setCd(g, "rally", owner);
@@ -2010,7 +2097,7 @@ function TowerConquest() {
   const SABOTAGE_TOTAL_DAMAGE = 30;
   const SABOTAGE_SNEAK_TROOPS = 5;
   function castSabotage(g, owner) {
-    const enemies = g.towers.filter((t) => t.owner !== NEUTRAL && !(sameTeam(g, t.owner, owner) || t.owner === owner));
+    const enemies = g.towers.filter((t) => t.owner !== NEUTRAL && !alliedTo(g, t.owner, owner));
     if (enemies.length === 0) return;
 
     const perBuilding = SABOTAGE_TOTAL_DAMAGE / enemies.length;
@@ -2046,7 +2133,7 @@ function TowerConquest() {
   // need 50% more troops to take a Fortified building during that window.
   function castFortify(g, owner) {
     for (const t of g.towers) {
-      if (!(sameTeam(g, t.owner, owner) || t.owner === owner)) continue;
+      if (!alliedTo(g, t.owner, owner)) continue;
       t.fortifyExpiresAt = g.pulse + FORTIFY_DURATION;
       g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.6, color: "#A8C5DE" });
     }
@@ -2068,7 +2155,7 @@ function TowerConquest() {
   function castBarrage(g, owner) {
     for (const t of g.towers) {
       if (t.type !== "tower") continue; // towers only — castles are untouched, unlike Tower Defense
-      if (!(sameTeam(g, t.owner, owner) || t.owner === owner)) continue;
+      if (!alliedTo(g, t.owner, owner)) continue;
       for (const d of (t.defs || [])) {
         d.boulder = true;
         d.boulderExpiresAt = g.pulse + TOWER_DEF_DURATION;
@@ -2090,10 +2177,10 @@ function TowerConquest() {
   // multiplicatively if a unit somehow carries both.
   function castRage(g, owner) {
     for (const u of g.units) {
-      if (sameTeam(g, u.owner, owner) || u.owner === owner) u.rageBoosted = true;
+      if (alliedTo(g, u.owner, owner)) u.rageBoosted = true;
     }
     for (const t of g.towers) {
-      if (sameTeam(g, t.owner, owner) || t.owner === owner) {
+      if (alliedTo(g, t.owner, owner)) {
         g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.6, color: "#FF6B4A" });
       }
     }
@@ -2123,13 +2210,13 @@ function TowerConquest() {
   //      naturally instead of needing its own parallel speed system.
   function castRollingStones(g, owner) {
     for (const u of g.units) {
-      if (sameTeam(g, u.owner, owner) || u.owner === owner) {
+      if (alliedTo(g, u.owner, owner)) {
         u.rollingStone = true;
         u.speedMul = ROLLING_STONE_SPEED_MULT;
       }
     }
     for (const t of g.towers) {
-      if (sameTeam(g, t.owner, owner) || t.owner === owner) {
+      if (alliedTo(g, t.owner, owner)) {
         g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.7, color: "#8C7A63" });
       }
     }
@@ -2150,12 +2237,12 @@ function TowerConquest() {
   // a hypothetical one.
   function castFrost(g, owner) {
     for (const u of g.units) {
-      if (sameTeam(g, u.owner, owner) || u.owner === owner) continue; // hostiles only
+      if (alliedTo(g, u.owner, owner)) continue; // hostiles only
       u.frozen = true;
       u.frozenUntil = g.pulse + FROST_DURATION;
     }
     for (const t of g.towers) {
-      if (sameTeam(g, t.owner, owner) || t.owner === owner) {
+      if (alliedTo(g, t.owner, owner)) {
         g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.6, color: "#BFE9FF" });
       }
     }
@@ -2172,11 +2259,16 @@ function TowerConquest() {
   // interrupting them, and does nothing if nothing is eligible (nothing to
   // waste the cast on, mirrors Sabotage's empty-target no-op).
   function castInstantUpgrade(g, owner) {
-    const eligible = g.towers.filter((t) => t.owner === owner && t.level < MAX_LEVEL && !t.upgrading);
+    // Team-scoped (changed this session): a teammate's building is eligible too,
+    // so the cast still does something for a caster with none of their own left.
+    const eligible = g.towers.filter((t) => alliedTo(g, t.owner, owner) && t.level < MAX_LEVEL && !t.upgrading);
     if (eligible.length === 0) return;
     const t = eligible[Math.floor(Math.random() * eligible.length)];
     t.level += 1;
-    applyMomentumBuild(g, owner);
+    // Momentum credit goes to the BUILDING'S owner, not the caster — upgrading an
+    // ally's castle should fire up that ally's troops, and an eliminated caster
+    // has no meaningful momentum of their own to bank.
+    applyMomentumBuild(g, t.owner);
     // Same right-turret reattachment every other level-change path does
     // (build completion, capture, conversion) — the defense tower's anchor
     // point moves as the silhouette grows.
@@ -2359,7 +2451,16 @@ function TowerConquest() {
       case "speed": return marching >= 5;     // only useful with a meaningful force already marching
       case "rollingStones": return marching >= 5; // same bar as Speed — also wants a real force marching
       case "rage": return marching >= 5;      // same bar — also a per-unit strength buff on whoever's marching now
-      case "rally": return momentumMult(g, pid) < MOMENTUM_MAX;   // never wasted, but skip if already capped
+      case "rally": {
+        // Team-scoped boost, so ask a team-scoped question: worth casting if ANY
+        // ally is still below the cap. Matters for an eliminated-but-team-alive
+        // caster, whose own momentum is frozen and would otherwise sit at the cap
+        // forever and permanently block a cast their partner could still use.
+        for (let p = 0; p < g.numPlayers; p++) {
+          if (alliedTo(g, p, pid) && momentumMult(g, p) < MOMENTUM_MAX) return true;
+        }
+        return false;
+      }
       case "secondWind": return true;   // self-correcting fallback target — never truly wasted
       case "instantUpgrade": return true; // free; no-ops safely if nothing's eligible
       case "sabotage": return true;     // always has a target while any enemy building exists
@@ -2377,7 +2478,9 @@ function TowerConquest() {
     // downstream systems (cooldown stamps, train spend, ready-flash) fire either.
     if (g.noAiHeroes) return;
     for (let pid = 1; pid < g.numPlayers; pid++) {
-      if (g.eliminated.has(pid)) continue;
+      // Eliminated players whose team is still alive keep casting (see stillCasting) —
+      // their abilities are team-scoped, so they still land on the surviving ally.
+      if (!stillCasting(g, pid)) continue;
       const isTeam = (owner) => owner === pid || sameTeam(g, owner, pid);
       const kit = (HEROES[g.heroes && g.heroes[pid]] || HEROES.tempo).kit;
       const incoming = incomingThreat(g, pid, isTeam);
@@ -2655,6 +2758,11 @@ function TowerConquest() {
   // and castSabotage's instant-capture check below, so the two can never
   // drift out of sync with each other.
   function captureBuilding(g, t, newOwner) {
+    // A player who was wiped out but kept casting for their team (see stillCasting)
+    // can take a building back via Sabotage's instant-capture branch. Clear the
+    // elimination flag so they resume normal play — otherwise they'd own a castle
+    // while aiAct kept skipping them and the HUD kept showing them as dead.
+    if (g.eliminated.has(newOwner)) g.eliminated.delete(newOwner);
     applyMomentumCapture(g, newOwner); // the capturer alone gains — losing a building costs the loser nothing extra
     t.lostBy = t.owner;      // who just lost this castle
     t.lostAt = g.pulse;      // game clock at the moment of capture
@@ -3114,11 +3222,16 @@ function TowerConquest() {
         // steps. Timers/train still advance normally so nothing looks stuck
         // if the tutorial is ever extended to call aiAct later.
         for (let pid = 1; pid < g.numPlayers; pid++) {
-          if (g.eliminated.has(pid)) continue;
-          g.aiTimers[pid] -= dt;
-          if (g.aiTimers[pid] <= 0) {
-            if (!g.tutorial) aiAct(g, pid);
-            g.aiTimers[pid] = 1.1 + Math.random() * 1.6;
+          if (!stillCasting(g, pid)) continue; // fully-dead team: nothing left to tick
+          // An eliminated-but-team-alive AI takes no aiAct turn (it has no
+          // buildings or troops to move) but its train keeps loading so it can
+          // keep casting team-scoped specials for its surviving partner.
+          if (!g.eliminated.has(pid)) {
+            g.aiTimers[pid] -= dt;
+            if (g.aiTimers[pid] <= 0) {
+              if (!g.tutorial) aiAct(g, pid);
+              g.aiTimers[pid] = 1.1 + Math.random() * 1.6;
+            }
           }
           if (g.aiTrain[pid] < trainMax()) g.aiTrain[pid] = Math.min(trainMax(), g.aiTrain[pid] + dt);
         }
@@ -3147,14 +3260,27 @@ function TowerConquest() {
             g.towers.some((t) => t.owner === pid) ||
             g.units.some((u) => u.owner === pid) ||
             g.orders.some((o) => o.owner === pid && o.remaining > 0);
-          if (!alive) g.eliminated.add(pid);
+          if (!alive) {
+            g.eliminated.add(pid);
+            // Tutorial's closing step waits on this: the rival is beaten the
+            // moment they hold nothing at all. Set on the elimination sweep
+            // rather than in captureBuilding because taking the last CASTLE
+            // isn't the same as elimination — troops still in flight or a
+            // queued order keep a player alive for a beat afterwards, and the
+            // step should only clear once they're genuinely gone.
+            if (g.tutorial && pid !== 0) g.tutorialFlags.finished = true;
+          }
         }
         const aliveTeams = new Set();
         for (let pid = 0; pid < g.numPlayers; pid++)
           if (!g.eliminated.has(pid)) aliveTeams.add(g.teams[pid]);
         const myTeam = g.teams[0];
         if (!g.tutorial && !aliveTeams.has(myTeam)) { g.over = true; setOutcome("lose"); SoundEngine.lose(); SoundEngine.stopBattle(); }
-        else if (aliveTeams.size === 1) { g.over = true; setOutcome("win"); SoundEngine.win(); SoundEngine.stopBattle(); }
+        // The tutorial deliberately does NOT end on a win: the player wiping out the
+        // rival is the second-to-last STEP, and slamming the victory screen up here
+        // would skip the wrap-up step entirely. The tutorial ends when the player
+        // taps "Finish Tutorial" on that final overlay instead.
+        else if (!g.tutorial && aliveTeams.size === 1) { g.over = true; setOutcome("win"); SoundEngine.win(); SoundEngine.stopBattle(); }
 
         // Tutorial: once the requested action is detected, hold the step open
         // for `settleFor` seconds so the player actually sees the effect (a
