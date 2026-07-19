@@ -58,7 +58,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.241"; // bump by 0.001 each update
+const APP_VERSION = "0.245"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -359,8 +359,18 @@ const towerFireCd = (t) => ARROW_FIRE_CD / fireLevelMult(t);
 // Defense (60s) still leaves 20s in the tank — enough to immediately follow up with Slow
 // Down (the 1st-stage special) instead of starting from zero.
 //
-const TRAIN_STAGE = 20;                  // seconds to load each stage
-const TRAIN_MAX = TRAIN_STAGE * 4;       // 80s to fully max out (3 real stages + 1 reserve)
+// TRAIN_STAGE is deliberately a `let`, not a const: it's player-configurable from the
+// menu's SKILL TIMER option (see TRAIN_STAGE_OPTIONS / the "settings" screen), which lets
+// a match be tuned from fast-and-spammy to slow-and-strategic. Everything downstream
+// derives from it rather than hardcoding 20/40/60/80, so changing it rescales the whole
+// train — per-stage load time, each ability's cast cost (trainThreshold), the reserve
+// stage, and every UI fill percentage — consistently and in one place.
+const DEFAULT_TRAIN_STAGE = 20;
+const TRAIN_STAGE_OPTIONS = [5, 10, 15, 20, 30, 45];
+let TRAIN_STAGE = DEFAULT_TRAIN_STAGE;   // seconds to load each stage
+// A function, not a const, because TRAIN_STAGE can change between matches — a
+// module-load-time `TRAIN_STAGE * 4` would freeze the old value forever.
+const trainMax = () => TRAIN_STAGE * 4;  // 4x stage: 3 real stages + 1 reserve
 
 // ----- Hero system -----
 // Every ability (the 3 that used to be hardcoded into the train, plus the 9
@@ -380,7 +390,7 @@ const ABILITY_META = {
   speed:          { name: "Speed",           icon: "💨", tier: 2, color: "#57E0C6", readyTxt: "#B8F5EA", readyBg: "rgba(46,158,138,0.34)", desc: "Speeds up every marching soldier of yours by 50%" },
   barrage:        { name: "Barrage",         icon: "🪨", tier: 2, color: "#FF3B30", readyTxt: "#FFC7B0", readyBg: "rgba(180,40,25,0.42)", desc: "Your towers (not castles) lob splash-damage boulders" },
   rage:           { name: "Rage",            icon: "🔥", tier: 3, color: "#FF6B4A", readyTxt: "#FFD3C2", readyBg: "rgba(180,70,40,0.40)", desc: "Marching troops turn red and fight 50% stronger" },
-  rollingStones:  { name: "Rolling Stones",  icon: "🗿", tier: 2, color: "#8C7A63", readyTxt: "#E3D9C9", readyBg: "rgba(100,86,68,0.40)", desc: "Marching troops become 4x-strength, tower-immune Rolling Stones" },
+  rollingStones:  { name: "Rolling Stones",  icon: "🗿", tier: 2, color: "#8C7A63", readyTxt: "#E3D9C9", readyBg: "rgba(100,86,68,0.40)", desc: "Marching troops become 4x-strength boulders: +50% speed, tower-immune, but can never capture" },
   storm:          { name: "Tower Defense",   icon: "🛡️", tier: 3, color: "#8FB4FF", readyTxt: "#D2E0FF", readyBg: "rgba(92,124,196,0.34)", desc: "Towers fire 25% faster; castles temporarily join in" },
   sabotage:       { name: "Sabotage",        icon: "🕵️", tier: 3, color: "#C97A1E", readyTxt: "#F0CBA0", readyBg: "rgba(140,90,20,0.36)", desc: "Weakens every enemy building; may instantly capture any left near-empty" },
   fortify:        { name: "Fortify",         icon: "🏰", tier: 2, color: "#A8C5DE", readyTxt: "#DCEAF6", readyBg: "rgba(90,120,150,0.34)", desc: "+50% defensive strength for your buildings, 10s" },
@@ -419,9 +429,13 @@ const HEROES = {
 };
 const HERO_IDS = Object.keys(HEROES);
 
-// Beyond the shared train, each individual special also has its own 20s cooldown per
-// caster — even with train progress to spare, you can't spam the same one back to back.
-const SPECIAL_COOLDOWN = 20;
+// Beyond the shared train, each individual special also has its own cooldown per
+// caster — even with train progress to spare, you can't spam the same one back to
+// back. Tied to TRAIN_STAGE so it tracks the menu's SKILL TIMER setting: picking a
+// 5s train would otherwise leave a fixed 20s cooldown as the real bottleneck,
+// making the faster settings do almost nothing. A function (not a const) for the
+// same reason trainMax() is — TRAIN_STAGE changes between matches.
+const specialCooldown = () => TRAIN_STAGE;
 
 // Every soldier that dies anywhere on the field — yours, an ally's, or an enemy's —
 // feeds everyone's train a little, symmetrically. 10 deaths = +1s for every player.
@@ -493,6 +507,16 @@ const FROST_DURATION = 10; // seconds enemies stay frozen in place
 // Top-level because unitArrives, the tower-targeting loops, and castRollingStones
 // all reference it.
 const ROLLING_STONE_STRENGTH_MULT = 4;
+// Rolling Stones also physically move faster — same +50% as Speed's SPEED_BOOST,
+// applied by writing u.speedMul (not a separate field), so it flows through the
+// existing march-speed math and can be overwritten by an enemy Slow Down/Frost
+// exactly like any other speed buff. Deliberately reuses the same number as
+// SPEED_BOOST rather than inventing a second value to tune.
+const ROLLING_STONE_SPEED_MULT = 1.5;
+// Visual radius of a Rolling Stone in world px, replacing the soldier sprite
+// entirely (SOLDIER_W/H are 9x13) — sized to read as a boulder that's bulkier
+// than the soldier it replaced without swamping a crowded lane.
+const ROLLING_STONE_R = 6.5;
 
 // Rage (hero-kit, Tier 3, see castRage) — same building-arrival strength-
 // multiplier mechanism as Rolling Stones above (applied in unitArrives, at
@@ -1324,6 +1348,20 @@ function TowerConquest() {
   // gets a sensible starting kit (Rally/Speed/Tower Defense as of this
   // session's Rally<->Slow Down swap with Warlord).
   const [selectedHero, setSelectedHero] = useState("tempo");
+  // Player-chosen seconds-per-train-stage (the menu's SKILL TIMER option).
+  // Kept in React state so the menu re-renders on change, and mirrored into the
+  // module-level TRAIN_STAGE by pickSkillTimer below — the game loop, the
+  // specials UI, and trainThreshold all read that variable directly rather than
+  // threading this state through every call site.
+  const [skillTimer, setSkillTimer] = useState(DEFAULT_TRAIN_STAGE);
+  const pickSkillTimer = (secs) => {
+    TRAIN_STAGE = secs;
+    setSkillTimer(secs);
+  };
+  // When false, AI opponents are assigned no hero at all and never cast a
+  // special — a "just the map and the troops" mode. Purely a restriction on the
+  // OPPONENTS: the player keeps their own hero and full kit.
+  const [opponentHeroes, setOpponentHeroes] = useState(true);
   const [showHelp, setShowHelp] = useState(false); // "How to play" modal, closed by default
   const [pct, setPct] = useState(100);
   const pctRef = useRef(100);
@@ -1368,8 +1406,8 @@ function TowerConquest() {
   // Pulse each special button once, right when it comes off cooldown.
   const [pulse, setPulse] = useState({ 1: false, 2: false, 3: false });
   // "Denied" shake — set briefly when a tap lands on a special that LOOKS
-  // tappable but isn't actually ready yet (still loading or on its own 20s
-  // cooldown). See castPlayerSpecial: without this, a too-early tap on a
+  // tappable but isn't actually ready yet (still loading or on its own
+  // per-special cooldown). See castPlayerSpecial: without this, a too-early tap on a
   // native disabled button produces literally zero feedback, which is
   // indistinguishable from the ability itself doing nothing.
   const [shake, setShake] = useState({ 1: false, 2: false, 3: false });
@@ -1440,6 +1478,13 @@ function TowerConquest() {
     SoundEngine.resume();
     SoundEngine.click();
     setInspectPid(null); // clear any leftover ability-details popup from a previous match
+    // Lock in the train pacing for this match. The tutorial is FORCED back to
+    // DEFAULT_TRAIN_STAGE regardless of the menu setting — its script is timed
+    // around the default (the "tutorialAutoWave" enemy trickle is paced to when
+    // Tower Defense becomes available, and each step waits on a specific
+    // ability being ready), so a 5s or 45s train would desync the whole thing.
+    // Same reasoning as forcing heroes[0]="tempo" for the tutorial below.
+    TRAIN_STAGE = tutorial ? DEFAULT_TRAIN_STAGE : skillTimer;
     // "random" isn't a real mode — resolve it to one of the concrete modes now.
     let gameMode = tutorial ? "ffa" : gameModeIn;
     let playersResolved = tutorial ? 2 : players;
@@ -1477,6 +1522,11 @@ function TowerConquest() {
     // repeats — there are at most 3 AI opponents in any real mode (FFA caps
     // at 4 total, 2v2 is exactly 4), exactly enough for a repeat-free draw.
     const humanHero = tutorial ? "tempo" : selectedHero;
+    // "No hero" opponents: AI players get null instead of a hero id, and
+    // aiSpecials bails out entirely (see its early return). Never applied to the
+    // tutorial, whose scripted pacing assumes its one AI opponent behaves
+    // normally. The human's own hero is untouched either way.
+    const noAiHeroes = !tutorial && !opponentHeroes;
     const aiPool = tutorial ? [] : HERO_IDS.filter((id) => id !== humanHero);
     for (let i = aiPool.length - 1; i > 0; i--) { // Fisher-Yates shuffle
       const j = Math.floor(Math.random() * (i + 1));
@@ -1484,12 +1534,15 @@ function TowerConquest() {
     }
     const heroes = tutorial
       ? Array.from({ length: nPlayers }, () => "tempo")
-      : [humanHero, ...aiPool.slice(0, nPlayers - 1)];
+      : noAiHeroes
+        ? [humanHero, ...Array.from({ length: nPlayers - 1 }, () => null)]
+        : [humanHero, ...aiPool.slice(0, nPlayers - 1)];
     gameRef.current = {
       W, H,
       towers: map.towers,
       teams,
-      heroes, // heroes[owner] -> HEROES key; see CAST_FNS/aiSpecials/specials-UI for how this is consumed
+      heroes, // heroes[owner] -> HEROES key (or null with noAiHeroes); see CAST_FNS/aiSpecials/specials-UI
+      noAiHeroes, // read by aiSpecials + the standings pills, so it survives into the match
       mode: gameMode,
       selectedMode: tutorial ? "ffa" : gameModeIn, // the RAW menu choice, pre-random-resolution —
                                                     // see startGame's Redeploy caveat: "random"
@@ -1552,7 +1605,7 @@ function TowerConquest() {
       setPaused(false);
     }
     setScreen("play");
-  }, [selectedHero]);
+  }, [selectedHero, skillTimer]);
 
   // Two owners are allied if they share a team. Neutral (-1) is nobody's ally.
   const sameTeam = (g, a, b) =>
@@ -1732,12 +1785,13 @@ function TowerConquest() {
   // ----- Specials -----
   const trainOf = (g, owner) => (owner === 0 ? g.trainProgress : g.aiTrain[owner]);
 
-  // How much longer until `kind` comes off its own 20s per-caster cooldown (separate
+  // How much longer until `kind` comes off its own per-caster cooldown (see
+  // specialCooldown(), which tracks the SKILL TIMER setting) — separate
   // from train progress — this is what stops spamming the same special back to back).
   const cooldownRemaining = (g, kind, owner = 0) => {
     const last = g.lastCast[owner + "_" + kind];
     if (last === undefined) return 0;
-    return Math.max(0, SPECIAL_COOLDOWN - (g.pulse - last));
+    return Math.max(0, specialCooldown() - (g.pulse - last));
   };
 
   // Looks up the CURRENT match's hero for owner 0 (falls back to Tempo before
@@ -1760,7 +1814,7 @@ function TowerConquest() {
 
   // Casting a special spends progress equal to its OWN threshold (20s / 40s / 60s
   // for 1st/2nd/3rd stage) — using the top-tier special always fully drains the train.
-  // Also stamps this cast's time so the special's own 20s cooldown starts ticking.
+  // Also stamps this cast's time so the special's own cooldown starts ticking.
   const setCd = (g, kind, owner) => {
     const cost = trainThreshold(kind);
     g.lastCast[owner + "_" + kind] = g.pulse;
@@ -1778,10 +1832,10 @@ function TowerConquest() {
   const gainTrainTime = (g, deaths) => {
     if (deaths <= 0) return;
     const seconds = deaths * TRAIN_KILL_GAIN;
-    g.trainProgress = Math.min(TRAIN_MAX, g.trainProgress + seconds);
+    g.trainProgress = Math.min(trainMax(), g.trainProgress + seconds);
     for (let pid = 1; pid < g.numPlayers; pid++) {
       if (g.eliminated.has(pid)) continue;
-      g.aiTrain[pid] = Math.min(TRAIN_MAX, g.aiTrain[pid] + seconds);
+      g.aiTrain[pid] = Math.min(trainMax(), g.aiTrain[pid] + seconds);
     }
   };
 
@@ -2051,21 +2105,28 @@ function TowerConquest() {
   // marching allied soldier into a Rolling Stone for the rest of its march —
   // a permanent transformation for that unit, same "no duration, applies to
   // whoever's marching right now" shape castSpeed/castSlow already use,
-  // rather than a timed buff. Three effects, each threaded into a different
+  // rather than a timed buff. Four effects, each threaded into a different
   // system:
   //   1. "4 times the strength" — see ROLLING_STONE_STRENGTH_MULT's own
   //      comment above; applied in unitArrives.
   //   2. "Can't be shot by towers" — u.rollingStone is checked and skipped in
   //      every tower-targeting loop (nearest-target search, arrow retarget,
   //      boulder splash) in the game loop below.
-  //   3. "Can't take over a castle" — unitArrives special-cases a Rolling
-  //      Stone hitting an enemy CASTLE specifically (not a tower): it still
-  //      does full damage but can never be the arrival that flips ownership,
-  //      clamped at 1 troop instead. A non-stone unit (or a later reinforcing
-  //      wave) is still needed to finish that capture.
+  //   3. "Can never capture ANY building" — unitArrives special-cases a
+  //      Rolling Stone arriving at any hostile building (castle OR tower): it
+  //      still does full damage but can never be the arrival that flips
+  //      ownership, clamped at 1 troop instead. A non-stone unit (or a later
+  //      reinforcing wave) is always needed to finish the capture. Towers used
+  //      to be exempt from this; they no longer are.
+  //   4. "+50% speed" — writes u.speedMul (see ROLLING_STONE_SPEED_MULT), the
+  //      same field Speed/Slow Down/Frost use, so it composes with them
+  //      naturally instead of needing its own parallel speed system.
   function castRollingStones(g, owner) {
     for (const u of g.units) {
-      if (sameTeam(g, u.owner, owner) || u.owner === owner) u.rollingStone = true;
+      if (sameTeam(g, u.owner, owner) || u.owner === owner) {
+        u.rollingStone = true;
+        u.speedMul = ROLLING_STONE_SPEED_MULT;
+      }
     }
     for (const t of g.towers) {
       if (sameTeam(g, t.owner, owner) || t.owner === owner) {
@@ -2311,6 +2372,10 @@ function TowerConquest() {
   // array) rather than a hardcoded storm/speed/slow list — this is what makes
   // aiSpecials work for any of the 4 heroes' kits.
   function aiSpecials(g) {
+    // "No hero" opponents cast nothing at all. Bailing out here rather than
+    // filtering per-ability means no AI ever accrues a cast, so none of the
+    // downstream systems (cooldown stamps, train spend, ready-flash) fire either.
+    if (g.noAiHeroes) return;
     for (let pid = 1; pid < g.numPlayers; pid++) {
       if (g.eliminated.has(pid)) continue;
       const isTeam = (owner) => owner === pid || sameTeam(g, owner, pid);
@@ -2625,11 +2690,14 @@ function TowerConquest() {
     const strength = (u.rollingStone ? ROLLING_STONE_STRENGTH_MULT : 1) * (u.rageBoosted ? RAGE_STRENGTH_MULT : 1);
     if (sameTeam(g, t.owner, u.owner) || t.owner === u.owner) {
       t.troops += strength; // reinforce own or allied garrison — no per-building limit; see the regen step for the actual population budget (sum of towerCapacity across a TEAM's buildings in 2v2, a player's in FFA)
-    } else if (u.rollingStone && t.type === "castle") {
-      // Rolling Stones "can't take over a castle": full damage still lands,
-      // but this arrival can never be the one that flips ownership — clamped
-      // at 1 troop instead of letting the capture branch trigger. A non-stone
-      // unit (or a later wave) is still needed to actually finish it off.
+    } else if (u.rollingStone) {
+      // Rolling Stones "can only kill troops, never take over a building":
+      // full damage still lands, but this arrival can never be the one that
+      // flips ownership — clamped at 1 troop instead of letting the capture
+      // branch trigger. A non-stone unit (or a later wave) is always needed
+      // to actually finish it off. This applies to EVERY building type now —
+      // it used to be gated on `t.type === "castle"`, which left towers
+      // capturable by stones.
       t.troops = Math.max(1, t.troops - (strength * momentumMult(g, u.owner)) / (momentumMult(g, t.owner) * levelDefenseMult(t) * fortifyMult(g, t)));
       applyMomentumKill(g, u.owner, t.owner);
       t.underAttackFlashAt = g.pulse;
@@ -3052,7 +3120,7 @@ function TowerConquest() {
             if (!g.tutorial) aiAct(g, pid);
             g.aiTimers[pid] = 1.1 + Math.random() * 1.6;
           }
-          if (g.aiTrain[pid] < TRAIN_MAX) g.aiTrain[pid] = Math.min(TRAIN_MAX, g.aiTrain[pid] + dt);
+          if (g.aiTrain[pid] < trainMax()) g.aiTrain[pid] = Math.min(trainMax(), g.aiTrain[pid] + dt);
         }
 
         // Tutorial-only: keep a small enemy trickle marching at the player during
@@ -3107,7 +3175,7 @@ function TowerConquest() {
         }
 
         // Special "train" progress + effect animations
-        if (g.trainProgress < TRAIN_MAX) g.trainProgress = Math.min(TRAIN_MAX, g.trainProgress + dt);
+        if (g.trainProgress < trainMax()) g.trainProgress = Math.min(trainMax(), g.trainProgress + dt);
         for (let i = g.rings.length - 1; i >= 0; i--) {
           g.rings[i].life += dt;
           if (g.rings[i].life >= g.rings[i].dur) g.rings.splice(i, 1);
@@ -3139,7 +3207,7 @@ function TowerConquest() {
             troops: Math.floor(mine.reduce((s, t) => s + t.troops, 0) + marching),
             dead: g.eliminated.has(pid),
             momentum: momentumMult(g, pid),
-            trainPct: trainOf(g, pid) / TRAIN_MAX, // 0..1 — see the per-player mini loading bar in the standings row
+            trainPct: trainOf(g, pid) / trainMax(), // 0..1 — see the per-player mini loading bar in the standings row
           });
         }
         setHud(stats);
@@ -3860,7 +3928,11 @@ function TowerConquest() {
     // march in lockstep; the speed-boost glow stays on the ground beneath.
     for (const u of g.units) {
       const Q = P(u.x, u.y);
-      if (u.speedMul && u.speedMul > 1) {
+      // A Rolling Stone is drawn as an actual boulder below (replacing the
+      // soldier sprite outright), and its speed buff is intrinsic to what it
+      // is — so it deliberately skips the teal speed glow here, which would
+      // otherwise read as a second, redundant effect stacked under the rock.
+      if (u.speedMul && u.speedMul > 1 && !u.rollingStone) {
         ctx.fillStyle = "rgba(87,224,198,0.5)";
         ctx.beginPath();
         ctx.ellipse(Q.x, Q.y, 5.5 * Q.s, 5.5 * Q.s * TILT, 0, 0, Math.PI * 2);
@@ -3880,19 +3952,6 @@ function TowerConquest() {
         ctx.stroke();
         ctx.setLineDash([]);
       }
-      if (u.rollingStone) {
-        // Rolling Stones (see castRollingStones) — a filled, rotated stone-grey
-        // diamond, layered independently of the speed/slow glow above (drawn as
-        // its own `if`, not chained into the else-if) so the two can stack if a
-        // unit is ever both. Diamond shape keeps it distinct from both the
-        // speed ellipse and the slow/frost ring at a glance.
-        ctx.save();
-        ctx.translate(Q.x, Q.y);
-        ctx.rotate(Math.PI / 4);
-        ctx.fillStyle = "rgba(140,122,99,0.55)";
-        ctx.fillRect(-4.5 * Q.s, -4.5 * Q.s, 9 * Q.s, 9 * Q.s);
-        ctx.restore();
-      }
       if (u.rageBoosted) {
         // Rage (see castRage) — a solid, saturated red glow beneath the
         // sprite: the same "filled glow" language as Speed's teal one (both
@@ -3909,10 +3968,58 @@ function TowerConquest() {
       }
       const tgt = g.towers[u.dst];
       const flip = tgt ? tgt.x < u.x : false;
-      const frame = (Math.floor(g.pulse * 9 + u.phase * 3) % 2 + 2) % 2;
-      const bob = frame === 1 ? -0.5 * Q.s : 0;
-      const w = SOLDIER_W * Q.s, h = SOLDIER_H * Q.s;
-      ctx.drawImage(soldierSprite(u.owner, frame, flip), Q.x - w / 2, Q.y - h + bob, w, h);
+      let h;
+      if (u.rollingStone) {
+        // An actual rolling boulder, drawn in place of the soldier sprite —
+        // the unit doesn't just get a marker, it visibly IS a stone now.
+        const r = ROLLING_STONE_R * Q.s;
+        h = r * 2;
+        const cy = Q.y - r; // rest the rock ON the unit's ground point
+        // Rotation is derived from remaining distance to the destination, which
+        // decreases monotonically as the unit advances — so the rock always
+        // rolls FORWARD, never jitters or reverses, and needs no per-unit state
+        // to accumulate. Sign flips with travel direction so it rolls the way
+        // it's actually going.
+        const rem = tgt ? Math.hypot(tgt.x - u.x, tgt.y - u.y) : 0;
+        const roll = (flip ? 1 : -1) * rem * 0.12;
+        // Contact shadow on the ground, matching the soldier sprites' language.
+        ctx.fillStyle = "rgba(0,0,0,0.28)";
+        ctx.beginPath();
+        ctx.ellipse(Q.x, Q.y, r * 0.95, r * 0.42 * TILT * 2, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.save();
+        ctx.translate(Q.x, cy);
+        ctx.rotate(roll);
+        // Body
+        ctx.fillStyle = "#8C7A63";
+        ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill();
+        // Lit face, upper-left to match the map's shared LIGHT_DIR convention
+        ctx.fillStyle = "rgba(255,247,230,0.22)";
+        ctx.beginPath(); ctx.arc(-r * 0.32, -r * 0.36, r * 0.52, 0, Math.PI * 2); ctx.fill();
+        // A couple of cracks/pits so the rotation actually reads as rolling —
+        // a flat-shaded circle would look static no matter how fast it spun.
+        ctx.strokeStyle = "rgba(58,48,38,0.55)";
+        ctx.lineWidth = Math.max(1, 0.9 * Q.s);
+        ctx.beginPath();
+        ctx.moveTo(-r * 0.55, -r * 0.1); ctx.lineTo(-r * 0.05, r * 0.2);
+        ctx.moveTo(r * 0.2, -r * 0.5); ctx.lineTo(r * 0.45, -r * 0.05);
+        ctx.stroke();
+        ctx.fillStyle = "rgba(58,48,38,0.4)";
+        ctx.beginPath(); ctx.arc(r * 0.3, r * 0.35, r * 0.16, 0, Math.PI * 2); ctx.fill();
+        // Faction rim — a stone still has to read as YOURS at a glance, which
+        // the old grey diamond did via the sprite it sat under. Now that the
+        // sprite is gone, the rim carries that job.
+        ctx.strokeStyle = FACTIONS[u.owner].color;
+        ctx.lineWidth = Math.max(1, 1.3 * Q.s);
+        ctx.beginPath(); ctx.arc(0, 0, r * 0.94, 0, Math.PI * 2); ctx.stroke();
+        ctx.restore();
+      } else {
+        const frame = (Math.floor(g.pulse * 9 + u.phase * 3) % 2 + 2) % 2;
+        const bob = frame === 1 ? -0.5 * Q.s : 0;
+        const w = SOLDIER_W * Q.s;
+        h = SOLDIER_H * Q.s;
+        ctx.drawImage(soldierSprite(u.owner, frame, flip), Q.x - w / 2, Q.y - h + bob, w, h);
+      }
       if ((u.speedMul && u.speedMul < 1) || u.frozen) {
         // Small rotating frost sparkle above the head — a second, unmistakable cue on
         // top of the ring beneath, cheap to draw (a few strokes) and immune to the
@@ -4173,21 +4280,26 @@ function TowerConquest() {
           // icon if a match somehow started before heroes were assigned
           // (shouldn't happen, but gameRef.current reads are inherently
           // a snapshot — see the appropriate-boundaries note elsewhere).
+          // With "no hero" opponents this pid genuinely has no kit — don't let
+          // the `|| "tempo"` fallback invent one and display abilities the AI
+          // can never actually cast.
+          const noHero = !!(gameRef.current && gameRef.current.noAiHeroes);
           const heroId = (gameRef.current && gameRef.current.heroes && gameRef.current.heroes[s.pid]) || "tempo";
           const hero = HEROES[heroId] || HEROES.tempo;
-          const inspecting = inspectPid === s.pid;
+          const inspecting = !noHero && inspectPid === s.pid;
           return (
             <div key={s.pid} style={{ position: "relative" }}>
               {/* Tapping a pill toggles a details popup listing that hero's 3
                   abilities in full — icon, name, tier, and description — the
                   same info the menu's hero picker shows, just for whoever
-                  you're currently versing instead of your own pick. */}
-              <div onClick={() => setInspectPid(inspecting ? null : s.pid)}
+                  you're currently versing instead of your own pick. Disabled
+                  entirely for heroless opponents: there'd be nothing to show. */}
+              <div onClick={() => { if (!noHero) setInspectPid(inspecting ? null : s.pid); }}
                 style={{
                   display: "flex", flexDirection: "column", gap: 4,
                   background: "rgba(10,14,24,0.32)",
                   border: `1px solid ${inspecting ? FACTIONS[s.pid].color : FACTIONS[s.pid].dim + "55"}`,
-                  borderRadius: 10, padding: "5px 9px", cursor: "pointer",
+                  borderRadius: 10, padding: "5px 9px", cursor: noHero ? "default" : "pointer",
                 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{
@@ -4200,10 +4312,19 @@ function TowerConquest() {
                       portrait lives in the tap-to-inspect popup below instead,
                       where it's a one-off overlay rather than permanent map-eating
                       real estate — see the "player bars" note in the project doc. */}
-                  <img src={hero.portrait} alt="" style={{
-                    width: 16, height: 16, borderRadius: "50%", objectFit: "cover",
-                    flexShrink: 0, border: `1px solid ${FACTIONS[s.pid].color}88`,
-                  }} />
+                  {noHero ? (
+                    <span style={{
+                      width: 16, height: 16, borderRadius: "50%", flexShrink: 0,
+                      border: `1px dashed ${FACTIONS[s.pid].color}88`,
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      fontSize: 9, color: "rgba(232,235,242,0.5)",
+                    }}>—</span>
+                  ) : (
+                    <img src={hero.portrait} alt="" style={{
+                      width: 16, height: 16, borderRadius: "50%", objectFit: "cover",
+                      flexShrink: 0, border: `1px solid ${FACTIONS[s.pid].color}88`,
+                    }} />
+                  )}
                   <span style={{ fontSize: 11, color: "rgba(232,235,242,0.85)", whiteSpace: "nowrap" }}>
                     {FACTIONS[s.pid].name}
                   </span>
@@ -4227,6 +4348,14 @@ function TowerConquest() {
                     "which ability" AND "how charged," not just a generic
                     fullness bar. A bar at full charge gets a brighter fill
                     + a glow so a ready enemy special stands out. */}
+                {noHero ? (
+                  <div style={{
+                    fontSize: 9, color: "rgba(232,235,242,0.45)",
+                    letterSpacing: 0.5, textAlign: "center", padding: "1px 0",
+                  }}>
+                    no specials
+                  </div>
+                ) : (
                 <div style={{ display: "flex", gap: 4 }}>
                   {[1, 2, 3].map((tier) => {
                     const kind = hero.kit[tier];
@@ -4251,6 +4380,7 @@ function TowerConquest() {
                     );
                   })}
                 </div>
+                )}
               </div>
 
               {inspecting && (
@@ -4580,6 +4710,30 @@ function TowerConquest() {
               </button>
             </div>
 
+            <div style={{ marginTop: 26 }}>
+              <div style={{ fontSize: 13, letterSpacing: 3, color: "#8592A8", marginBottom: 14 }}>SETTINGS</div>
+              {/* Skill timer + opponent-heroes both live behind here now rather than
+                  as their own inline menu sections. Keeps the pre-match menu to the
+                  three things you change most (mode, combatants, hero) and stops the
+                  screen growing every time a new match option is added. Summary text
+                  shows the current values so opening it isn't required just to check. */}
+              <button onClick={() => { SoundEngine.click(); setScreen("settings"); }}
+                style={chip({
+                  background: "#F4F7FC",
+                  borderColor: "#D7E1EE",
+                  color: "#3C4658",
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+                  margin: "0 auto", padding: "10px 18px",
+                })}>
+                <span style={{ fontSize: 18 }}>&#9881;&#65039;</span>
+                <span style={{ fontWeight: 700 }}>Settings</span>
+                <span style={{ fontSize: 11, color: "#8592A8" }}>
+                  {skillTimer}s &middot; {opponentHeroes ? "hero rivals" : "no hero rivals"}
+                </span>
+                <span style={{ fontSize: 11, color: "#8592A8", marginLeft: 2 }}>open &#9654;</span>
+              </button>
+            </div>
+
             <button onClick={() => startGame(numPlayers, mode)}
               style={chip({
                 marginTop: 28, background: "#FFD23F", color: "#1F2A44",
@@ -4597,6 +4751,137 @@ function TowerConquest() {
               </button>
             </div>
           </div>
+          </div>
+        </div>
+      )}
+
+      {screen === "settings" && (
+        <div style={{
+          position: "absolute", inset: 0,
+          overflowY: "auto", WebkitOverflowScrolling: "touch", touchAction: "pan-y",
+          background: "linear-gradient(180deg, #EAF4FF 0%, #FFFFFF 60%)",
+        }}>
+          <button onClick={() => { SoundEngine.click(); setScreen("menu"); }}
+            style={chip({
+              position: "absolute", top: 16, left: 16, zIndex: 5,
+              padding: "8px 14px", fontSize: 13,
+              background: "#FFFFFF", color: "#6B7684", borderColor: "#D7E1EE",
+            })}>
+            ← Back
+          </button>
+          <div style={{
+            minHeight: "100%", boxSizing: "border-box",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: "70px 20px 32px",
+          }}>
+            <div style={{ maxWidth: 460, textAlign: "center" }}>
+              <h2 style={{ fontSize: 22, fontWeight: 800, margin: "0 0 20px", letterSpacing: 1, color: "#1F2A44" }}>
+                Settings
+              </h2>
+
+              <div style={{ fontSize: 12, letterSpacing: 2, color: "#8592A8", marginBottom: 8, textAlign: "left" }}>
+                SKILL TIMER
+              </div>
+              <p style={{ fontSize: 12, color: "#6B7684", margin: "0 0 14px", lineHeight: 1.5, textAlign: "left" }}>
+                How long each stage of the specials train takes to load. Lower means abilities
+                come up faster and matches get more chaotic; higher makes each cast a bigger
+                commitment. Each ability&rsquo;s own cooldown matches this too.
+              </p>
+              <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+                {TRAIN_STAGE_OPTIONS.map((secs) => {
+                  const active = skillTimer === secs;
+                  return (
+                    <button key={secs} onClick={() => { SoundEngine.click(); pickSkillTimer(secs); }}
+                      style={chip({
+                        background: active ? "#FFF6DC" : "#F4F7FC",
+                        borderColor: active ? "#E2A100" : "#D7E1EE",
+                        color: active ? "#B87800" : "#3C4658",
+                        minWidth: 92, padding: "12px 14px",
+                        display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+                      })}>
+                      <span style={{ fontSize: 17, fontWeight: 800 }}>{secs}s</span>
+                      <span style={{ fontSize: 10, opacity: 0.8 }}>
+                        {secs === DEFAULT_TRAIN_STAGE ? "default" : secs < DEFAULT_TRAIN_STAGE ? "faster" : "slower"}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Concrete per-tier breakdown, so the abstract "seconds per stage"
+                  number translates into the thing the player actually feels:
+                  when each of their own hero's three abilities becomes castable. */}
+              <div style={{
+                marginTop: 18, padding: "10px 14px", borderRadius: 10,
+                background: "#FFFFFF", border: "1px solid #E3E9F3",
+                maxWidth: 380, marginLeft: "auto", marginRight: "auto", textAlign: "left",
+              }}>
+                {[1, 2, 3].map((tier) => {
+                  const meta = ABILITY_META[HEROES[selectedHero].kit[tier]];
+                  return (
+                    <div key={tier} style={{
+                      display: "flex", alignItems: "center", gap: 10, padding: "6px 0",
+                      borderTop: tier > 1 ? "1px solid #E3E9F3" : "none",
+                    }}>
+                      <div style={{ fontSize: 16, flexShrink: 0 }}>{meta.icon}</div>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: readableAccent(meta.color, 0.3), flex: 1 }}>
+                        {meta.name}
+                      </div>
+                      <div style={{
+                        fontFamily: "'IBM Plex Mono', monospace", fontSize: 12,
+                        fontWeight: 700, color: "#6B7684",
+                      }}>
+                        {skillTimer * tier}s
+                      </div>
+                    </div>
+                  );
+                })}
+                <div style={{ fontSize: 10, color: "#8592A8", marginTop: 8, lineHeight: 1.4 }}>
+                  Times shown are for {HEROES[selectedHero].name}'s kit, from an empty train.
+                  Kills load it faster. The tutorial always uses {DEFAULT_TRAIN_STAGE}s.
+                </div>
+              </div>
+
+              <div style={{
+                marginTop: 26, paddingTop: 22, borderTop: "1px solid #E3E9F3",
+              }}>
+                <div style={{ fontSize: 12, letterSpacing: 2, color: "#8592A8", marginBottom: 8, textAlign: "left" }}>
+                  OPPONENTS
+                </div>
+                <p style={{ fontSize: 12, color: "#6B7684", margin: "0 0 14px", lineHeight: 1.5, textAlign: "left" }}>
+                  Whether AI rivals get a hero of their own. Turning it off means no specials are
+                  ever used against you &mdash; you keep your own hero and full kit either way.
+                </p>
+                <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+                  {[[true, "\u{1F6E1}\u{FE0F}", "With heroes", "they cast specials too"],
+                    [false, "\u{1F6AB}", "No heroes", "no specials against you"]].map(([val, icon, label, sub]) => (
+                    <button key={String(val)} onClick={() => { SoundEngine.click(); setOpponentHeroes(val); }}
+                      style={chip({
+                        background: opponentHeroes === val ? "#FFF6DC" : "#F4F7FC",
+                        borderColor: opponentHeroes === val ? "#E2A100" : "#D7E1EE",
+                        color: opponentHeroes === val ? "#B87800" : "#3C4658",
+                        minWidth: 150, padding: "10px 14px",
+                        display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+                      })}>
+                      <span style={{ fontSize: 16 }}>{icon}</span>
+                      <span style={{ fontWeight: 700 }}>{label}</span>
+                      <span style={{ fontSize: 10, opacity: 0.8 }}>{sub}</span>
+                    </button>
+                  ))}
+                </div>
+                <div style={{ fontSize: 10, color: "#8592A8", marginTop: 8, lineHeight: 1.4 }}>
+                  The tutorial always plays with a normal hero opponent.
+                </div>
+              </div>
+
+              <button onClick={() => { SoundEngine.click(); setScreen("menu"); }}
+                style={chip({
+                  marginTop: 26, background: "#FFD23F", color: "#1F2A44",
+                  fontWeight: 800, fontSize: 15, padding: "12px 30px", border: "1px solid #E2A100",
+                })}>
+                Done
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -4881,7 +5166,7 @@ function TowerConquest() {
                 ...specials.map((s, i) => {
                   const start = i * TRAIN_STAGE;
                   const fillPct = Math.max(0, Math.min(100, ((fireInfo.trainProgress - start) / TRAIN_STAGE) * 100));
-                  // Ready needs BOTH the train loaded AND this special's own 20s cooldown
+                  // Ready needs BOTH the train loaded AND this special's own cooldown
                   // clear. Show whichever is the binding constraint as the countdown.
                   const ready = s.secs <= 0 && s.cd <= 0;
                   const displaySecs = Math.max(s.secs, s.cd);
@@ -4933,10 +5218,12 @@ function TowerConquest() {
                 }),
                 (() => {
                   // 4th segment: pure reserve capacity, no special of its own. Fills
-                  // from the 3rd special's threshold (60s) up to TRAIN_MAX (80s) —
-                  // banking this is what lets you follow up Tower Defense with
-                  // Tower Defense right away instead of starting from empty. The
-                  // reserve mechanic itself (fill behavior) is unchanged — only
+                  // from the 3rd special's threshold (3x TRAIN_STAGE) up to trainMax()
+                  // (4x TRAIN_STAGE) — banking this is what lets you follow up Tower
+                  // Defense with the Tier-1 ability right away instead of starting from
+                  // empty. Expressed in stage multiples rather than literal seconds
+                  // because TRAIN_STAGE is player-configurable (see SKILL TIMER).
+                  // The reserve mechanic itself (fill behavior) is unchanged — only
                   // what's DISPLAYED on top of it changed: the player's own
                   // Momentum (renamed back from "Attack Strength" this session —
                   // now that momentum affects speed and defense again, not just
