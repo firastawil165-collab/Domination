@@ -58,7 +58,7 @@ const { useRef, useState, useEffect, useCallback } = React;
 
 
 // ================= Constants =================
-const APP_VERSION = "0.249"; // bump by 0.001 each update
+const APP_VERSION = "0.251"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -343,6 +343,19 @@ const towerMax = (t) => (t.level + 1) * BASE_MAX;
 // the player just leaves it be.
 const towerCapacity = (t) => towerMax(t) + CAPACITY_BONUS;
 const towerRegen = (t) => (t.type === "tower" ? 0 : REGEN_RATE * regenLevelMult(t));
+// Difficulty. Only "easy" differs from the baseline, and only in one number: every
+// building NOT on the player's team regenerates this much slower. Deliberately a
+// single lever rather than a bundle of AI-behavior tweaks — the AI's decision code
+// (aiAct/aiSpecials) is identical on both settings, so easy mode is "the rivals
+// rebuild slower," not "the rivals play worse," which is both easier to reason
+// about and easier to tune. Applies to enemy players only: neutrals, the player,
+// and a 2v2 ally all regenerate normally.
+const EASY_ENEMY_REGEN_MULT = 0.75; // -25%
+const DIFFICULTIES = [
+  { id: "easy", label: "Easy", icon: "\u{1F331}", sub: "rivals rebuild 25% slower" },
+  { id: "regular", label: "Regular", icon: "\u{2694}\u{FE0F}", sub: "the standard fight" },
+];
+const DEFAULT_DIFFICULTY = "regular";
 const towerFireCd = (t) => ARROW_FIRE_CD / fireLevelMult(t);
 
 
@@ -1388,6 +1401,9 @@ function TowerConquest() {
   // special — a "just the map and the troops" mode. Purely a restriction on the
   // OPPONENTS: the player keeps their own hero and full kit.
   const [opponentHeroes, setOpponentHeroes] = useState(true);
+  // "easy" | "regular" — see EASY_ENEMY_REGEN_MULT. Mirrored onto g at match start
+  // (g.difficulty) so a mid-match menu change can't retune a game in progress.
+  const [difficulty, setDifficulty] = useState(DEFAULT_DIFFICULTY);
   const [showHelp, setShowHelp] = useState(false); // "How to play" modal, closed by default
   const [pct, setPct] = useState(100);
   const pctRef = useRef(100);
@@ -1601,6 +1617,12 @@ function TowerConquest() {
                                                     // silently stop re-rolling and just repeat
                                                     // whatever mode+playercount got rolled once.
       selectedNumPlayers: tutorial ? 2 : players,  // ditto — the raw pre-resolution player count
+      // Snapshotted at match start rather than read live from React state, so
+      // opening Settings mid-match can't retune a game already in progress. The
+      // tutorial is always Easy — it's already the forgiving mode (half-speed
+      // enemy regen on top of this), and its scripted pacing shouldn't shift
+      // depending on a menu setting.
+      difficulty: tutorial ? "easy" : difficulty,
       tutorial,          // if true, the player can never lose (see outcome check)
       tutorialFlags: { captured: false, upgraded: false, castStorm: false, castSpeed: false, castRally: false, finished: false },
       tutorialWaitStart: null, // g.pulse timestamp when the current step's waitFor flag tripped;
@@ -1654,7 +1676,13 @@ function TowerConquest() {
       setPaused(false);
     }
     setScreen("play");
-  }, [selectedHero, skillTimer]);
+    // Every piece of menu state startGame actually reads has to be listed here,
+    // or useCallback hands back a memoized closure over the OLD value and the
+    // setting silently doesn't take effect. `opponentHeroes` was already missing
+    // (found while adding `difficulty` — changing "With heroes"/"No heroes" and
+    // hitting Deploy without also touching the hero picker or skill timer would
+    // start the match with the previous setting).
+  }, [selectedHero, skillTimer, opponentHeroes, difficulty]);
 
   // Two owners are allied if they share a team. Neutral (-1) is nobody's ally.
   const sameTeam = (g, a, b) =>
@@ -2904,7 +2932,18 @@ function TowerConquest() {
           // and neutral buildings are unaffected) — keeps the AI's economy
           // from quietly outpacing a player who's still reading each step.
           const tutorialRegenMult = (g.tutorial && t.owner !== 0 && t.owner !== NEUTRAL) ? 0.5 : 1;
-          const grown = Math.min(room, towerRegen(t) * dt * tutorialRegenMult);
+          // Easy difficulty: every building on a HOSTILE team regenerates 25%
+          // slower. Scoped by team rather than by `owner !== 0` (which is what
+          // the tutorial line above uses) so a 2v2 ally isn't handicapped
+          // alongside the enemies. Neutrals are explicitly excluded — they're
+          // nobody's economy, and slowing them would just make the map's free
+          // real estate easier for the AI to take too. Multiplies with the
+          // tutorial's own 0.5 rather than replacing it, so a tutorial enemy
+          // ends up at 0.5 * 0.75 = 0.375.
+          const easyRegenMult =
+            (g.difficulty === "easy" && t.owner !== NEUTRAL && !sameTeam(g, t.owner, 0))
+              ? EASY_ENEMY_REGEN_MULT : 1;
+          const grown = Math.min(room, towerRegen(t) * dt * tutorialRegenMult * easyRegenMult);
           if (grown > 0) {
             t.troops += grown;
             if (t.owner !== NEUTRAL) totalPop[g.teams[t.owner]] += grown; // keep the running total accurate within this tick
@@ -3332,6 +3371,12 @@ function TowerConquest() {
             towers: mine.length,
             troops: Math.floor(mine.reduce((s, t) => s + t.troops, 0) + marching),
             dead: g.eliminated.has(pid),
+            // Whether this player can still CAST despite being eliminated (see
+            // stillCasting — true while any teammate is alive). Drives whether
+            // their pill stays on screen: a wiped-out 2v2 ally still charges a
+            // train and still casts team-scoped specials at you/for you, so
+            // hiding their ability bars would hide information that's still live.
+            casting: stillCasting(g, pid),
             momentum: momentumMult(g, pid),
             trainPct: trainOf(g, pid) / trainMax(), // 0..1 — see the per-player mini loading bar in the standings row
           });
@@ -4395,10 +4440,20 @@ function TowerConquest() {
           overlay — the map's flex:1 simply shrinks to make room, so nothing
           here can ever sit on top of the battlefield again. */}
       {screen === "play" && (() => {
-        const others = hud.filter((s) => !s.dead && s.pid !== 0);
+        // Keep an ELIMINATED player's pill on screen as long as they can still
+        // cast (2v2 only — see stillCasting). Applies to allies and enemies
+        // alike: a wiped-out ally's specials are the whole reason to watch their
+        // bars, and a wiped-out enemy can still drop Frost/Sabotage on you.
+        // A truly-out player (whole team gone) drops off the HUD as before.
+        const others = hud.filter((s) => s.pid !== 0 && (!s.dead || s.casting));
         const rightPills = others.slice(0, 2);
         const leftPill = others[2];
         const renderPill = (s) => {
+          // Eliminated but still casting: the pill stays, dimmed, with the troop
+          // count (always 0) swapped for an OUT badge so there's no ambiguity
+          // about why the number never moves. The ability bars stay at full
+          // brightness — they're the reason the pill is still here.
+          const out = s.dead;
           const pct = Math.round(s.momentum * 100);
           const tint = pct > 100 ? "#4ADE5A" : pct < 100 ? "#FF6B6B" : "#8a93ab";
           // Hero icon so the player can see who they're up against at a
@@ -4426,6 +4481,7 @@ function TowerConquest() {
                   background: "rgba(10,14,24,0.32)",
                   border: `1px solid ${inspecting ? FACTIONS[s.pid].color : FACTIONS[s.pid].dim + "55"}`,
                   borderRadius: 10, padding: "5px 9px", cursor: noHero ? "default" : "pointer",
+                  opacity: out ? 0.62 : 1,
                 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{
@@ -4456,9 +4512,11 @@ function TowerConquest() {
                   </span>
                   <span style={{
                     fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, fontWeight: 700,
-                    color: "rgba(232,235,242,0.7)", minWidth: 22, textAlign: "right",
+                    color: out ? "rgba(232,235,242,0.45)" : "rgba(232,235,242,0.7)",
+                    minWidth: 22, textAlign: "right",
+                    letterSpacing: out ? 0.5 : 0,
                   }}>
-                    {s.troops}
+                    {out ? "OUT" : s.troops}
                   </span>
                   <span style={{
                     fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, fontWeight: 700,
@@ -4905,7 +4963,42 @@ function TowerConquest() {
                 Settings
               </h2>
 
+              {/* DIFFICULTY sits first: it's the coarsest, most consequential
+                  choice on this screen, and the two below it are refinements. */}
               <div style={{ fontSize: 12, letterSpacing: 2, color: "#8592A8", marginBottom: 8, textAlign: "left" }}>
+                DIFFICULTY
+              </div>
+              <p style={{ fontSize: 12, color: "#6B7684", margin: "0 0 14px", lineHeight: 1.5, textAlign: "left" }}>
+                Easy slows how fast rival castles rebuild their garrisons, giving you more room
+                to push. It doesn&rsquo;t make them play any worse &mdash; they scheme just as
+                hard either way, they just recover slower from a beating.
+              </p>
+              <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+                {DIFFICULTIES.map((d) => {
+                  const active = difficulty === d.id;
+                  return (
+                    <button key={d.id} onClick={() => { SoundEngine.click(); setDifficulty(d.id); }}
+                      style={chip({
+                        background: active ? "#FFF6DC" : "#F4F7FC",
+                        borderColor: active ? "#E2A100" : "#D7E1EE",
+                        color: active ? "#B87800" : "#3C4658",
+                        minWidth: 150, padding: "10px 14px",
+                        display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+                      })}>
+                      <span style={{ fontSize: 16 }}>{d.icon}</span>
+                      <span style={{ fontWeight: 700 }}>{d.label}</span>
+                      <span style={{ fontSize: 10, opacity: 0.8 }}>{d.sub}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <div style={{ fontSize: 10, color: "#8592A8", marginTop: 8, lineHeight: 1.4, textAlign: "left" }}>
+                Applies to rival players only &mdash; neutral castles, and your ally in 2v2,
+                rebuild at full speed. The tutorial is always Easy. Changing this only affects
+                your next match, not one already in progress.
+              </div>
+
+              <div style={{ fontSize: 12, letterSpacing: 2, color: "#8592A8", marginTop: 26, paddingTop: 22, borderTop: "1px solid #E3E9F3", marginBottom: 8, textAlign: "left" }}>
                 SKILL TIMER
               </div>
               <p style={{ fontSize: 12, color: "#6B7684", margin: "0 0 14px", lineHeight: 1.5, textAlign: "left" }}>
