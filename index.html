@@ -14,9 +14,23 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; height: 100%; background: #1c2942; overscroll-behavior: none; }
   #root { height: 100%; }
-  /* Simple loading text shown until React mounts */
+  /* Loading screen shown until React mounts. (v0.253 polish) Styled to match
+     the game's dark battlefield chrome — navy field, gold letterspaced wordmark,
+     a slow breathing pulse so a slow network doesn't look like a hang. */
   #boot { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
-          color: #8a93ab; font-family: 'Oxanium', sans-serif; letter-spacing: 3px; }
+          color: #FFD23F; font-family: 'Oxanium', sans-serif; font-weight: 800;
+          letter-spacing: 6px; font-size: 15px;
+          animation: bootPulse 1.6s ease-in-out infinite; }
+  @keyframes bootPulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { #boot { animation: none; opacity: 0.85; } }
+  /* (v0.253 polish) Every button presses DOWN when tapped — one global rule
+     instead of per-callsite classes, since chip() is an inline-style helper
+     with dozens of callers. transform composes fine with the specialReady /
+     specialDenied keyframes (animation wins while it runs, which is correct).
+     Skipped under prefers-reduced-motion along with everything else. */
+  button { transition: transform 0.07s ease; }
+  button:active { transform: translateY(1px) scale(0.985); }
+  @media (prefers-reduced-motion: reduce) { button { transition: none; } button:active { transform: none; } }
   @keyframes specialReady {
     0%   { box-shadow: 0 0 0 0 rgba(255,210,63,0.65); transform: scale(1); }
     35%  { box-shadow: 0 0 0 10px rgba(255,210,63,0); transform: scale(1.08); }
@@ -39,6 +53,11 @@
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<!-- Supabase JS client — accounts now (Phase 1), lobbies/matchmaking/live sync in later phases.
+     Loaded from jsdelivr rather than cdnjs: this file is now deployed on Vercel (a real browser),
+     not run inside Claude's artifact sandbox, so the cdnjs-only restriction noted elsewhere in
+     this file no longer applies to this specific script. -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script>
   // Silence Babel's "in-browser transformer" console notice; restored once our script runs.
   window.__origConsoleWarn = console.warn;
@@ -55,10 +74,18 @@ console.warn = window.__origConsoleWarn;
 console.error = window.__origConsoleError;
 const { useRef, useState, useEffect, useCallback } = React;
 
-
+// ================= Supabase =================
+// Project: domination-game. The anon/publishable key below is safe to ship in
+// client code by design (Supabase's browser-facing key, meant to be public —
+// see Project Settings -> API). All real access control lives in Postgres Row
+// Level Security policies, not in keeping this key secret. Never put the
+// secret/service_role key here.
+const SUPABASE_URL = "https://tmgnwsvujdvltndpxcgp.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRtZ253c3Z1amR2bHRuZHB4Y2dwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1NDkwNjcsImV4cCI6MjEwMDEyNTA2N30.066qrox7uKbcqQs_s79vu_hf2BY-jL003B0EQsvsZvY";
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ================= Constants =================
-const APP_VERSION = "0.251"; // bump by 0.001 each update
+const APP_VERSION = "0.254"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -172,6 +199,16 @@ function buildTerrainTexture(g) {
     tc.stroke();
   }
   tc.restore();
+
+  // (v0.253 polish) Soft vignette baked into the texture — darkens edges and
+  // corners so the battlefield's center reads as the lit "stage" and the map
+  // feels like it has depth instead of ending in a flat crop. Baked here, not
+  // drawn per-frame: it's one radial gradient at build time, zero runtime cost.
+  const vig = tc.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.38, W / 2, H / 2, Math.hypot(W, H) * 0.62);
+  vig.addColorStop(0, "rgba(6,10,20,0)");
+  vig.addColorStop(1, "rgba(6,10,20,0.30)");
+  tc.fillStyle = vig;
+  tc.fillRect(0, 0, W, H);
 
   g.terrainTex = tex;
 }
@@ -407,7 +444,7 @@ const ABILITY_META = {
   speed:          { name: "Speed",           icon: "💨", tier: 2, color: "#57E0C6", readyTxt: "#B8F5EA", readyBg: "rgba(46,158,138,0.34)", desc: "Speeds up every marching soldier of yours by 50%" },
   barrage:        { name: "Barrage",         icon: "🪨", tier: 2, color: "#FF3B30", readyTxt: "#FFC7B0", readyBg: "rgba(180,40,25,0.42)", desc: "Your towers (not castles) lob splash-damage boulders" },
   rage:           { name: "Rage",            icon: "🔥", tier: 3, color: "#FF6B4A", readyTxt: "#FFD3C2", readyBg: "rgba(180,70,40,0.40)", desc: "Marching troops turn red and fight 50% stronger" },
-  rollingStones:  { name: "Rolling Stones",  icon: "🗿", tier: 2, color: "#8C7A63", readyTxt: "#E3D9C9", readyBg: "rgba(100,86,68,0.40)", desc: "Marching troops become 4x-strength boulders: +50% speed, tower-immune, but can never capture" },
+  rollingStones:  { name: "Rolling Stones",  icon: "🗿", tier: 2, color: "#8C7A63", readyTxt: "#E3D9C9", readyBg: "rgba(100,86,68,0.40)", desc: "Your 20 marching troops nearest their target become 4x-strength boulders: +50% speed, tower-immune, but can never capture" },
   storm:          { name: "Tower Defense",   icon: "🛡️", tier: 3, color: "#8FB4FF", readyTxt: "#D2E0FF", readyBg: "rgba(92,124,196,0.34)", desc: "Towers fire 25% faster; castles temporarily join in" },
   sabotage:       { name: "Sabotage",        icon: "🕵️", tier: 3, color: "#C97A1E", readyTxt: "#F0CBA0", readyBg: "rgba(140,90,20,0.36)", desc: "Weakens every enemy building; may instantly capture any left near-empty" },
   fortify:        { name: "Fortify",         icon: "🏰", tier: 2, color: "#A8C5DE", readyTxt: "#DCEAF6", readyBg: "rgba(90,120,150,0.34)", desc: "+50% defensive strength for your buildings, 10s" },
@@ -524,6 +561,14 @@ const FROST_DURATION = 10; // seconds enemies stay frozen in place
 // Top-level because unitArrives, the tower-targeting loops, and castRollingStones
 // all reference it.
 const ROLLING_STONE_STRENGTH_MULT = 4;
+// How many marching soldiers a single Rolling Stones cast can transform. Capped
+// (v0.252) so the ability is a spearhead rather than a blanket buff on the entire
+// army: with a big push in flight, the old uncapped version could turn 60+ units
+// into 4x-strength tower-immune boulders at once, which decided fights outright.
+// The 20 picked are those CLOSEST TO THEIR OWN DESTINATION — the vanguard about to
+// land, not a random slice — so the cast reliably reinforces the blow that's
+// already about to connect, and the timing skill is "cast as the wave arrives."
+const ROLLING_STONE_MAX_UNITS = 20;
 // Rolling Stones also physically move faster — same +50% as Speed's SPEED_BOOST,
 // applied by writing u.speedMul (not a separate field), so it flows through the
 // existing march-speed math and can be overwritten by an enemy Slow Down/Frost
@@ -1418,6 +1463,49 @@ function TowerConquest() {
   const [soundOn, setSoundOn] = useState(true);
   useEffect(() => { SoundEngine.setMuted(!soundOn); }, [soundOn]);
   const [menuOpen, setMenuOpen] = useState(false);
+  // ---- Auth (Phase 1: accounts only — no lobbies/matchmaking wired up yet) ----
+  // `user` is the Supabase auth user object, or null when signed out. Playing
+  // vs AI never requires being signed in; this is purely groundwork for the
+  // online-multiplayer phases (matchmaking will need a stable player identity).
+  const [user, setUser] = useState(null);
+  const [authOpen, setAuthOpen] = useState(false);
+  const [authMode, setAuthMode] = useState("signin"); // "signin" | "signup"
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authNotice, setAuthNotice] = useState(""); // e.g. "check your email"
+  const [authBusy, setAuthBusy] = useState(false);
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setUser(data.session?.user ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
+  const handleAuthSubmit = async () => {
+    setAuthBusy(true); setAuthError(""); setAuthNotice("");
+    try {
+      if (authMode === "signup") {
+        const { error } = await supabase.auth.signUp({ email: authEmail, password: authPassword });
+        if (error) throw error;
+        setAuthNotice("Check your email to confirm your account, then sign in.");
+        setAuthMode("signin");
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
+        if (error) throw error;
+        setAuthOpen(false);
+        setAuthEmail(""); setAuthPassword("");
+      }
+    } catch (e) {
+      setAuthError(e.message || "Something went wrong.");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+  const handleSignOut = async () => {
+    SoundEngine.click();
+    await supabase.auth.signOut();
+  };
   // Which opponent's pill (by pid) currently has its ability-details popup
   // open, if any — tapping a pill in the Top HUD toggles this. Reset when a
   // new match starts (see startGame) so a stale pid from a previous game
@@ -2237,11 +2325,25 @@ function TowerConquest() {
   //      same field Speed/Slow Down/Frost use, so it composes with them
   //      naturally instead of needing its own parallel speed system.
   function castRollingStones(g, owner) {
-    for (const u of g.units) {
-      if (alliedTo(g, u.owner, owner)) {
-        u.rollingStone = true;
-        u.speedMul = ROLLING_STONE_SPEED_MULT;
-      }
+    // Only the ROLLING_STONE_MAX_UNITS allied soldiers closest to their OWN
+    // destination transform (v0.252) — measured per-unit against that unit's
+    // own dst building, not against one shared point, since a team's marches
+    // can be aimed at several different targets at once. Sorting the whole
+    // allied set and slicing is fine here: this runs once per cast, on at most
+    // a few hundred units, not per frame.
+    const byId = new Map(g.towers.map((t) => [t.id, t]));
+    const eligible = g.units.filter((u) => alliedTo(g, u.owner, owner));
+    const distToDst = (u) => {
+      const d = byId.get(u.dst);
+      return d ? dist(u, d) : Infinity; // no resolvable target: sort last, never picked over a real one
+    };
+    eligible.sort((a, b) => distToDst(a) - distToDst(b));
+    // Already-transformed units still occupy slots. Intentional: two casts in
+    // quick succession shouldn't stack into a 40-boulder wave just because the
+    // first cast's stones are (by definition) the ones nearest the target.
+    for (const u of eligible.slice(0, ROLLING_STONE_MAX_UNITS)) {
+      u.rollingStone = true;
+      u.speedMul = ROLLING_STONE_SPEED_MULT;
     }
     for (const t of g.towers) {
       if (alliedTo(g, t.owner, owner)) {
@@ -2791,6 +2893,17 @@ function TowerConquest() {
     // elimination flag so they resume normal play — otherwise they'd own a castle
     // while aiAct kept skipping them and the HUD kept showing them as dead.
     if (g.eliminated.has(newOwner)) g.eliminated.delete(newOwner);
+    // (v0.253 polish) Capture burst: two staggered rings in the NEW owner's
+    // faction color plus a ground puff. A capture is the single most important
+    // event in the game and previously had no dedicated visual of its own —
+    // the flag just quietly changed color. Reuses the existing ring/puff
+    // renderers, so this is data pushes only, no new draw code. Guarded on
+    // newOwner being a real player (it always is — neutral never captures).
+    if (newOwner !== NEUTRAL && FACTIONS[newOwner]) {
+      g.rings.push({ x: t.x, y: t.y, life: 0, dur: 0.55, color: FACTIONS[newOwner].color });
+      g.rings.push({ x: t.x, y: t.y, life: -0.12, dur: 0.7, color: FACTIONS[newOwner].color }); // negative life = delayed start
+      g.puffs.push({ x: t.x, y: t.y + 14, r: 26, age: 0, dur: 0.5 });
+    }
     applyMomentumCapture(g, newOwner); // the capturer alone gains — losing a building costs the loser nothing extra
     t.lostBy = t.owner;      // who just lost this castle
     t.lostAt = g.pulse;      // game clock at the moment of capture
@@ -3410,7 +3523,12 @@ function TowerConquest() {
     ctx.beginPath();
     ctx.roundRect(-plateW / 2, -9, plateW, 18, 5);
     ctx.fill();
-    ctx.strokeStyle = t.troops > towerCapacity(t) ? col : "rgba(138,147,171,0.5)";
+    // (v0.253 polish) Owned plates always carry a faint faction tint on the
+    // border, so a counter floating between two overlapping castles is
+    // attributable at a glance without hunting for the flag. Over-capacity
+    // still promotes to the FULL-strength color — the two states stay distinct
+    // (55 vs FF alpha), the neutral grey is unchanged.
+    ctx.strokeStyle = t.troops > towerCapacity(t) ? col : owned ? col + "55" : "rgba(138,147,171,0.5)";
     ctx.lineWidth = 1;
     ctx.stroke();
     ctx.fillStyle = "#E8EBF2";
@@ -4016,7 +4134,14 @@ function TowerConquest() {
         }
       }
 
-      // Borders like a political map (brighter when highlighted)
+      // Borders like a political map (brighter when highlighted).
+      // (v0.253 polish) Two-layer stroke: a wider, dark, low-alpha "ink" line
+      // FIRST, then the crisp faction-colored line on top — the same trick
+      // printed maps use, giving every border a settled cartographic weight
+      // instead of a bare vector stroke. One extra stroke per cell (≤12 cells).
+      ctx.strokeStyle = "rgba(10,14,24,0.35)";
+      ctx.lineWidth = 4.5;
+      ctx.stroke();
       const hot = isSrc || isHover;
       ctx.strokeStyle = t.owner === NEUTRAL
         ? (hot ? "rgba(255,255,255,1)" : "rgba(255,255,255,0.7)")
@@ -4040,10 +4165,16 @@ function TowerConquest() {
       ctx.strokeStyle = t.owner === NEUTRAL ? "rgba(255,255,255,0.35)" : FACTIONS[t.owner].color + "55";
       ctx.lineWidth = 1.4;
       ctx.setLineDash([5, 5]);
+      // (v0.253 polish) Dashes drift slowly around the ring so an armed
+      // building reads as actively scanning, not as static dotted geometry.
+      // Slow on purpose — at this speed it registers as ambient life, not as
+      // an alert demanding attention.
+      ctx.lineDashOffset = -g.pulse * 6;
       ctx.beginPath();
       ctx.ellipse(C.x, C.y, r, r * TILT, 0, 0, Math.PI * 2);
       ctx.stroke();
       ctx.setLineDash([]);
+      ctx.lineDashOffset = 0;
       ctx.restore();
     }
 
@@ -4078,17 +4209,32 @@ function TowerConquest() {
       const d = Math.hypot(B.x - A.x, B.y - A.y);
       if (d > 8) {
         const ux = (B.x - A.x) / d, uy = (B.y - A.y) / d;
+        // (v0.253 polish) The arrow now animates and reacts to what's under it:
+        //   - dashes MARCH toward the pointer (negative lineDashOffset driven
+        //     by g.pulse) — motion in the direction the troops will travel;
+        //   - the moment the pointer is over a releasable region (g.hover, the
+        //     same field the region highlight already uses, so the two cues can
+        //     never disagree), the whole arrow turns gold: "release here sends".
+        // A soft dark under-stroke keeps it legible over bright terrain.
+        const locked = g.hover != null && g.hover !== g.drag.src;
+        const col = locked ? "255,210,63" : "255,255,255";
         ctx.setLineDash([7, 7]);
-        ctx.strokeStyle = "rgba(255,255,255,0.75)";
-        ctx.lineWidth = 2;
+        ctx.lineDashOffset = -g.pulse * 42;
+        ctx.strokeStyle = "rgba(10,14,24,0.35)";
+        ctx.lineWidth = 4;
         ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+        ctx.strokeStyle = `rgba(${col},0.85)`;
+        ctx.lineWidth = 2;
+        ctx.stroke();
         ctx.setLineDash([]);
-        // Arrowhead
-        ctx.fillStyle = "rgba(255,255,255,0.85)";
+        ctx.lineDashOffset = 0;
+        // Arrowhead — slightly larger when locked onto a region
+        const ah = locked ? 14 : 12;
+        ctx.fillStyle = `rgba(${col},0.95)`;
         ctx.beginPath();
         ctx.moveTo(B.x, B.y);
-        ctx.lineTo(B.x - ux * 12 - uy * 6, B.y - uy * 12 + ux * 6);
-        ctx.lineTo(B.x - ux * 12 + uy * 6, B.y - uy * 12 - ux * 6);
+        ctx.lineTo(B.x - ux * ah - uy * (ah / 2), B.y - uy * ah + ux * (ah / 2));
+        ctx.lineTo(B.x - ux * ah + uy * (ah / 2), B.y - uy * ah - ux * (ah / 2));
         ctx.closePath();
         ctx.fill();
       }
@@ -4287,8 +4433,14 @@ function TowerConquest() {
     // the ground. Shared by Speed (cyan) and Tower Defense / 2.0 (gold).
     const RING_RADIUS = 70;
     for (const rg of g.rings) {
+      // (v0.253) A ring may be pushed with a NEGATIVE starting life as a cheap
+      // delay (the capture burst's second ring does) — the ticker still counts
+      // it up, we just don't draw until it crosses zero. Clamping p also
+      // hardens the alpha math: unclamped, a negative p pushes the alpha hex
+      // above FF and silently corrupts the strokeStyle string.
+      if (rg.life < 0) continue;
       const C = P(rg.x, rg.y);
-      const p = rg.life / rg.dur;
+      const p = Math.min(1, rg.life / rg.dur);
       const rr = RING_RADIUS * C.s * (0.4 + 0.6 * p);
       const alpha = Math.round(0.8 * (1 - p) * 255).toString(16).padStart(2, "0");
       ctx.strokeStyle = rg.color + alpha;
@@ -4404,6 +4556,10 @@ function TowerConquest() {
     fontSize: 15,
     cursor: "pointer",
     backdropFilter: "blur(4px)",
+    // (v0.253 polish) Faint resting shadow — lifts chips off the light menu
+    // background; effectively invisible against the dark in-game chrome, so
+    // one default serves both themes. Overridable via ...base like the rest.
+    boxShadow: "0 1px 3px rgba(31,42,68,0.10)",
     ...base,
   });
 
@@ -4750,7 +4906,15 @@ function TowerConquest() {
         <div style={{
           position: "absolute", inset: 0,
           overflowY: "auto", WebkitOverflowScrolling: "touch", touchAction: "pan-y",
-          background: "linear-gradient(180deg, #EAF4FF 0%, #FFFFFF 60%)",
+          // (v0.253 polish) Two very faint radial washes — gold upper-left,
+          // navy lower-right, the game's own faction-and-chrome palette — over
+          // the original gradient. Applied identically to all three light
+          // screens (menu / hero picker / settings) so they read as one place.
+          background: [
+            "radial-gradient(650px 420px at 12% 0%, rgba(255,210,63,0.10), transparent 70%)",
+            "radial-gradient(700px 480px at 95% 100%, rgba(31,42,68,0.08), transparent 70%)",
+            "linear-gradient(180deg, #EAF4FF 0%, #FFFFFF 60%)",
+          ].join(", "),
         }}>
           <div style={{
             position: "absolute", bottom: 10, right: 14,
@@ -4765,9 +4929,96 @@ function TowerConquest() {
             padding: "32px 20px",
           }}>
           <div style={{ maxWidth: 560, textAlign: "center" }}>
-            <h1 style={{ fontSize: 46, fontWeight: 800, margin: "0 0 10px", letterSpacing: 1, color: "#1F2A44" }}>
+            {/* (v0.253 polish) Wordmark treatment: an eyebrow naming what the
+                game IS, wider tracking on the title, and a short gold rule
+                grounding it — a proper mark instead of a bare styled <h1>.
+                Deliberately no extra iconography; the gold split already
+                carries the identity. */}
+            <div style={{ fontSize: 11, letterSpacing: 5, color: "#8592A8", fontWeight: 700, marginBottom: 8 }}>
+              REAL&#8209;TIME TERRITORY WARFARE
+            </div>
+            <h1 style={{ fontSize: 46, fontWeight: 800, margin: 0, letterSpacing: 3, color: "#1F2A44", textShadow: "0 2px 0 rgba(31,42,68,0.08)" }}>
               DOMIN<span style={{ color: "#D99A00" }}>ATION</span>
             </h1>
+            <div style={{ width: 56, height: 3, borderRadius: 2, background: "linear-gradient(90deg, #E2A100, #FFD23F)", margin: "10px auto 10px" }} />
+
+            {/* Account pill — Phase 1 groundwork for online multiplayer. Signing in
+                is optional right now (vs-AI play needs no account); this just
+                establishes a stable identity for later matchmaking phases. */}
+            <div style={{ display: "flex", justifyContent: "center", marginBottom: 4 }}>
+              {user ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#6B7684" }}>
+                  <span>Signed in as <b style={{ color: "#3C4658" }}>{user.email}</b></span>
+                  <button onClick={handleSignOut}
+                    style={chip({ padding: "3px 10px", fontSize: 11, background: "#F4F7FC", borderColor: "#D7E1EE", color: "#6B7684" })}>
+                    Sign out
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => { SoundEngine.click(); setAuthOpen(true); setAuthError(""); setAuthNotice(""); }}
+                  style={chip({ padding: "4px 12px", fontSize: 12, background: "#F4F7FC", borderColor: "#D7E1EE", color: "#3C4658" })}>
+                  Sign in / Sign up
+                </button>
+              )}
+            </div>
+
+            {authOpen && (
+              <div onClick={() => setAuthOpen(false)}
+                style={{
+                  position: "fixed", inset: 0, zIndex: 100,
+                  background: "rgba(31,42,68,0.35)", backdropFilter: "blur(2px)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  padding: 20,
+                }}>
+                <div onClick={(e) => e.stopPropagation()}
+                  style={{
+                    background: "#FFFFFF", border: "1px solid #E3E9F3", borderRadius: 14,
+                    padding: 24, maxWidth: 340, width: "100%",
+                    boxShadow: "0 12px 40px rgba(31,42,68,0.18)", textAlign: "left",
+                  }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+                    <div style={{ fontSize: 17, fontWeight: 800, color: "#1F2A44" }}>
+                      {authMode === "signup" ? "Create account" : "Sign in"}
+                    </div>
+                    <button onClick={() => setAuthOpen(false)}
+                      style={{ background: "none", border: "none", color: "#8a93ab", fontSize: 20, cursor: "pointer", lineHeight: 1 }}>
+                      ✕
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    <input
+                      type="email" placeholder="Email" value={authEmail}
+                      onChange={(e) => setAuthEmail(e.target.value)}
+                      style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid #D7E1EE", fontSize: 14, fontFamily: "inherit" }}
+                    />
+                    <input
+                      type="password" placeholder="Password" value={authPassword}
+                      onChange={(e) => setAuthPassword(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter" && !authBusy) handleAuthSubmit(); }}
+                      style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid #D7E1EE", fontSize: 14, fontFamily: "inherit" }}
+                    />
+                    {authError && <div style={{ color: "#C0392B", fontSize: 12 }}>{authError}</div>}
+                    {authNotice && <div style={{ color: "#2E7D32", fontSize: 12 }}>{authNotice}</div>}
+                    <button
+                      onClick={handleAuthSubmit} disabled={authBusy || !authEmail || !authPassword}
+                      style={chip({
+                        marginTop: 4, padding: "10px 12px", fontSize: 14, fontWeight: 700,
+                        background: "#FFF6DC", borderColor: "#E2A100", color: "#B87800",
+                        opacity: (authBusy || !authEmail || !authPassword) ? 0.6 : 1,
+                      })}>
+                      {authBusy ? "Please wait…" : (authMode === "signup" ? "Create account" : "Sign in")}
+                    </button>
+                    <button
+                      onClick={() => { setAuthMode(authMode === "signup" ? "signin" : "signup"); setAuthError(""); setAuthNotice(""); }}
+                      style={{ background: "none", border: "none", color: "#8592A8", fontSize: 12, cursor: "pointer", textAlign: "center", padding: 4 }}>
+                      {authMode === "signup" ? "Already have an account? Sign in" : "New here? Create an account"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <button
               onClick={() => { SoundEngine.click(); setShowHelp(true); }}
               style={chip({
@@ -4943,7 +5194,15 @@ function TowerConquest() {
         <div style={{
           position: "absolute", inset: 0,
           overflowY: "auto", WebkitOverflowScrolling: "touch", touchAction: "pan-y",
-          background: "linear-gradient(180deg, #EAF4FF 0%, #FFFFFF 60%)",
+          // (v0.253 polish) Two very faint radial washes — gold upper-left,
+          // navy lower-right, the game's own faction-and-chrome palette — over
+          // the original gradient. Applied identically to all three light
+          // screens (menu / hero picker / settings) so they read as one place.
+          background: [
+            "radial-gradient(650px 420px at 12% 0%, rgba(255,210,63,0.10), transparent 70%)",
+            "radial-gradient(700px 480px at 95% 100%, rgba(31,42,68,0.08), transparent 70%)",
+            "linear-gradient(180deg, #EAF4FF 0%, #FFFFFF 60%)",
+          ].join(", "),
         }}>
           <button onClick={() => { SoundEngine.click(); setScreen("menu"); }}
             style={chip({
@@ -5109,7 +5368,15 @@ function TowerConquest() {
         <div style={{
           position: "absolute", inset: 0,
           overflowY: "auto", WebkitOverflowScrolling: "touch", touchAction: "pan-y",
-          background: "linear-gradient(180deg, #EAF4FF 0%, #FFFFFF 60%)",
+          // (v0.253 polish) Two very faint radial washes — gold upper-left,
+          // navy lower-right, the game's own faction-and-chrome palette — over
+          // the original gradient. Applied identically to all three light
+          // screens (menu / hero picker / settings) so they read as one place.
+          background: [
+            "radial-gradient(650px 420px at 12% 0%, rgba(255,210,63,0.10), transparent 70%)",
+            "radial-gradient(700px 480px at 95% 100%, rgba(31,42,68,0.08), transparent 70%)",
+            "linear-gradient(180deg, #EAF4FF 0%, #FFFFFF 60%)",
+          ].join(", "),
         }}>
           <button onClick={() => { SoundEngine.click(); setScreen("menu"); }}
             style={chip({
@@ -5268,8 +5535,11 @@ function TowerConquest() {
             }}>
               <div style={{ pointerEvents: "auto" }}>
                 <div style={{
-                  fontSize: 22, fontWeight: 800, letterSpacing: 2,
+                  fontSize: 22, fontWeight: 800, letterSpacing: 3,
                   color: outcome === "win" ? "#4ADE5A" : "#E4534A",
+                  // (v0.253 polish) soft same-color glow so the verdict reads
+                  // as an EVENT over a busy battlefield, not another label
+                  textShadow: outcome === "win" ? "0 0 18px rgba(74,222,90,0.55)" : "0 0 18px rgba(228,83,74,0.55)",
                 }}>
                   {outcome === "win" ? "SECTOR SECURED" : "OVERRUN"}
                 </div>
