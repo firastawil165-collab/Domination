@@ -62,6 +62,17 @@ Goal: real accounts + matchmaking + live PvP, on top of the existing single-file
      rescales every coordinate-bearing field (tower `x`/`y`/`cell` polygon/`defs`, unit
      `x`/`y`, arrows, rings, sparks, slashes) against the guest's own current viewport on
      every incoming snapshot — self-correcting if the guest resizes/rotates mid-match.
+   - **Non-serializable state (fixed in v0.257)**: `g.terrainTex` is a live `<canvas>` element
+     — the baked terrain texture, built once at map-gen time (`buildTerrainTexture`). It isn't
+     JSON-safe, so it arrived on the guest as `{}`; `draw()`'s `ctx.drawImage(g.terrainTex, ...)`
+     is the very first thing it does each frame, so this threw immediately and silently
+     blanked the guest's entire canvas — the actual cause of "guest sees nothing" (the
+     coordinate-rescaling fix above was real and necessary, but not sufficient on its own;
+     this was the thing actually blocking every frame). Fixed by stripping `terrainTex`
+     (alongside `net`) before broadcast in `remapSnapshotForGuest`, and having the guest
+     rebuild its own copy locally in `applyGuestSnapshot` — cached by viewport size
+     (`guestTerrainKeyRef`) since it's expensive (per-pixel noise over the whole board) and
+     only actually needs redoing when the guest's own size changes.
    - **Known gaps**: hold-to-convert (castle<->tower) isn't networked yet — a no-op for the
      guest, host-only for now. No rematch — "Redeploy"/"Menu" both tear the room down after
      an online match; playing again means re-hosting/re-joining. Guest's hero is auto-assigned

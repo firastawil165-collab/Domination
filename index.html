@@ -125,7 +125,14 @@ function remapLastCastForGuest(lastCast) {
   return out;
 }
 function remapSnapshotForGuest(g) {
-  const { net, ...rest } = g;
+  // `net` (holds the live Realtime channel) and `terrainTex` (a live <canvas>
+  // element, baked once at map-gen time — see buildTerrainTexture) can't
+  // survive being broadcast: channel.send() JSON-serializes the payload, and
+  // neither is JSON-safe. Left in, terrainTex arrives as `{}`, and draw()'s
+  // `ctx.drawImage(g.terrainTex, ...)` throws on literally the first thing it
+  // draws every frame — silently blanking the guest's whole canvas. The guest
+  // rebuilds its own terrain texture locally instead (see applyGuestSnapshot).
+  const { net, terrainTex, ...rest } = g;
   return {
     ...rest,
     towers: g.towers.map((t) => ({ ...t, owner: netSwapOwner(t.owner) })),
@@ -146,7 +153,7 @@ function remapHudForGuest(hud) {
 }
 
 // ================= Constants =================
-const APP_VERSION = "0.256"; // bump by 0.001 each update
+const APP_VERSION = "0.257"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -1573,6 +1580,7 @@ function TowerConquest() {
   // ref (not state) since the game loop reads it every frame; the useState
   // values below only drive the room modal's own UI.
   const netRef = useRef(null); // { channel, role: "host" | "guest", myPlayerId, code }
+  const guestTerrainKeyRef = useRef(null); // "W x H" of the last locally-built terrain texture
   const [onlineOpen, setOnlineOpen] = useState(false);
   const [onlineTab, setOnlineTab] = useState("host"); // "host" | "join"
   const [onlineStatus, setOnlineStatus] = useState("idle"); // idle | waiting | ready | starting | error
@@ -1585,6 +1593,7 @@ function TowerConquest() {
       try { sb.removeChannel(netRef.current.channel); } catch (e) { /* already gone */ }
     }
     netRef.current = null;
+    guestTerrainKeyRef.current = null; // force a fresh terrain rebuild next match — see applyGuestSnapshot
     setOnlineStatus("idle");
     setOnlineRoomCode("");
     setOnlineError("");
@@ -1628,6 +1637,15 @@ function TowerConquest() {
       slashes: src.slashes.map(scalePt),
     };
     gameRef.current = { ...g, eliminated: new Set(src.eliminated), net: netRef.current };
+    // terrainTex was stripped before broadcast (see remapSnapshotForGuest) —
+    // build it locally instead. Expensive (per-pixel noise over the whole
+    // board), so only redo it when the guest's own size actually changes,
+    // not on every ~10Hz snapshot.
+    const terrainKey = myW + "x" + myH;
+    if (guestTerrainKeyRef.current !== terrainKey) {
+      guestTerrainKeyRef.current = terrainKey;
+      buildTerrainTexture(gameRef.current);
+    }
     setHud(payload.hud || []);
     if (payload.g.over && payload.outcome) setOutcome(payload.outcome);
     setOnlineOpen(false);
