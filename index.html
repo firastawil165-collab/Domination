@@ -125,14 +125,17 @@ function remapLastCastForGuest(lastCast) {
   return out;
 }
 function remapSnapshotForGuest(g) {
-  // `net` (holds the live Realtime channel) and `terrainTex` (a live <canvas>
-  // element, baked once at map-gen time — see buildTerrainTexture) can't
-  // survive being broadcast: channel.send() JSON-serializes the payload, and
-  // neither is JSON-safe. Left in, terrainTex arrives as `{}`, and draw()'s
-  // `ctx.drawImage(g.terrainTex, ...)` throws on literally the first thing it
-  // draws every frame — silently blanking the guest's whole canvas. The guest
-  // rebuilds its own terrain texture locally instead (see applyGuestSnapshot).
-  const { net, terrainTex, ...rest } = g;
+  // Strip fields that must never travel over the wire:
+  //  - `net` — holds the live Realtime channel (circular, not JSON-safe).
+  //  - `terrainTex` — a live <canvas> baked at map-gen time. Not JSON-safe;
+  //    left in it arrives as `{}`, and draw()'s `ctx.drawImage(g.terrainTex,…)`
+  //    (the first thing it draws each frame) throws, blanking the guest's whole
+  //    canvas. The guest rebuilds its own copy locally (see applyGuestSnapshot).
+  //  - `drag` / `hover` / `lastTap` — the HOST's own transient pointer state.
+  //    These belong to whoever is looking at the screen; broadcasting them would
+  //    paint the host's hover highlight / drag line on the guest. The guest keeps
+  //    its OWN copies across snapshots instead (see applyGuestSnapshot).
+  const { net, terrainTex, drag, hover, lastTap, ...rest } = g;
   return {
     ...rest,
     towers: g.towers.map((t) => ({ ...t, owner: netSwapOwner(t.owner) })),
@@ -153,7 +156,7 @@ function remapHudForGuest(hud) {
 }
 
 // ================= Constants =================
-const APP_VERSION = "0.257"; // bump by 0.001 each update
+const APP_VERSION = "0.258"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -1636,13 +1639,31 @@ function TowerConquest() {
       sparks: src.sparks.map(scalePt),
       slashes: src.slashes.map(scalePt),
     };
+    const prev = gameRef.current;
     gameRef.current = { ...g, eliminated: new Set(src.eliminated), net: netRef.current };
-    // terrainTex was stripped before broadcast (see remapSnapshotForGuest) —
-    // build it locally instead. Expensive (per-pixel noise over the whole
-    // board), so only redo it when the guest's own size actually changes,
-    // not on every ~10Hz snapshot.
+    // Client-only state the host's snapshot doesn't carry has to be restored
+    // onto every fresh gameRef, because the whole object is replaced ~10x/sec:
+    //  - drag / hover / lastTap: the guest's OWN transient pointer state. This
+    //    is the important one — without it, a drag begun in handleDown (which
+    //    sets g.drag) is wiped by the very next snapshot before the release in
+    //    handleUp can read it, so the guest's orders never fire: it can watch
+    //    but never actually play. Carried across so a gesture survives the
+    //    snapshots that land mid-drag.
+    //  - terrainTex: a live <canvas>, stripped before broadcast + rebuilt
+    //    locally. Same texture all match unless the guest's own size changes,
+    //    so reuse the previous one rather than rebuilding (expensive per-pixel
+    //    noise) — and crucially, without carrying it, it'd be undefined on
+    //    every snapshot after the first and the terrain would vanish.
+    const sameSession = prev && prev.net === netRef.current;
+    if (sameSession) {
+      gameRef.current.drag = prev.drag;
+      gameRef.current.hover = prev.hover;
+      gameRef.current.lastTap = prev.lastTap;
+    }
     const terrainKey = myW + "x" + myH;
-    if (guestTerrainKeyRef.current !== terrainKey) {
+    if (sameSession && prev.terrainTex && guestTerrainKeyRef.current === terrainKey) {
+      gameRef.current.terrainTex = prev.terrainTex;
+    } else {
       guestTerrainKeyRef.current = terrainKey;
       buildTerrainTexture(gameRef.current);
     }

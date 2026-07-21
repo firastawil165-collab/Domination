@@ -73,6 +73,19 @@ Goal: real accounts + matchmaking + live PvP, on top of the existing single-file
      rebuild its own copy locally in `applyGuestSnapshot` — cached by viewport size
      (`guestTerrainKeyRef`) since it's expensive (per-pixel noise over the whole board) and
      only actually needs redoing when the guest's own size changes.
+   - **Guest input wiped mid-gesture (fixed in v0.258)**: with the map finally visible, the
+     guest still couldn't *do* anything — "could only watch." Cause: `applyGuestSnapshot`
+     replaces `gameRef.current` wholesale ~10x/sec, but `drag`/`hover`/`lastTap` are
+     client-only pointer state that live nowhere else. `handleDown` sets `g.drag`; the next
+     snapshot (≤100ms later) swaps in a fresh object with no `drag`, so by the time
+     `handleUp` fires the drag is gone and the order never sends. Fixed by carrying the
+     guest's own `drag`/`hover`/`lastTap` (and the local `terrainTex`) forward onto each new
+     gameRef in `applyGuestSnapshot` (guarded on same-session via `prev.net === netRef.current`).
+     Also stripped the HOST's `drag`/`hover`/`lastTap` in `remapSnapshotForGuest` so one
+     player's pointer state never paints on the other's screen. Verified with a live two-tab
+     test (different viewport sizes): a drag set on the guest survives multiple snapshot
+     replacements, and an order broadcast from the guest reaches the host and spawns the
+     guest's (owner-1) marching troops.
    - **Known gaps**: hold-to-convert (castle<->tower) isn't networked yet — a no-op for the
      guest, host-only for now. No rematch — "Redeploy"/"Menu" both tear the room down after
      an online match; playing again means re-hosting/re-joining. Guest's hero is auto-assigned
