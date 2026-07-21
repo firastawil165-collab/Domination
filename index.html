@@ -82,10 +82,71 @@ const { useRef, useState, useEffect, useCallback } = React;
 // secret/service_role key here.
 const SUPABASE_URL = "https://tmgnwsvujdvltndpxcgp.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRtZ253c3Z1amR2bHRuZHB4Y2dwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1NDkwNjcsImV4cCI6MjEwMDEyNTA2N30.066qrox7uKbcqQs_s79vu_hf2BY-jL003B0EQsvsZvY";
-const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Named `sb`, not `supabase` — the UMD bundle above already declares a global
+// `supabase`, and a top-level `const supabase` in this script collides with
+// it (SyntaxError: Identifier 'supabase' has already been declared), which
+// silently kills the whole script before it can even restore console.error,
+// leaving the page stuck on the boot screen with no visible error.
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ================= Online (private 1v1 room, host-authoritative) =================
+// Phase 2/3 (see DOMINATION_PROJECT.md), scoped down to the simplest useful
+// slice: no lobby browser, no DB tables — a "room" is just a Supabase
+// Realtime channel named after a short code, torn down when everyone leaves.
+// The host runs the real simulation unchanged (aiAct/aiSpecials are simply
+// skipped for the guest's player slot — see the game loop) and broadcasts a
+// full state snapshot ~10x/sec; the guest never simulates locally (the sim
+// has ~30 scattered Math.random() calls, so two independently-ticking
+// clients would desync within seconds) — it only renders the latest
+// snapshot and forwards its own input back over the same channel.
+//
+// Every "owner === 0" check throughout the render/input/specials code
+// assumes the LOCAL player is always player 0 — there are dozens of these
+// call sites. Rather than thread a dynamic "my player id" through all of
+// them, the host relabels 0<->1 in the snapshot it sends the guest (see
+// remapSnapshotForGuest) so the guest's client always sees itself as player
+// 0, same as the host. Tower/unit *ids* are untouched — only the `owner`
+// field and other player-indexed slots (teams, momentum, heroes, train,
+// lastCast) swap. Valid for 1v1 only, which is all online supports for now.
+function makeRoomCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I — easy to read aloud
+  let s = "";
+  for (let i = 0; i < 5; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+function netSwapOwner(o) { return o === 0 ? 1 : o === 1 ? 0 : o; } // NEUTRAL (-1) passes through
+function remapLastCastForGuest(lastCast) {
+  const out = {};
+  for (const key in lastCast) {
+    const idx = key.indexOf("_");
+    const owner = Number(key.slice(0, idx));
+    out[netSwapOwner(owner) + key.slice(idx)] = lastCast[key];
+  }
+  return out;
+}
+function remapSnapshotForGuest(g) {
+  const { net, ...rest } = g;
+  return {
+    ...rest,
+    towers: g.towers.map((t) => ({ ...t, owner: netSwapOwner(t.owner) })),
+    units: g.units.map((u) => ({ ...u, owner: netSwapOwner(u.owner) })),
+    orders: g.orders.map((o) => ({ ...o, owner: netSwapOwner(o.owner) })),
+    arrows: g.arrows.map((a) => ({ ...a, owner: netSwapOwner(a.owner) })),
+    teams: [g.teams[1], g.teams[0]],
+    momentum: g.momentum ? [g.momentum[1], g.momentum[0]] : g.momentum,
+    heroes: g.heroes ? [g.heroes[1], g.heroes[0]] : g.heroes,
+    eliminated: Array.from(g.eliminated).map(netSwapOwner),
+    trainProgress: g.aiTrain[1],
+    aiTrain: [0, g.trainProgress],
+    lastCast: remapLastCastForGuest(g.lastCast || {}),
+  };
+}
+function remapHudForGuest(hud) {
+  return (hud || []).map((h) => ({ ...h, pid: netSwapOwner(h.pid), team: netSwapOwner(h.team) }));
+}
 
 // ================= Constants =================
-const APP_VERSION = "0.254"; // bump by 0.001 each update
+const APP_VERSION = "0.255"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -1476,8 +1537,8 @@ function TowerConquest() {
   const [authNotice, setAuthNotice] = useState(""); // e.g. "check your email"
   const [authBusy, setAuthBusy] = useState(false);
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setUser(data.session?.user ?? null));
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+    sb.auth.getSession().then(({ data }) => setUser(data.session?.user ?? null));
+    const { data: sub } = sb.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null);
     });
     return () => sub.subscription.unsubscribe();
@@ -1486,12 +1547,12 @@ function TowerConquest() {
     setAuthBusy(true); setAuthError(""); setAuthNotice("");
     try {
       if (authMode === "signup") {
-        const { error } = await supabase.auth.signUp({ email: authEmail, password: authPassword });
+        const { error } = await sb.auth.signUp({ email: authEmail, password: authPassword });
         if (error) throw error;
         setAuthNotice("Check your email to confirm your account, then sign in.");
         setAuthMode("signin");
       } else {
-        const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
+        const { error } = await sb.auth.signInWithPassword({ email: authEmail, password: authPassword });
         if (error) throw error;
         setAuthOpen(false);
         setAuthEmail(""); setAuthPassword("");
@@ -1504,8 +1565,121 @@ function TowerConquest() {
   };
   const handleSignOut = async () => {
     SoundEngine.click();
-    await supabase.auth.signOut();
+    await sb.auth.signOut();
   };
+
+  // ---- Online: private 1v1 room (see the remapSnapshotForGuest block above
+  // for the overall design). `netRef` is the live channel + role, kept in a
+  // ref (not state) since the game loop reads it every frame; the useState
+  // values below only drive the room modal's own UI.
+  const netRef = useRef(null); // { channel, role: "host" | "guest", myPlayerId, code }
+  const [onlineOpen, setOnlineOpen] = useState(false);
+  const [onlineTab, setOnlineTab] = useState("host"); // "host" | "join"
+  const [onlineStatus, setOnlineStatus] = useState("idle"); // idle | waiting | ready | starting | error
+  const [onlineRoomCode, setOnlineRoomCode] = useState("");
+  const [joinCodeInput, setJoinCodeInput] = useState("");
+  const [onlineError, setOnlineError] = useState("");
+
+  const leaveOnlineRoom = useCallback(() => {
+    if (netRef.current && netRef.current.channel) {
+      try { sb.removeChannel(netRef.current.channel); } catch (e) { /* already gone */ }
+    }
+    netRef.current = null;
+    setOnlineStatus("idle");
+    setOnlineRoomCode("");
+    setOnlineError("");
+  }, []);
+
+  // Guest side: replace the local mirror wholesale with the host's latest
+  // (already player-relabeled) snapshot. `eliminated` travels as an array —
+  // Sets aren't JSON-safe — and is rebuilt into a Set here.
+  const applyGuestSnapshot = useCallback((payload) => {
+    gameRef.current = { ...payload.g, eliminated: new Set(payload.g.eliminated), net: netRef.current };
+    setHud(payload.hud || []);
+    if (payload.g.over && payload.outcome) setOutcome(payload.outcome);
+    setOnlineOpen(false);
+    setOnlineStatus("playing");
+    setScreen("play");
+  }, []);
+
+  const hostOnlineRoom = useCallback(() => {
+    leaveOnlineRoom();
+    const code = makeRoomCode();
+    const channel = sb.channel(`domination-room-${code}`, {
+      config: { broadcast: { self: false }, presence: { key: Math.random().toString(36).slice(2) } },
+    });
+    netRef.current = { channel, role: "host", myPlayerId: 0, code };
+    channel
+      .on("broadcast", { event: "order" }, ({ payload }) => {
+        const g = gameRef.current;
+        if (!g || !g.net || g.net.role !== "host" || g.over) return;
+        const src = g.towers.find((t) => t.id === payload.srcId);
+        const dst = g.towers.find((t) => t.id === payload.dstId);
+        if (src && dst && src.id !== dst.id && src.owner === 1) issueOrder(g, src, dst, payload.percent);
+      })
+      .on("broadcast", { event: "upgrade" }, ({ payload }) => {
+        const g = gameRef.current;
+        if (!g || !g.net || g.net.role !== "host" || g.over) return;
+        const t = g.towers.find((t) => t.id === payload.towerId);
+        if (t && t.owner === 1 && canStartUpgrade(t)) startUpgrade(g, t);
+      })
+      .on("broadcast", { event: "cast" }, ({ payload }) => {
+        const g = gameRef.current;
+        if (!g || !g.net || g.net.role !== "host" || g.over) return;
+        if (!readyFor(g, payload.kind, 1)) return;
+        const fn = CAST_FNS[payload.kind];
+        if (fn) {
+          try { fn(g, 1); } catch (err) { console.error(`[online cast] "${payload.kind}" threw:`, err); }
+        }
+      })
+      .on("presence", { event: "sync" }, () => {
+        const count = Object.keys(channel.presenceState()).length;
+        setOnlineStatus((s) => (s === "starting" || s === "playing" ? s : (count >= 2 ? "ready" : "waiting")));
+      })
+      .subscribe(async (status) => {
+        if (status === "SUBSCRIBED") {
+          await channel.track({ joinedAt: Date.now() });
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          setOnlineError("Connection lost. Try hosting a new room.");
+          setOnlineStatus("error");
+        }
+      });
+    setOnlineRoomCode(code);
+    setOnlineStatus("waiting");
+    setOnlineTab("host");
+    setOnlineError("");
+    setOnlineOpen(true);
+  }, [leaveOnlineRoom]);
+
+  const joinOnlineRoom = useCallback((rawCode) => {
+    const code = rawCode.trim().toUpperCase();
+    if (!code) return;
+    leaveOnlineRoom();
+    const channel = sb.channel(`domination-room-${code}`, {
+      config: { broadcast: { self: false }, presence: { key: Math.random().toString(36).slice(2) } },
+    });
+    netRef.current = { channel, role: "guest", myPlayerId: 1, code };
+    channel
+      .on("broadcast", { event: "snapshot" }, ({ payload }) => applyGuestSnapshot(payload))
+      .on("presence", { event: "sync" }, () => {
+        const count = Object.keys(channel.presenceState()).length;
+        setOnlineStatus((s) => (s === "starting" || s === "playing" ? s : (count >= 2 ? "ready" : "waiting")));
+      })
+      .subscribe(async (status) => {
+        if (status === "SUBSCRIBED") {
+          await channel.track({ joinedAt: Date.now() });
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          setOnlineError("Couldn't reach that room. Check the code and try again.");
+          setOnlineStatus("error");
+        }
+      });
+    setOnlineRoomCode(code);
+    setOnlineStatus("waiting");
+    setOnlineTab("join");
+    setOnlineError("");
+    setOnlineOpen(true);
+  }, [leaveOnlineRoom, applyGuestSnapshot]);
+
   // Which opponent's pill (by pid) currently has its ability-details popup
   // open, if any — tapping a pill in the Top HUD toggles this. Reset when a
   // new match starts (see startGame) so a stale pid from a previous game
@@ -1771,6 +1945,20 @@ function TowerConquest() {
     // hitting Deploy without also touching the hero picker or skill timer would
     // start the match with the previous setting).
   }, [selectedHero, skillTimer, opponentHeroes, difficulty]);
+
+  // Host side: begin an online match. Online is 1v1-only (see the room modal
+  // below), so this always forces a plain 2-player FFA match regardless of
+  // whatever the menu's own mode/player-count pickers are set to — reuses
+  // startGame exactly as the vs-AI path does, then tags the freshly-built
+  // gameRef with the room's net info so the game loop and input handlers
+  // know to broadcast/forward instead of running solo.
+  const startOnlineMatch = useCallback(() => {
+    if (!netRef.current || netRef.current.role !== "host") return;
+    setOnlineStatus("starting");
+    startGame(2, "ffa");
+    gameRef.current.net = netRef.current;
+    setOnlineOpen(false);
+  }, [startGame]);
 
   // Two owners are allied if they share a team. Neutral (-1) is nobody's ally.
   const sameTeam = (g, a, b) =>
@@ -2446,6 +2634,14 @@ function TowerConquest() {
       return;
     }
     SoundEngine.resume();
+    // Online guest: the client-side readiness check above is purely local
+    // feedback (the shake). The actual cast has to happen on the host,
+    // which owns the real train/cooldown state for pid 1 — forward it and
+    // stop; the host's next broadcast snapshot will reflect the result.
+    if (g.net && g.net.role === "guest") {
+      g.net.channel.send({ type: "broadcast", event: "cast", payload: { kind } });
+      return;
+    }
     const fn = CAST_FNS[kind];
     try {
       if (fn) fn(g, 0);
@@ -2516,7 +2712,11 @@ function TowerConquest() {
       const now = performance.now();
       if (drag.t0 != null && now - drag.t0 >= HOLD_MS) {
         g.lastTap = null;
-        if (canConvert(src)) {
+        // Convert isn't wired up over the network yet — quietly a no-op for
+        // an online guest rather than opening a confirm bubble whose
+        // eventual "Confirm" would only mutate the guest's own soon-to-be-
+        // overwritten mirror and never reach the host.
+        if (canConvert(src) && !(g.net && g.net.role === "guest")) {
           const rect = canvasRef.current.getBoundingClientRect();
           const bx = Math.min(rect.width - 90, Math.max(90, sp.x));
           const by = Math.min(rect.height - 20, Math.max(70, sp.y));
@@ -2527,10 +2727,14 @@ function TowerConquest() {
       if (g.lastTap && g.lastTap.id === src.id && now - g.lastTap.time < 350) {
         g.lastTap = null;
         if (canStartUpgrade(src)) {
-          startUpgrade(g, src);
-          // Tutorial's "upgraded" flag fires when the build actually finishes
-          // (see the upgrade-build-completion block in the game loop), not here —
-          // otherwise the tutorial would advance before the player sees the result.
+          if (g.net && g.net.role === "guest") {
+            g.net.channel.send({ type: "broadcast", event: "upgrade", payload: { towerId: src.id } });
+          } else {
+            startUpgrade(g, src);
+            // Tutorial's "upgraded" flag fires when the build actually finishes
+            // (see the upgrade-build-completion block in the game loop), not here —
+            // otherwise the tutorial would advance before the player sees the result.
+          }
         }
       } else {
         g.lastTap = { id: src.id, time: now };
@@ -2539,7 +2743,14 @@ function TowerConquest() {
     }
 
     if (target && target.id !== src.id && src.owner === 0) {
-      issueOrder(g, src, target, pctRef.current);
+      if (g.net && g.net.role === "guest") {
+        g.net.channel.send({
+          type: "broadcast", event: "order",
+          payload: { srcId: src.id, dstId: target.id, percent: pctRef.current },
+        });
+      } else {
+        issueOrder(g, src, target, pctRef.current);
+      }
       // Tutorial's "captured" flag fires on actual capture (see unitArrives),
       // not on order-issue, so the step waits until the player really takes
       // the castle rather than advancing the instant they let go of the drag.
@@ -2962,6 +3173,10 @@ function TowerConquest() {
   useEffect(() => {
     if (screen !== "play") return;
     let raf, last = performance.now(), hudTimer = 0;
+    // Host-only: throttled snapshot broadcast + the hud/outcome values it
+    // rides along with (recomputed every hudTimer tick below, just like the
+    // local setHud call already was — reused here rather than duplicated).
+    let netBroadcastTimer = 0, lastHudStats = [], lastOutcomeSent = null;
 
     const step = (now) => {
       const g = gameRef.current;
@@ -2969,6 +3184,17 @@ function TowerConquest() {
       last = now;
       if (!g) return;
       g.pulse += dt;
+
+      if (g.net && g.net.role === "guest") {
+        // Never simulate locally — gameRef.current is only ever a mirror of
+        // the host's latest broadcast (applied in applyGuestSnapshot). Just
+        // draw the last snapshot and keep the specials-train UI in sync
+        // (syncSpecials is a pure read of g, safe to call off a mirror).
+        draw(g);
+        syncSpecials(g);
+        raf = requestAnimationFrame(step);
+        return;
+      }
 
       if (!g.over && !pausedRef.current) {
         // Battle heat decays continuously; feeds the ambient battle bed below.
@@ -3381,7 +3607,11 @@ function TowerConquest() {
           if (!g.eliminated.has(pid)) {
             g.aiTimers[pid] -= dt;
             if (g.aiTimers[pid] <= 0) {
-              if (!g.tutorial) aiAct(g, pid);
+              // Online host: player 1's buildings belong to a real guest,
+              // not the AI — the guest's own orders arrive via the "order"
+              // broadcast handler instead. Online is 1v1-only, so this loop
+              // only ever reaches pid 1 in that case anyway.
+              if (!g.tutorial && !(g.net && g.net.role === "host")) aiAct(g, pid);
               g.aiTimers[pid] = 1.1 + Math.random() * 1.6;
             }
           }
@@ -3402,7 +3632,9 @@ function TowerConquest() {
         g.aiFxTimer -= dt;
         if (g.aiFxTimer <= 0) {
           g.aiFxTimer = 0.5;
-          aiSpecials(g);
+          // Same reasoning as the aiAct skip above — the only AI pid this
+          // could act on in an online match (1) is the real guest.
+          if (!(g.net && g.net.role === "host")) aiSpecials(g);
         }
 
         // Eliminations & outcome (team-aware)
@@ -3427,12 +3659,12 @@ function TowerConquest() {
         for (let pid = 0; pid < g.numPlayers; pid++)
           if (!g.eliminated.has(pid)) aliveTeams.add(g.teams[pid]);
         const myTeam = g.teams[0];
-        if (!g.tutorial && !aliveTeams.has(myTeam)) { g.over = true; setOutcome("lose"); SoundEngine.lose(); SoundEngine.stopBattle(); }
+        if (!g.tutorial && !aliveTeams.has(myTeam)) { g.over = true; setOutcome("lose"); lastOutcomeSent = "lose"; SoundEngine.lose(); SoundEngine.stopBattle(); }
         // The tutorial deliberately does NOT end on a win: the player wiping out the
         // rival is the second-to-last STEP, and slamming the victory screen up here
         // would skip the wrap-up step entirely. The tutorial ends when the player
         // taps "Finish Tutorial" on that final overlay instead.
-        else if (!g.tutorial && aliveTeams.size === 1) { g.over = true; setOutcome("win"); SoundEngine.win(); SoundEngine.stopBattle(); }
+        else if (!g.tutorial && aliveTeams.size === 1) { g.over = true; setOutcome("win"); lastOutcomeSent = "win"; SoundEngine.win(); SoundEngine.stopBattle(); }
 
         // Tutorial: once the requested action is detected, hold the step open
         // for `settleFor` seconds so the player actually sees the effect (a
@@ -3496,7 +3728,24 @@ function TowerConquest() {
         }
         setHud(stats);
         syncSpecials(g);
+        lastHudStats = stats;
       }
+
+      if (g.net && g.net.role === "host") {
+        netBroadcastTimer += dt;
+        if (netBroadcastTimer >= 0.1) {
+          netBroadcastTimer = 0;
+          g.net.channel.send({
+            type: "broadcast", event: "snapshot",
+            payload: {
+              g: remapSnapshotForGuest(g),
+              hud: remapHudForGuest(lastHudStats),
+              outcome: lastOutcomeSent === "win" ? "lose" : lastOutcomeSent === "lose" ? "win" : null,
+            },
+          });
+        }
+      }
+
       raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
@@ -4814,7 +5063,7 @@ function TowerConquest() {
                         style={chip({ padding: "8px 12px", fontSize: 13, textAlign: "left", width: "100%" })}>
                         {soundOn ? "🔊 Sound: On" : "🔇 Sound: Off"}
                       </button>
-                      <button onClick={() => { SoundEngine.click(); setMenuOpen(false); setPaused(false); setScreen("menu"); }}
+                      <button onClick={() => { SoundEngine.click(); setMenuOpen(false); setPaused(false); if (netRef.current) leaveOnlineRoom(); setScreen("menu"); }}
                         style={chip({ padding: "8px 12px", fontSize: 13, textAlign: "left", width: "100%" })}>
                         🗺️ New map
                       </button>
@@ -4961,7 +5210,139 @@ function TowerConquest() {
                   Sign in / Sign up
                 </button>
               )}
+              <button
+                onClick={() => { SoundEngine.click(); setOnlineOpen(true); if (!netRef.current) { setOnlineTab("host"); setOnlineStatus("idle"); } }}
+                style={chip({ padding: "4px 12px", fontSize: 12, background: "#F4F7FC", borderColor: "#D7E1EE", color: "#3C4658" })}>
+                🌐 Play a Friend
+              </button>
             </div>
+
+            {onlineOpen && (
+              <div onClick={() => { if (onlineStatus !== "playing" && onlineStatus !== "starting") setOnlineOpen(false); }}
+                style={{
+                  position: "fixed", inset: 0, zIndex: 100,
+                  background: "rgba(31,42,68,0.35)", backdropFilter: "blur(2px)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  padding: 20,
+                }}>
+                <div onClick={(e) => e.stopPropagation()}
+                  style={{
+                    background: "#FFFFFF", border: "1px solid #E3E9F3", borderRadius: 14,
+                    padding: 24, maxWidth: 360, width: "100%",
+                    boxShadow: "0 12px 40px rgba(31,42,68,0.18)", textAlign: "left",
+                  }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+                    <div style={{ fontSize: 17, fontWeight: 800, color: "#1F2A44" }}>Play a Friend</div>
+                    <button onClick={() => { leaveOnlineRoom(); setOnlineOpen(false); }}
+                      style={{ background: "none", border: "none", color: "#8a93ab", fontSize: 20, cursor: "pointer", lineHeight: 1 }}>
+                      ✕
+                    </button>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+                    <button onClick={() => { if (onlineTab !== "host") { leaveOnlineRoom(); setOnlineTab("host"); } }}
+                      style={chip({
+                        flex: 1, padding: "8px 0", fontSize: 13,
+                        background: onlineTab === "host" ? "#FFF6DC" : "#F4F7FC",
+                        borderColor: onlineTab === "host" ? "#E2A100" : "#D7E1EE",
+                        color: onlineTab === "host" ? "#B87800" : "#3C4658",
+                      })}>
+                      Host
+                    </button>
+                    <button onClick={() => { if (onlineTab !== "join") { leaveOnlineRoom(); setOnlineTab("join"); } }}
+                      style={chip({
+                        flex: 1, padding: "8px 0", fontSize: 13,
+                        background: onlineTab === "join" ? "#FFF6DC" : "#F4F7FC",
+                        borderColor: onlineTab === "join" ? "#E2A100" : "#D7E1EE",
+                        color: onlineTab === "join" ? "#B87800" : "#3C4658",
+                      })}>
+                      Join
+                    </button>
+                  </div>
+
+                  {onlineTab === "host" ? (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      {!netRef.current ? (
+                        <React.Fragment>
+                          <p style={{ fontSize: 12, color: "#6B7684", margin: 0, lineHeight: 1.5 }}>
+                            Creates a private 1v1 room and gives you a code to send your friend.
+                          </p>
+                          <button onClick={hostOnlineRoom}
+                            style={chip({ padding: "10px 12px", fontSize: 14, fontWeight: 700, background: "#FFF6DC", borderColor: "#E2A100", color: "#B87800" })}>
+                            Create Room
+                          </button>
+                        </React.Fragment>
+                      ) : (
+                        <React.Fragment>
+                          <div style={{ fontSize: 12, color: "#6B7684" }}>Room code — share this with your friend:</div>
+                          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                            <div style={{
+                              flex: 1, textAlign: "center", fontSize: 26, fontWeight: 800, letterSpacing: 6,
+                              color: "#1F2A44", background: "#F4F7FC", border: "1px solid #D7E1EE",
+                              borderRadius: 8, padding: "10px 0", fontFamily: "'IBM Plex Mono', monospace",
+                            }}>
+                              {onlineRoomCode}
+                            </div>
+                            <button
+                              onClick={() => { if (navigator.clipboard) navigator.clipboard.writeText(onlineRoomCode); }}
+                              style={chip({ padding: "10px 12px", fontSize: 12, background: "#F4F7FC", borderColor: "#D7E1EE", color: "#3C4658" })}>
+                              Copy
+                            </button>
+                          </div>
+                          <div style={{ fontSize: 12, color: onlineStatus === "ready" ? "#2E7D32" : "#8592A8" }}>
+                            {onlineStatus === "waiting" && "Waiting for your friend to join…"}
+                            {onlineStatus === "ready" && "Your friend is here — ready when you are."}
+                            {onlineStatus === "starting" && "Starting…"}
+                            {onlineStatus === "error" && onlineError}
+                          </div>
+                          <button onClick={startOnlineMatch} disabled={onlineStatus !== "ready"}
+                            style={chip({
+                              padding: "10px 12px", fontSize: 14, fontWeight: 700,
+                              background: "#FFF6DC", borderColor: "#E2A100", color: "#B87800",
+                              opacity: onlineStatus === "ready" ? 1 : 0.5,
+                            })}>
+                            Start Match
+                          </button>
+                        </React.Fragment>
+                      )}
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      <p style={{ fontSize: 12, color: "#6B7684", margin: 0, lineHeight: 1.5 }}>
+                        Enter the code your friend sent you.
+                      </p>
+                      <input
+                        value={joinCodeInput}
+                        onChange={(e) => setJoinCodeInput(e.target.value.toUpperCase())}
+                        onKeyDown={(e) => { if (e.key === "Enter" && joinCodeInput.trim()) joinOnlineRoom(joinCodeInput); }}
+                        placeholder="ROOM CODE"
+                        style={{
+                          padding: "10px 12px", borderRadius: 8, border: "1px solid #D7E1EE",
+                          fontSize: 18, letterSpacing: 4, textAlign: "center", fontFamily: "'IBM Plex Mono', monospace",
+                        }}
+                      />
+                      {netRef.current && netRef.current.role === "guest" ? (
+                        <div style={{ fontSize: 12, color: onlineStatus === "ready" ? "#2E7D32" : "#8592A8" }}>
+                          {onlineStatus === "waiting" && "Connected — waiting for the host to start…"}
+                          {onlineStatus === "ready" && "Both here — waiting for the host to hit Start."}
+                          {onlineStatus === "error" && onlineError}
+                        </div>
+                      ) : (
+                        onlineStatus === "error" && <div style={{ fontSize: 12, color: "#C0392B" }}>{onlineError}</div>
+                      )}
+                      <button onClick={() => joinOnlineRoom(joinCodeInput)} disabled={!joinCodeInput.trim()}
+                        style={chip({
+                          padding: "10px 12px", fontSize: 14, fontWeight: 700,
+                          background: "#FFF6DC", borderColor: "#E2A100", color: "#B87800",
+                          opacity: joinCodeInput.trim() ? 1 : 0.5,
+                        })}>
+                        Join Room
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
 
             {authOpen && (
               <div onClick={() => setAuthOpen(false)}
@@ -5169,7 +5550,7 @@ function TowerConquest() {
               </button>
             </div>
 
-            <button onClick={() => startGame(numPlayers, mode)}
+            <button onClick={() => { if (netRef.current) leaveOnlineRoom(); startGame(numPlayers, mode); }}
               style={chip({
                 marginTop: 28, background: "#FFD23F", color: "#1F2A44",
                 fontWeight: 800, fontSize: 17, padding: "14px 42px", border: "1px solid #E2A100",
@@ -5177,7 +5558,7 @@ function TowerConquest() {
               Deploy
             </button>
             <div style={{ marginTop: 10 }}>
-              <button onClick={() => startGame(2, "ffa", true)}
+              <button onClick={() => { if (netRef.current) leaveOnlineRoom(); startGame(2, "ffa", true); }}
                 style={chip({
                   padding: "8px 16px", fontSize: 13,
                   background: "#FFFFFF", color: "#6B7684", borderColor: "#D7E1EE",
@@ -5550,11 +5931,16 @@ function TowerConquest() {
                 </div>
               </div>
               <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
-                <button onClick={() => startGame(gameRef.current.selectedNumPlayers, gameRef.current.selectedMode)}
-                  style={chip({ background: "#FFD23F", color: "#0A0E18", fontWeight: 800, border: "1px solid #FFD23F", padding: "8px 14px" })}>
-                  Redeploy
-                </button>
-                <button onClick={() => { SoundEngine.click(); setScreen("menu"); }} style={chip({ padding: "8px 14px" })}>Menu</button>
+                {/* Online matches don't support Redeploy yet — rematching means re-hosting/
+                    re-joining a fresh room, so this button is hidden once the finished match
+                    was one (host or guest both have gameRef.current.net set at that point). */}
+                {!gameRef.current?.net && (
+                  <button onClick={() => startGame(gameRef.current.selectedNumPlayers, gameRef.current.selectedMode)}
+                    style={chip({ background: "#FFD23F", color: "#0A0E18", fontWeight: 800, border: "1px solid #FFD23F", padding: "8px 14px" })}>
+                    Redeploy
+                  </button>
+                )}
+                <button onClick={() => { SoundEngine.click(); if (netRef.current) leaveOnlineRoom(); setScreen("menu"); }} style={chip({ padding: "8px 14px" })}>Menu</button>
               </div>
             </div>
           )}

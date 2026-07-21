@@ -16,8 +16,7 @@ the new session everything it needs.
 
 ## Online multiplayer (in progress — Vercel + Supabase)
 
-Goal: real accounts + matchmaking + live PvP, on top of the existing single-file game. Three-phase
-plan, decided this session:
+Goal: real accounts + matchmaking + live PvP, on top of the existing single-file game.
 
 1. **Phase 1 (done, v0.254): accounts.** Supabase project `domination-game` created. Supabase JS
    client (`@supabase/supabase-js@2`, loaded from **jsdelivr**, not cdnjs — see note below) wired
@@ -26,16 +25,39 @@ plan, decided this session:
    under the title, opens a modal. Playing vs AI still requires no account; this is purely
    groundwork for matchmaking needing a stable player identity. Schema: `supabase_schema.sql`
    (run once in Supabase's SQL Editor) — `profiles` (auto-created on signup via trigger),
-   `lobbies`, `lobby_players`, `matches`, all RLS-enabled.
-2. **Phase 2 (not started): lobby / matchmaking screen.** Create/join a lobby, ready-up, using
-   Supabase Realtime Presence/Broadcast for the live queue (not DB polling — too slow).
-3. **Phase 3 (not started, riskiest): live gameplay sync.** Chosen approach is
-   **host-authoritative**, not lockstep — the existing sim has ~30 scattered `Math.random()`
-   calls (map gen, AI, effects) so two clients simulating independently would desync. Instead:
-   one player's client runs the real simulation unchanged and broadcasts compact state snapshots
-   over a Supabase Realtime channel ~10x/sec; the other client is a thin input+render shell that
-   sends drag-orders back over the same channel. Reuses the whole existing engine; the hard parts
-   still ahead are latency handling, reconnect, and desync recovery.
+   `lobbies`, `lobby_players`, `matches`, all RLS-enabled. **Note:** the Supabase JS client
+   instance is named `sb`, not `supabase` — the UMD bundle's own global is already called
+   `supabase`, and `const supabase = ...` collides with it (silent SyntaxError, whole script
+   dead, stuck on the boot screen — fixed in v0.255).
+2. **Phase 2 (done, v0.255, scoped down): private 1v1 room.** Not the full lobby-browser/
+   matchmaking system originally sketched in `supabase_schema.sql` (those tables are still
+   unused) — instead, the simplest useful slice: a "Play a Friend" button on the menu opens a
+   modal to Host (generates a 5-character room code) or Join (enter a code). No DB writes at
+   all — a room is just an ephemeral Supabase Realtime channel named
+   `domination-room-<CODE>`, torn down when either side leaves. Presence tracks when both
+   players are in the channel; the host's "Start Match" button is disabled until then.
+3. **Phase 3 (done, v0.255): live gameplay sync.** Host-authoritative, as planned — the host
+   runs the real simulation completely unchanged (`startGame(2, "ffa")`, same as vs-AI) and
+   broadcasts a full `gameRef.current` snapshot ~10x/sec over the room channel; the guest never
+   simulates locally (the sim has ~30 scattered `Math.random()` calls, so two independently-
+   ticking clients would desync in seconds) — its `gameRef.current` is just overwritten by
+   whatever snapshot arrived most recently, and it forwards its own input (drag-orders,
+   double-tap upgrades, special casts) back over the channel for the host to apply via the
+   same `issueOrder`/`startUpgrade`/`CAST_FNS` functions used locally.
+   - **The "always player 0" trick**: dozens of call sites across rendering/input/specials
+     hardcode `owner === 0` / `g.teams[0]` to mean "the local human." Rather than thread a
+     dynamic player id through all of them, the host relabels player 0<->1 in the snapshot
+     it sends the guest (`remapSnapshotForGuest`/`remapHudForGuest`) so the guest's client
+     always sees itself as player 0 too — camera, "this is you" highlights, the specials
+     train, the HUD's own-stats row all just work, unmodified.
+   - **AI is disabled for the guest's slot**: online is 1v1-only specifically so the sim
+     loop's `for (pid = 1; ...)` AI loop only ever touches the guest's player index; both
+     `aiAct` and `aiSpecials` are skipped entirely when `g.net.role === "host"`.
+   - **Known gaps**: hold-to-convert (castle<->tower) isn't networked yet — a no-op for the
+     guest, host-only for now. No rematch — "Redeploy"/"Menu" both tear the room down after
+     an online match; playing again means re-hosting/re-joining. Guest's hero is auto-assigned
+     from the AI pool rather than picked. No reconnect-on-drop — a lost connection just ends
+     the session for both sides. All reasonable follow-ups, not attempted this session.
 
 **Note on CDN sourcing:** this file's own notes say cdnjs-only because of Claude's artifact
 sandbox. That restriction doesn't apply once the file is actually deployed (Vercel = a real
