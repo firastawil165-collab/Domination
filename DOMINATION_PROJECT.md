@@ -53,6 +53,15 @@ Goal: real accounts + matchmaking + live PvP, on top of the existing single-file
    - **AI is disabled for the guest's slot**: online is 1v1-only specifically so the sim
      loop's `for (pid = 1; ...)` AI loop only ever touches the guest's player index; both
      `aiAct` and `aiSpecials` are skipped entirely when `g.net.role === "host"`.
+   - **Coordinate rescaling (fixed in v0.256)**: this game has no separate "world size" —
+     `startGame` generates the map directly in the local viewport's own pixel dimensions
+     (`viewSize()`), and `proj`/`unproj`/`regionAt` all assume every coordinate already
+     lives in `[0, g.W] x [0, g.H]`. Broadcasting the host's snapshot unscaled meant a guest
+     on a differently-sized screen saw nothing — the whole match was drawn in the host's
+     coordinate space, mostly or entirely off their own canvas. `applyGuestSnapshot` now
+     rescales every coordinate-bearing field (tower `x`/`y`/`cell` polygon/`defs`, unit
+     `x`/`y`, arrows, rings, sparks, slashes) against the guest's own current viewport on
+     every incoming snapshot — self-correcting if the guest resizes/rotates mid-match.
    - **Known gaps**: hold-to-convert (castle<->tower) isn't networked yet — a no-op for the
      guest, host-only for now. No rematch — "Redeploy"/"Menu" both tear the room down after
      an online match; playing again means re-hosting/re-joining. Guest's hero is auto-assigned
