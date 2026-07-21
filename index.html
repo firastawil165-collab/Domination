@@ -156,7 +156,7 @@ function remapHudForGuest(hud) {
 }
 
 // ================= Constants =================
-const APP_VERSION = "0.258"; // bump by 0.001 each update
+const APP_VERSION = "0.259"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -1584,6 +1584,13 @@ function TowerConquest() {
   // values below only drive the room modal's own UI.
   const netRef = useRef(null); // { channel, role: "host" | "guest", myPlayerId, code }
   const guestTerrainKeyRef = useRef(null); // "W x H" of the last locally-built terrain texture
+  // Guest-side interpolation buffer (see applyGuestSnapshot + the guest render
+  // branch). Snapshots arrive ~10x/sec but the guest renders at 60fps; without
+  // this, every soldier teleports in 100ms hops ("laggy, troops come out
+  // weird"). We keep the previous and current snapshot's unit/arrow positions
+  // (by uid) plus their arrival times, and tween between them each frame so
+  // motion is smooth — at the cost of rendering ~one snapshot interval behind.
+  const guestInterpRef = useRef({ from: null, to: null, startTime: 0, interval: 0.1 });
   const [onlineOpen, setOnlineOpen] = useState(false);
   const [onlineTab, setOnlineTab] = useState("host"); // "host" | "join"
   const [onlineStatus, setOnlineStatus] = useState("idle"); // idle | waiting | ready | starting | error
@@ -1667,6 +1674,24 @@ function TowerConquest() {
       guestTerrainKeyRef.current = terrainKey;
       buildTerrainTexture(gameRef.current);
     }
+    // Advance the interpolation buffer: this snapshot's positions become the
+    // new "to", the old "to" becomes "from", and we record how long the last
+    // interval actually took so the render tween runs at the real snapshot
+    // cadence (self-correcting if the network jitters). Positions are copied
+    // out now, before the render loop mutates g.units/g.arrows in place.
+    const now = performance.now();
+    const interp = guestInterpRef.current;
+    const uPos = new Map();
+    for (const u of gameRef.current.units) uPos.set(u.uid, { x: u.x, y: u.y });
+    if (sameSession && interp.to) {
+      interp.from = interp.to;
+      interp.interval = Math.min(0.5, Math.max(0.03, (now - interp.startTime) / 1000));
+    } else {
+      interp.from = uPos; // first snapshot of the match — nothing to tween from yet
+      interp.interval = 0.1;
+    }
+    interp.to = uPos;
+    interp.startTime = now;
     setHud(payload.hud || []);
     if (payload.g.over && payload.outcome) setOutcome(payload.outcome);
     setOnlineOpen(false);
@@ -3259,9 +3284,21 @@ function TowerConquest() {
 
       if (g.net && g.net.role === "guest") {
         // Never simulate locally — gameRef.current is only ever a mirror of
-        // the host's latest broadcast (applied in applyGuestSnapshot). Just
-        // draw the last snapshot and keep the specials-train UI in sync
-        // (syncSpecials is a pure read of g, safe to call off a mirror).
+        // the host's latest broadcast (applied in applyGuestSnapshot). But
+        // snapshots land only ~10x/sec while we render at 60fps, so tween each
+        // soldier between its previous and current snapshot position instead of
+        // letting it teleport in 100ms hops. alpha runs 0→1 across one snapshot
+        // interval; a unit missing from `from` (just spawned) stays put at its
+        // current position until it has two samples to move between.
+        const interp = guestInterpRef.current;
+        if (interp.from && interp.to) {
+          const alpha = Math.max(0, Math.min(1, (now - interp.startTime) / 1000 / interp.interval));
+          for (const u of g.units) {
+            const a = interp.from.get(u.uid);
+            const b = interp.to.get(u.uid);
+            if (a && b) { u.x = a.x + (b.x - a.x) * alpha; u.y = a.y + (b.y - a.y) * alpha; }
+          }
+        }
         draw(g);
         syncSpecials(g);
         raf = requestAnimationFrame(step);

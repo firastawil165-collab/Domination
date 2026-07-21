@@ -86,6 +86,24 @@ Goal: real accounts + matchmaking + live PvP, on top of the existing single-file
      test (different viewport sizes): a drag set on the guest survives multiple snapshot
      replacements, and an order broadcast from the guest reaches the host and spawns the
      guest's (owner-1) marching troops.
+   - **Guest interpolation (added in v0.259)**: snapshots arrive ~10x/sec but the guest
+     renders at 60fps, so every soldier teleported in 100ms hops — reported as "very laggy,
+     troops come out weird." The guest now tweens each unit between its previous and current
+     snapshot position every frame (`guestInterpRef` holds the two position samples by `uid`
+     plus their arrival times; `applyGuestSnapshot` advances the buffer, the guest render
+     branch lerps before `draw`). Trade-off: the guest renders ~one snapshot interval (~100ms)
+     behind the host — standard interpolation latency, well worth it for smooth motion.
+     Units missing a previous sample (just spawned) render at their current position rather
+     than streaking from the origin. Only units are interpolated — towers don't move (just
+     troop counts tick), and arrows have no stable id to match across snapshots. The
+     interpolation math was verified deterministically (a synthetic two-snapshot replay sweeps
+     smoothly 0→target, monotonic, new units stay put); live end-to-end smoothness can only be
+     eyeballed on real devices, since the test harness throttles background-tab timers and
+     can't run the host sim and the guest's 60fps render at full speed at once.
+   - **Possible next lever if still laggy**: the snapshot re-sends static tower `cell` Voronoi
+     polygons every frame (they never change after map-gen) — trimming those to a periodic
+     keyframe would cut payload/bandwidth notably. Not done yet; interpolation was the
+     higher-impact fix for the reported symptom.
    - **Known gaps**: hold-to-convert (castle<->tower) isn't networked yet — a no-op for the
      guest, host-only for now. No rematch — "Redeploy"/"Menu" both tear the room down after
      an online match; playing again means re-hosting/re-joining. Guest's hero is auto-assigned
