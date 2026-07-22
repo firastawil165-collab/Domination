@@ -36,6 +36,46 @@ Goal: real accounts + matchmaking + live PvP, on top of the existing single-file
    all — a room is just an ephemeral Supabase Realtime channel named
    `domination-room-<CODE>`, torn down when either side leaves. Presence tracks when both
    players are in the channel; the host's "Start Match" button is disabled until then.
+> **SUPERSEDED — now deterministic lockstep (see "Phase 4" below).** Everything in the
+> Phase 3 subsection is kept as history, but the host-authoritative snapshot model it
+> describes has been REPLACED: both peers now run the identical sim and exchange only
+> inputs. The guest no longer overwrites its state from snapshots, there is no
+> per-frame `snapshot` broadcast, and neither the coordinate-rescaling nor the guest
+> interpolation described below still runs. The "always player 0" relabel trick and
+> `remapSnapshotForGuest` DO live on — used once for the initial state, not every frame.
+
+**Phase 4 (done): deterministic lockstep.** Motivation: even after keyframing the snapshot
+payload and raising the rate, the guest felt laggy — snapshot age + interpolation delay +
+uncredited input round-trip are inherent to host-authoritative streaming. Replaced with
+lockstep: both peers simulate identically from a shared start and exchange only inputs.
+- **Determinism groundwork** — `makeRng(seed)` (mulberry32) on `g.rng`; every in-sim random
+  draw (unit `rowPhase`, `castInstantUpgrade`, AI) goes through it. The game loop advances in
+  fixed `FIXED_DT` (1/60) steps via an accumulator (was variable frame `dt` — the big
+  divergence source). Map-gen RNG is untouched: the map is generated once and shipped, not
+  reproduced.
+- **Handshake** — host picks a seed, generates the map, and broadcasts one `match-start`
+  (`{ seed, state: remapSnapshotForGuest(g, true) }`); both peers load it (guest rebuilds
+  `g.rng` from the seed) and start the lockstep loop. No more `snapshot`/`applyGuestSnapshot`.
+- **Command frames** — inputs batch into command frames (every `TICKS_PER_CMD_FRAME`=6 ticks,
+  ~10 Hz) exchanged via the `frame` broadcast; the sim still runs 60 Hz. A frame's inputs
+  apply at its boundary on BOTH peers, in a canonical order (host-origin cmds then
+  guest-origin) with per-peer `who` labels, so any RNG draw during application stays in sync.
+  Execution stalls at a boundary until both peers' inputs for that frame are in hand
+  (`remoteFramesRef` buffers frames that arrive before lockstep inits, avoiding a startup
+  deadlock). `LOCKSTEP_SEND_LEAD` pre-sends a small buffer (the ~1-frame input delay).
+- **Mirror labeling** — each peer still relabels itself as player 0 (so the `owner===0` sites
+  are untouched), which makes the two states mirror images. AI is therefore fully disabled
+  online (`!g.net`) — its `aiTimers` RNG reset would otherwise desync the mirror; opponent
+  trains still advance.
+- **Desync detection (Phase C)** — each `frame` packet carries an FNV-1a `lockstepChecksum`
+  of the state (in canonical labeling) at a boundary; the peer compares it to its own and, on
+  mismatch, shows a sticky on-screen `netWarn` banner (no devtools on a phone). No automatic
+  full-state resync yet — that's the next lever if drift ever shows up (cross-engine only;
+  same-engine iPhone-vs-iPhone is exact).
+- **Not yet networked**: hold-to-convert (still solo-only). AI-vs-AI online (random-vs-random)
+  would need AI to run deterministically on both peers.
+
+**History (host-authoritative snapshot model, v0.255–v0.26x, now replaced):**
 3. **Phase 3 (done, v0.255): live gameplay sync.** Host-authoritative, as planned — the host
    runs the real simulation completely unchanged (`startGame(2, "ffa")`, same as vs-AI) and
    broadcasts a full `gameRef.current` snapshot ~10x/sec over the room channel; the guest never

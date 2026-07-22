@@ -89,32 +89,26 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 // leaving the page stuck on the boot screen with no visible error.
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// ================= Online (private 1v1 room, host-authoritative) =================
-// Phase 2/3 (see DOMINATION_PROJECT.md), scoped down to the simplest useful
-// slice: no lobby browser, no DB tables — a "room" is just a Supabase
-// Realtime channel named after a short code, torn down when everyone leaves.
-// The host runs the real simulation unchanged (aiAct/aiSpecials are simply
-// skipped for the guest's player slot — see the game loop) and broadcasts a
-// full state snapshot ~10x/sec; the guest never simulates locally (the sim
-// has ~30 scattered Math.random() calls, so two independently-ticking
-// clients would desync within seconds) — it only renders the latest
-// snapshot and forwards its own input back over the same channel.
+// ================= Online (private 1v1 room, deterministic lockstep) =================
+// (see DOMINATION_PROJECT.md "Phase 4"), scoped to the simplest useful slice: no
+// lobby browser, no DB tables — a "room" is just a Supabase Realtime channel named
+// after a short code, torn down when everyone leaves.
 //
-// Every "owner === 0" check throughout the render/input/specials code
-// assumes the LOCAL player is always player 0 — there are dozens of these
-// call sites. Rather than thread a dynamic "my player id" through all of
-// them, the host relabels 0<->1 in the snapshot it sends the guest (see
-// remapSnapshotForGuest) so the guest's client always sees itself as player
-// 0, same as the host. Tower/unit *ids* are untouched — only the `owner`
-// field and other player-indexed slots (teams, momentum, heroes, train,
-// lastCast) swap. Valid for 1v1 only, which is all online supports for now.
-// Host snapshot cadence. Broadcasting more often lowers the age of the guest's
-// freshest data (and, since the guest's tween interval self-corrects to the real
-// arrival gap, tightens its interpolation latency too). 15/sec instead of the old
-// 10/sec is affordable because most snapshots now omit the static `cell` polygons
-// (see remapSnapshotForGuest) — net bandwidth is lower even at the higher rate.
-const NET_SNAP_INTERVAL = 1 / 15;  // seconds between host snapshots
-const NET_KEYFRAME_EVERY = 15;     // re-send static cells every Nth snapshot (~1s)
+// BOTH peers run the identical simulation and exchange only inputs (lockstep):
+// the host ships a one-time match-start (shared seed + initial state), then each
+// side broadcasts its per-command-frame inputs; both apply them at the same frame
+// boundary, so the two sims stay bit-identical. This replaced the earlier
+// host-authoritative model (host simulates, streams full snapshots ~10-15x/sec,
+// guest renders behind), whose snapshot age + interpolation delay + input
+// round-trip made the guest feel laggy no matter how the payload was tuned.
+//
+// Every "owner === 0" check throughout the render/input/specials code assumes the
+// LOCAL player is player 0 — dozens of call sites. Rather than thread a dynamic
+// "my player id" through all of them, each peer relabels 0<->1 so it sees ITSELF
+// as player 0 (the guest's initial state is owner-swapped via remapSnapshotForGuest;
+// the host is already 0). That makes the two states mirror images, so lockstep
+// commands apply in a canonical order and AI is disabled online — see the game
+// loop and applyFrameCmds. Tower/unit *ids* are untouched. 1v1 only for now.
 
 // ---- Deterministic fixed timestep ----
 // The sim advances in fixed FIXED_DT steps via an accumulator (see the game
@@ -124,6 +118,17 @@ const NET_KEYFRAME_EVERY = 15;     // re-send static cells every Nth snapshot (~
 // movement/regen constants were originally tuned at, so solo feel is unchanged.
 const FIXED_DT = 1 / 60;
 const MAX_CATCHUP_STEPS = 5; // cap sim steps per frame so a stall can't spiral
+
+// ---- Online lockstep ----
+// Both peers run the identical sim and exchange only inputs, batched into
+// "command frames": every TICKS_PER_CMD_FRAME sim ticks is one command frame, so
+// inputs are exchanged at 10 Hz while the sim still runs at 60 Hz. A frame's
+// inputs take effect at its boundary on BOTH peers, so the two sims stay in
+// perfect step. LOCKSTEP_SEND_LEAD frames are pre-sent at match start to build a
+// small buffer that absorbs network jitter (this is the ~1-frame input delay).
+const TICKS_PER_CMD_FRAME = 6;
+const CMD_FRAME_INTERVAL = TICKS_PER_CMD_FRAME * FIXED_DT; // 0.1s real time per command frame
+const LOCKSTEP_SEND_LEAD = 2;
 
 // Deterministic PRNG (mulberry32). For online lockstep both peers seed it from
 // the same match seed and consume the stream in the same order (unit spawn
@@ -1684,6 +1689,18 @@ function TowerConquest() {
   // (by uid) plus their arrival times, and tween between them each frame so
   // motion is smooth — at the cost of rendering ~one snapshot interval behind.
   const guestInterpRef = useRef({ from: null, to: null, startTime: 0, interval: 0.1 });
+  // Online lockstep state (both peers). `tick` is the local sim tick; command
+  // frame = floor(tick / TICKS_PER_CMD_FRAME). `pending` collects local inputs
+  // to broadcast on the next send; `localFrames`/`remote` hold each side's inputs
+  // by frame; `sendFrame` is the next frame we'll broadcast, `sendAccum` paces
+  // sending at CMD_FRAME_INTERVAL. Non-null only during an online match.
+  const lockstepRef = useRef(null);
+  // Incoming peer command frames, kept in a ref that exists BEFORE lockstep is
+  // initialized. The host starts broadcasting frames the instant it sends
+  // match-start, which can arrive at the guest before it finishes processing
+  // match-start (and creating lockstepRef); buffering here means those early
+  // frames aren't dropped. initLockstep adopts this same Map as its `remote`.
+  const remoteFramesRef = useRef(new Map());
   const [onlineOpen, setOnlineOpen] = useState(false);
   const [onlineTab, setOnlineTab] = useState("host"); // "host" | "join"
   const [onlineStatus, setOnlineStatus] = useState("idle"); // idle | waiting | ready | starting | error
@@ -1696,99 +1713,130 @@ function TowerConquest() {
       try { sb.removeChannel(netRef.current.channel); } catch (e) { /* already gone */ }
     }
     netRef.current = null;
-    guestTerrainKeyRef.current = null; // force a fresh terrain rebuild next match — see applyGuestSnapshot
-    guestCellsRef.current = null;      // drop cached cell polygons — a new match re-keyframes them
+    guestTerrainKeyRef.current = null; // force a fresh terrain rebuild next match
+    guestCellsRef.current = null;
+    lockstepRef.current = null;        // drop the lockstep command buffers
+    remoteFramesRef.current = new Map(); // and any buffered peer frames from a prior match
+    setNetWarn(null);
     setOnlineStatus("idle");
     setOnlineRoomCode("");
     setOnlineError("");
   }, []);
 
-  // Guest side: replace the local mirror wholesale with the host's latest
-  // (already player-relabeled) snapshot. `eliminated` travels as an array —
-  // Sets aren't JSON-safe — and is rebuilt into a Set here.
-  //
-  // No coordinate rescaling: host and guest both use the same fixed WORLD (an
-  // iPhone-portrait rectangle, identical on every device), so the host's
-  // coordinates are ALREADY in the guest's world space. The guest just adopts
-  // them and lets its own draw()-time viewFit scale that fixed world onto its
-  // screen (a matching-ratio screen fills it; a differently-shaped one gets
-  // letterbox bars). This keeps speed and range identical for both players AND
-  // makes a tower's drawn range ring match where its arrows actually land: range
-  // is a world-unit radius scaled by the exact same fit as every position, so
-  // they can't drift apart the way they did when the guest rescaled the host's
-  // raw-pixel world.
-  const applyGuestSnapshot = useCallback((payload) => {
-    const g = payload.g;
-    const src = g;
-    const prev = gameRef.current;
-    gameRef.current = { ...g, eliminated: new Set(src.eliminated), net: netRef.current };
-    // Client-only state the host's snapshot doesn't carry has to be restored
-    // onto every fresh gameRef, because the whole object is replaced ~10x/sec:
-    //  - drag / hover / lastTap: the guest's OWN transient pointer state. This
-    //    is the important one — without it, a drag begun in handleDown (which
-    //    sets g.drag) is wiped by the very next snapshot before the release in
-    //    handleUp can read it, so the guest's orders never fire: it can watch
-    //    but never actually play. Carried across so a gesture survives the
-    //    snapshots that land mid-drag.
-    //  - terrainTex: a live <canvas>, stripped before broadcast + rebuilt
-    //    locally. Same texture all match unless the guest's own size changes,
-    //    so reuse the previous one rather than rebuilding (expensive per-pixel
-    //    noise) — and crucially, without carrying it, it'd be undefined on
-    //    every snapshot after the first and the terrain would vanish.
-    const sameSession = prev && prev.net === netRef.current;
-    if (sameSession) {
-      gameRef.current.drag = prev.drag;
-      gameRef.current.hover = prev.hover;
-      gameRef.current.lastTap = prev.lastTap;
+  // ---- Lockstep command plumbing ----
+  // Both peers run the identical sim and exchange only inputs. A local input
+  // (order/upgrade/cast) is buffered in `pending` and broadcast on the next
+  // command-frame send; it is NOT applied immediately (that would desync the two
+  // sims). It executes on BOTH peers when its frame's boundary is reached, so the
+  // two simulations stay in perfect step. Each peer relabels itself as player 0
+  // (so the dozens of `owner === 0` render/input sites are untouched), which
+  // makes the two states mirror images — hence the canonical apply order below.
+  const initLockstep = () => {
+    lockstepRef.current = {
+      tick: 0,
+      sendFrame: 0,
+      // Pre-bank a lead so the first frame immediately sends LOCKSTEP_SEND_LEAD
+      // command frames — a small buffer that absorbs jitter (the input delay).
+      sendAccum: LOCKSTEP_SEND_LEAD * CMD_FRAME_INTERVAL,
+      pending: [],
+      localFrames: new Map(),          // frame -> our own cmds (kept to apply on execution)
+      remote: remoteFramesRef.current,  // frame -> peer's cmds; shared with the frame handler
+      checksums: new Map(),            // frame -> our state hash at that frame's boundary
+      lastChkFrame: -1,                // most recent boundary we hashed (rides along on sends)
+      lastChkHash: 0,
+      desyncFrame: null,               // first frame a mismatch was detected (for the warning)
+      started: true,
+    };
+  };
+  const enqueueLocalCmd = (cmd) => {
+    const ls = lockstepRef.current;
+    if (ls) ls.pending.push(cmd);
+  };
+  // Apply one command in THIS peer's own labeling: `who` is the originator as this
+  // peer sees it (0 = self/local, 1 = the opponent/remote). The owner check keeps
+  // a stale command (tower captured during the input-delay window) from applying —
+  // and because both peers evaluate it on the same synced state, they agree.
+  const applyLockstepCmd = (g, c, who) => {
+    if (c.t === "order") {
+      const src = g.towers.find((t) => t.id === c.srcId);
+      const dst = g.towers.find((t) => t.id === c.dstId);
+      if (src && dst && src.id !== dst.id && src.owner === who) issueOrder(g, src, dst, c.percent);
+    } else if (c.t === "upgrade") {
+      const t = g.towers.find((t) => t.id === c.towerId);
+      if (t && t.owner === who && canStartUpgrade(t)) startUpgrade(g, t);
+    } else if (c.t === "cast") {
+      const fn = CAST_FNS[c.kind];
+      if (fn && readyFor(g, c.kind, who)) {
+        try { fn(g, who); } catch (err) { console.error(`[lockstep cast] "${c.kind}" threw:`, err); }
+      }
     }
-    // Re-attach the static Voronoi cells. A keyframe snapshot carries them (so we
-    // cache them by tower id); every cell-less snapshot in between gets them back
-    // from that cache. Before the first keyframe lands (or if one is dropped), a
-    // tower may have no cell yet — leave it as [] so the `cell.length < 3` guards
-    // in draw()/regionAt safely skip it instead of dereferencing undefined.
-    if (!guestCellsRef.current) guestCellsRef.current = new Map();
-    const cellCache = guestCellsRef.current;
-    for (const t of gameRef.current.towers) {
-      if (t.cell && t.cell.length >= 3) cellCache.set(t.id, t.cell);
-      else t.cell = cellCache.get(t.id) || [];
+  };
+  // Apply a whole command frame in a fixed canonical order (host-origin cmds, then
+  // guest-origin) that's identical on both peers, so any RNG draws during
+  // application (e.g. a cast) resolve the same. `who` is per-peer: a command this
+  // peer originated is owner 0 to it, the peer's is owner 1.
+  const applyFrameCmds = (g, ls, F) => {
+    const localCmds = ls.localFrames.get(F) || [];
+    const remoteCmds = ls.remote.get(F) || [];
+    const isHost = g.net.role === "host";
+    const hostCmds = isHost ? localCmds : remoteCmds;
+    const guestCmds = isHost ? remoteCmds : localCmds;
+    for (const c of hostCmds) applyLockstepCmd(g, c, isHost ? 0 : 1);
+    for (const c of guestCmds) applyLockstepCmd(g, c, isHost ? 1 : 0);
+  };
+  // Cheap FNV-1a hash of the sim state, computed in CANONICAL labeling (host's) so
+  // the two mirror-image peers produce the SAME number when in sync. Compared
+  // across the wire (see the frame handler) to catch any determinism drift — the
+  // one thing that would silently break lockstep. Owners are canonicalized; troops
+  // and positions are rounded so a harmless sub-unit float difference doesn't trip
+  // it (same-engine iPhone-vs-iPhone is exact anyway).
+  const lockstepChecksum = (g) => {
+    const canon = g.net.role === "host" ? (o) => o : netSwapOwner;
+    let h = 2166136261 >>> 0;
+    const mix = (n) => { h ^= (n | 0); h = Math.imul(h, 16777619) >>> 0; };
+    const ts = g.towers.slice().sort((a, b) => a.id - b.id);
+    for (const t of ts) { mix(t.id); mix(canon(t.owner) + 2); mix(Math.round(t.troops)); mix(t.level | 0); mix(t.type === "tower" ? 1 : 0); }
+    mix(g.units.length);
+    for (const u of g.units) { mix(Math.round(u.x)); mix(Math.round(u.y)); mix(canon(u.owner) + 2); }
+    return h >>> 0;
+  };
+  // Frame-handler side (both peers): buffer the peer's inputs, and if the packet
+  // reports a state hash for a frame we've already executed, compare it to ours.
+  // A mismatch means the sims drifted — surfaced once, on screen (there's no
+  // devtools on a phone), so a determinism regression is caught during testing
+  // rather than silently ruining the match.
+  const recordRemoteFrame = (payload) => {
+    remoteFramesRef.current.set(payload.frame, payload.cmds || []);
+    const ls = lockstepRef.current;
+    if (ls && ls.desyncFrame == null && payload.chkFrame >= 0 && ls.checksums.has(payload.chkFrame) &&
+        ls.checksums.get(payload.chkFrame) !== payload.chkHash) {
+      ls.desyncFrame = payload.chkFrame;
+      console.warn(`[lockstep] DESYNC at frame ${payload.chkFrame}: local=${ls.checksums.get(payload.chkFrame)} remote=${payload.chkHash}`);
+      setNetWarn("Online desync — the two games drifted apart. Please rematch.");
     }
-    const haveCells = gameRef.current.towers.some((t) => t.cell.length >= 3);
-    // Keyed on the world size (g.W×g.H, the host's world — same REF_H height on
-    // both sides, width = host's aspect). buildTerrainTexture paints at g.W×g.H,
-    // so a rebuild is needed only when the host's world dims change (host aspect
-    // change), NOT when the guest merely resizes — draw()'s fit handles that.
-    // buildTerrainTexture bakes AO along the cell borders, so it must wait until
-    // we actually have cells (the first keyframe); until then draw() falls back
-    // to its flat fill for a frame or two, then the keyframe triggers the build.
-    const terrainKey = Math.round(gameRef.current.W) + "x" + Math.round(gameRef.current.H);
-    if (sameSession && prev.terrainTex && guestTerrainKeyRef.current === terrainKey) {
-      gameRef.current.terrainTex = prev.terrainTex;
-    } else if (haveCells) {
-      guestTerrainKeyRef.current = terrainKey;
-      buildTerrainTexture(gameRef.current);
-    } else if (sameSession && prev.terrainTex) {
-      gameRef.current.terrainTex = prev.terrainTex; // no cells this frame — keep current texture
-    }
-    // Advance the interpolation buffer: this snapshot's positions become the
-    // new "to", the old "to" becomes "from", and we record how long the last
-    // interval actually took so the render tween runs at the real snapshot
-    // cadence (self-correcting if the network jitters). Positions are copied
-    // out now, before the render loop mutates g.units/g.arrows in place.
-    const now = performance.now();
-    const interp = guestInterpRef.current;
-    const uPos = new Map();
-    for (const u of gameRef.current.units) uPos.set(u.uid, { x: u.x, y: u.y });
-    if (sameSession && interp.to) {
-      interp.from = interp.to;
-      interp.interval = Math.min(0.5, Math.max(0.03, (now - interp.startTime) / 1000));
-    } else {
-      interp.from = uPos; // first snapshot of the match — nothing to tween from yet
-      interp.interval = 0.1;
-    }
-    interp.to = uPos;
-    interp.startTime = now;
-    setHud(payload.hud || []);
-    if (payload.g.over && payload.outcome) setOutcome(payload.outcome);
+  };
+
+  // Guest side: load the host's one-time match-start (shared seed + full initial
+  // state, already owner-swapped so the guest is player 0), rebuild the RNG from
+  // the seed, and begin the lockstep loop. After this the guest simulates locally
+  // just like the host — no more per-frame snapshots.
+  const applyMatchStart = useCallback((payload) => {
+    const s = payload.state;
+    gameRef.current = {
+      ...s,
+      eliminated: new Set(s.eliminated || []),
+      net: netRef.current,
+      seed: payload.seed,
+      rng: makeRng(payload.seed), // functions don't survive JSON — rebuild from the shared seed
+      drag: null, hover: null, lastTap: null,
+    };
+    guestTerrainKeyRef.current = null;
+    buildTerrainTexture(gameRef.current);
+    initLockstep();
+    setOutcome(null);
+    setPaused(false);
+    setMenuOpen(false);
+    setShowHelp(false);
     setOnlineOpen(false);
     setOnlineStatus("playing");
     setScreen("play");
@@ -1802,28 +1850,11 @@ function TowerConquest() {
     });
     netRef.current = { channel, role: "host", myPlayerId: 0, code };
     channel
-      .on("broadcast", { event: "order" }, ({ payload }) => {
-        const g = gameRef.current;
-        if (!g || !g.net || g.net.role !== "host" || g.over) return;
-        const src = g.towers.find((t) => t.id === payload.srcId);
-        const dst = g.towers.find((t) => t.id === payload.dstId);
-        if (src && dst && src.id !== dst.id && src.owner === 1) issueOrder(g, src, dst, payload.percent);
-      })
-      .on("broadcast", { event: "upgrade" }, ({ payload }) => {
-        const g = gameRef.current;
-        if (!g || !g.net || g.net.role !== "host" || g.over) return;
-        const t = g.towers.find((t) => t.id === payload.towerId);
-        if (t && t.owner === 1 && canStartUpgrade(t)) startUpgrade(g, t);
-      })
-      .on("broadcast", { event: "cast" }, ({ payload }) => {
-        const g = gameRef.current;
-        if (!g || !g.net || g.net.role !== "host" || g.over) return;
-        if (!readyFor(g, payload.kind, 1)) return;
-        const fn = CAST_FNS[payload.kind];
-        if (fn) {
-          try { fn(g, 1); } catch (err) { console.error(`[online cast] "${payload.kind}" threw:`, err); }
-        }
-      })
+      // Lockstep: the guest's per-command-frame input packet. Buffered by frame
+      // number (in the pre-init ref, which initLockstep adopts); the sim consumes
+      // it at that frame's boundary (see the game loop). Also carries a state hash
+      // for desync detection.
+      .on("broadcast", { event: "frame" }, ({ payload }) => recordRemoteFrame(payload))
       .on("presence", { event: "sync" }, () => {
         const count = Object.keys(channel.presenceState()).length;
         setOnlineStatus((s) => (s === "starting" || s === "playing" ? s : (count >= 2 ? "ready" : "waiting")));
@@ -1852,7 +1883,12 @@ function TowerConquest() {
     });
     netRef.current = { channel, role: "guest", myPlayerId: 1, code };
     channel
-      .on("broadcast", { event: "snapshot" }, ({ payload }) => applyGuestSnapshot(payload))
+      // Lockstep: the one-time match start (seed + initial state), then the host's
+      // per-command-frame input packets buffered by frame for the sim to consume.
+      // (Frames can arrive before match-start finishes — the pre-init ref catches
+      // them so nothing is lost; see remoteFramesRef.)
+      .on("broadcast", { event: "match-start" }, ({ payload }) => applyMatchStart(payload))
+      .on("broadcast", { event: "frame" }, ({ payload }) => recordRemoteFrame(payload))
       .on("presence", { event: "sync" }, () => {
         const count = Object.keys(channel.presenceState()).length;
         setOnlineStatus((s) => (s === "starting" || s === "playing" ? s : (count >= 2 ? "ready" : "waiting")));
@@ -1870,7 +1906,7 @@ function TowerConquest() {
     setOnlineTab("join");
     setOnlineError("");
     setOnlineOpen(true);
-  }, [leaveOnlineRoom, applyGuestSnapshot]);
+  }, [leaveOnlineRoom, applyMatchStart]);
 
   // Which opponent's pill (by pid) currently has its ability-details popup
   // open, if any — tapping a pill in the Top HUD toggles this. Reset when a
@@ -1914,6 +1950,10 @@ function TowerConquest() {
   // Defense investigation in DOMINATION_PROJECT.md. There's no reliable
   // devtools access on a phone, so this has to be on-screen, not console-only.
   const [castError, setCastError] = useState(null);
+  // Online lockstep desync warning — shown on screen (no devtools on a phone) if
+  // the two peers' state hashes ever diverge. Sticky (no auto-clear) since a
+  // desync means the match is compromised and worth noticing. Cleared on leave.
+  const [netWarn, setNetWarn] = useState(null);
   const prevSecsRef = useRef({ 1: TRAIN_STAGE * 1, 2: TRAIN_STAGE * 2, 3: TRAIN_STAGE * 3 });
   useEffect(() => {
     const prev = prevSecsRef.current;
@@ -2159,9 +2199,19 @@ function TowerConquest() {
   // know to broadcast/forward instead of running solo.
   const startOnlineMatch = useCallback(() => {
     if (!netRef.current || netRef.current.role !== "host") return;
-    setOnlineStatus("starting");
-    startGame(2, "ffa");
+    setOnlineStatus("playing");
+    // The host generates the map and picks the shared seed, then broadcasts a
+    // single match-start: seed + full initial state (owner-swapped so the guest
+    // is player 0, cells included). Both peers then run the identical sim from
+    // that point, exchanging only per-frame inputs (lockstep) — no more snapshots.
+    const seed = Math.floor(Math.random() * 0x100000000) >>> 0;
+    startGame(2, "ffa", false, seed);
     gameRef.current.net = netRef.current;
+    netRef.current.channel.send({
+      type: "broadcast", event: "match-start",
+      payload: { seed, state: remapSnapshotForGuest(gameRef.current, true) },
+    });
+    initLockstep();
     setOnlineOpen(false);
   }, [startGame]);
 
@@ -2845,12 +2895,12 @@ function TowerConquest() {
       return;
     }
     SoundEngine.resume();
-    // Online guest: the client-side readiness check above is purely local
-    // feedback (the shake). The actual cast has to happen on the host,
-    // which owns the real train/cooldown state for pid 1 — forward it and
-    // stop; the host's next broadcast snapshot will reflect the result.
-    if (g.net && g.net.role === "guest") {
-      g.net.channel.send({ type: "broadcast", event: "cast", payload: { kind } });
+    // Online (either peer): the readiness check above is purely local feedback
+    // (the shake). Queue the cast as a lockstep command instead of applying it
+    // now — it executes at its command-frame boundary on BOTH peers, keeping the
+    // sims in step. Re-checked against the synced state at apply time.
+    if (g.net) {
+      enqueueLocalCmd({ t: "cast", kind });
       return;
     }
     const fn = CAST_FNS[kind];
@@ -2926,11 +2976,10 @@ function TowerConquest() {
       const now = performance.now();
       if (drag.t0 != null && now - drag.t0 >= HOLD_MS) {
         g.lastTap = null;
-        // Convert isn't wired up over the network yet — quietly a no-op for
-        // an online guest rather than opening a confirm bubble whose
-        // eventual "Confirm" would only mutate the guest's own soon-to-be-
-        // overwritten mirror and never reach the host.
-        if (canConvert(src) && !(g.net && g.net.role === "guest")) {
+        // Convert isn't wired up over the network yet — quietly a no-op in any
+        // online match (applying it on only one peer would desync the lockstep
+        // sims); it stays available in solo/tutorial.
+        if (canConvert(src) && !g.net) {
           const rect = canvasRef.current.getBoundingClientRect();
           const bx = Math.min(rect.width - 90, Math.max(90, sp.x));
           const by = Math.min(rect.height - 20, Math.max(70, sp.y));
@@ -2941,14 +2990,11 @@ function TowerConquest() {
       if (g.lastTap && g.lastTap.id === src.id && now - g.lastTap.time < 350) {
         g.lastTap = null;
         if (canStartUpgrade(src)) {
-          if (g.net && g.net.role === "guest") {
-            g.net.channel.send({ type: "broadcast", event: "upgrade", payload: { towerId: src.id } });
-          } else {
-            startUpgrade(g, src);
-            // Tutorial's "upgraded" flag fires when the build actually finishes
-            // (see the upgrade-build-completion block in the game loop), not here —
-            // otherwise the tutorial would advance before the player sees the result.
-          }
+          // Online: queue as a lockstep command (executes on both peers at its
+          // frame). Solo: start the upgrade immediately. (Tutorial's "upgraded"
+          // flag fires when the build finishes, in the game loop, not here.)
+          if (g.net) enqueueLocalCmd({ t: "upgrade", towerId: src.id });
+          else startUpgrade(g, src);
         }
       } else {
         g.lastTap = { id: src.id, time: now };
@@ -2957,14 +3003,10 @@ function TowerConquest() {
     }
 
     if (target && target.id !== src.id && src.owner === 0) {
-      if (g.net && g.net.role === "guest") {
-        g.net.channel.send({
-          type: "broadcast", event: "order",
-          payload: { srcId: src.id, dstId: target.id, percent: pctRef.current },
-        });
-      } else {
-        issueOrder(g, src, target, pctRef.current);
-      }
+      // Online: queue the order as a lockstep command (executes on both peers at
+      // its command-frame boundary). Solo: issue it immediately.
+      if (g.net) enqueueLocalCmd({ t: "order", srcId: src.id, dstId: target.id, percent: pctRef.current });
+      else issueOrder(g, src, target, pctRef.current);
       // Tutorial's "captured" flag fires on actual capture (see unitArrives),
       // not on order-issue, so the step waits until the player really takes
       // the castle rather than advancing the instant they let go of the drag.
@@ -3387,70 +3429,29 @@ function TowerConquest() {
   useEffect(() => {
     if (screen !== "play") return;
     let raf, last = performance.now(), hudTimer = 0, simAccum = 0;
-    // Host-only: throttled snapshot broadcast + the hud/outcome values it
-    // rides along with (recomputed every hudTimer tick below, just like the
-    // local setHud call already was — reused here rather than duplicated).
-    let netBroadcastTimer = 0, lastHudStats = [], lastOutcomeSent = null;
-    // Snapshot counter driving keyframe cadence: every KEYFRAME_EVERY-th snapshot
-    // (and the very first, count 0) carries the static `cell` polygons; the rest
-    // omit them and the guest re-attaches from its cache. ~1s between keyframes at
-    // NET_SNAP_INTERVAL, so a dropped keyframe self-heals within a second.
-    let netSnapCount = 0;
+    // Recomputed on the hud tick below; `lastOutcomeSent` guards the one-shot
+    // win/lose SFX + outcome screen so they fire exactly once.
+    let lastHudStats = [], lastOutcomeSent = null;
 
     const step = (now) => {
       const g = gameRef.current;
       // Real elapsed wall-clock time this animation frame. Drives presentation
-      // and network cadence (hud, snapshot throttle, guest tween) — NOT the sim,
-      // which advances in fixed FIXED_DT steps below so it's framerate-independent
-      // and identical on two clients (see the accumulator loop).
+      // and network cadence (hud tick, lockstep send pacing) — NOT the sim, which
+      // advances in fixed FIXED_DT steps below so it's framerate-independent and
+      // identical on two clients (see the drivers after runSimTick).
       const frameDt = Math.min(0.05, (now - last) / 1000);
       last = now;
       if (!g) return;
 
-      if (g.net && g.net.role === "guest") {
-        g.pulse += frameDt; // guest doesn't sim; advance pulse locally for animations
-        // Never simulate locally — gameRef.current is only ever a mirror of
-        // the host's latest broadcast (applied in applyGuestSnapshot). But
-        // snapshots land only ~10x/sec while we render at 60fps, so tween each
-        // soldier between its previous and current snapshot position instead of
-        // letting it teleport in 100ms hops. alpha runs 0→1 across one snapshot
-        // interval; a unit missing from `from` (just spawned) stays put at its
-        // current position until it has two samples to move between.
-        const interp = guestInterpRef.current;
-        if (interp.from && interp.to) {
-          const alpha = Math.max(0, Math.min(1, (now - interp.startTime) / 1000 / interp.interval));
-          for (const u of g.units) {
-            const a = interp.from.get(u.uid);
-            const b = interp.to.get(u.uid);
-            if (a && b) { u.x = a.x + (b.x - a.x) * alpha; u.y = a.y + (b.y - a.y) * alpha; }
-          }
-        }
-        draw(g);
-        syncSpecials(g);
-        raf = requestAnimationFrame(step);
-        return;
-      }
-
-      // ----- Fixed-timestep simulation -----
-      // Advance the sim in whole FIXED_DT steps, consuming the real frame time
-      // banked in `simAccum`. Every step uses the SAME `dt` (= FIXED_DT), so the
-      // sim is framerate-independent and — given the same seed + inputs — runs
-      // bit-identically on two clients (the basis for online lockstep). draw()
-      // and the hud/network cadence below still run once per real frame. The huge
-      // sim body keeps its original indentation to minimize the diff; it now
-      // lives inside the while loop. MAX_CATCHUP_STEPS caps a post-stall burst so
-      // a hitch can't spiral; paused/over frames bank nothing.
-      if (g.over || pausedRef.current) {
-        simAccum = 0;
-      } else {
-        simAccum += frameDt;
-        let simSteps = 0;
-        while (simAccum >= FIXED_DT && simSteps < MAX_CATCHUP_STEPS) {
-          if (g.over) break; // a sim step can end the match mid-burst
-          simAccum -= FIXED_DT;
-          simSteps++;
-          const dt = FIXED_DT;
-          g.pulse += dt;
+      // ----- One fixed-timestep sim tick -----
+      // The entire sim body lives in this closure so BOTH drivers below advance
+      // the sim identically, one FIXED_DT step at a time: the solo accumulator
+      // (free-running) and the online lockstep executor (gated on exchanged
+      // inputs at command-frame boundaries). Same dt every step ⇒ the sim is
+      // framerate-independent and, given the same seed + inputs, bit-identical on
+      // two clients. (Body kept at its original indentation to minimize the diff.)
+      const runSimTick = (dt) => {
+        g.pulse += dt;
         // Battle heat decays continuously; feeds the ambient battle bed below.
         if (g.battleHeat > 0) g.battleHeat = Math.max(0, g.battleHeat - BATTLE_HEAT_DECAY * dt);
 
@@ -3858,14 +3859,16 @@ function TowerConquest() {
           // An eliminated-but-team-alive AI takes no aiAct turn (it has no
           // buildings or troops to move) but its train keeps loading so it can
           // keep casting team-scoped specials for its surviving partner.
-          if (!g.eliminated.has(pid)) {
+          // No AI in an online match: BOTH pid 0 and pid 1 are human (each peer
+          // sees itself as 0, its opponent as 1), and their moves arrive as
+          // lockstep commands. Gating the whole aiTimers block on `!g.net` also
+          // matters for determinism — its g.rng() reset would otherwise pull from
+          // the shared RNG stream and desync the two sims. The opponent's train
+          // (aiTrain) still advances below so their casts can charge.
+          if (!g.eliminated.has(pid) && !g.net) {
             g.aiTimers[pid] -= dt;
             if (g.aiTimers[pid] <= 0) {
-              // Online host: player 1's buildings belong to a real guest,
-              // not the AI — the guest's own orders arrive via the "order"
-              // broadcast handler instead. Online is 1v1-only, so this loop
-              // only ever reaches pid 1 in that case anyway.
-              if (!g.tutorial && !(g.net && g.net.role === "host")) aiAct(g, pid);
+              if (!g.tutorial) aiAct(g, pid);
               g.aiTimers[pid] = 1.1 + g.rng() * 1.6;
             }
           }
@@ -3886,9 +3889,8 @@ function TowerConquest() {
         g.aiFxTimer -= dt;
         if (g.aiFxTimer <= 0) {
           g.aiFxTimer = 0.5;
-          // Same reasoning as the aiAct skip above — the only AI pid this
-          // could act on in an online match (1) is the real guest.
-          if (!(g.net && g.net.role === "host")) aiSpecials(g);
+          // No AI online (both players are human — see the aiAct guard above).
+          if (!g.net) aiSpecials(g);
         }
 
         // Eliminations & outcome (team-aware)
@@ -3948,8 +3950,78 @@ function TowerConquest() {
           g.slashes[i].life += dt;
           if (g.slashes[i].life >= g.slashes[i].dur) g.slashes.splice(i, 1);
         }
-        } // end while (fixed-step sim)
-        if (simSteps >= MAX_CATCHUP_STEPS) simAccum = 0; // drop backlog after a stall
+      }; // end runSimTick
+
+      const ls = g.net ? lockstepRef.current : null;
+      if (ls && ls.started) {
+        // ----- Online lockstep driver -----
+        // (1) Send: broadcast our buffered inputs, one command frame per interval,
+        // always running ahead of execution by the pre-banked lead so the peer has
+        // our inputs before it needs them.
+        ls.sendAccum += frameDt;
+        while (ls.sendAccum >= CMD_FRAME_INTERVAL) {
+          ls.sendAccum -= CMD_FRAME_INTERVAL;
+          const cmds = ls.pending;
+          ls.pending = [];
+          ls.localFrames.set(ls.sendFrame, cmds);
+          g.net.channel.send({
+            type: "broadcast", event: "frame",
+            payload: { frame: ls.sendFrame, cmds, chkFrame: ls.lastChkFrame, chkHash: ls.lastChkHash },
+          });
+          ls.sendFrame++;
+        }
+        // (2) Execute: advance the sim tick-by-tick at 60 Hz, but at every
+        // command-frame boundary wait until BOTH peers' inputs for that frame are
+        // in hand, then apply them. If the remote packet hasn't arrived yet we
+        // stall (render the last state) rather than guess — that's what keeps the
+        // two sims identical. MAX_CATCHUP_STEPS caps a post-stall catch-up burst.
+        if (!g.over) {
+          simAccum += frameDt;
+          let simSteps = 0;
+          while (simAccum >= FIXED_DT && simSteps < MAX_CATCHUP_STEPS) {
+            if (g.over) break;
+            if (ls.tick % TICKS_PER_CMD_FRAME === 0) {
+              const F = ls.tick / TICKS_PER_CMD_FRAME;
+              if (!(ls.localFrames.has(F) && ls.remote.has(F))) break; // stall: waiting on input
+              // Hash the state at this boundary (before applying F's inputs) so
+              // both peers hash the exact same pre-input state; it rides along on
+              // our next sends for the peer to compare (desync detection).
+              const chk = lockstepChecksum(g);
+              ls.checksums.set(F, chk);
+              ls.lastChkFrame = F;
+              ls.lastChkHash = chk;
+              if (ls.checksums.size > 128) ls.checksums.delete(F - 128);
+              applyFrameCmds(g, ls, F);
+              ls.localFrames.delete(F);
+              ls.remote.delete(F);
+            }
+            simAccum -= FIXED_DT;
+            simSteps++;
+            ls.tick++;
+            runSimTick(FIXED_DT);
+          }
+          if (simSteps >= MAX_CATCHUP_STEPS) simAccum = 0;
+        } else {
+          simAccum = 0;
+        }
+      } else {
+        // ----- Solo driver -----
+        // Free-running fixed-step accumulator: run as many whole FIXED_DT steps as
+        // the real frame time banked, capped so a hitch can't spiral. Paused/over
+        // frames bank nothing.
+        if (g.over || pausedRef.current) {
+          simAccum = 0;
+        } else {
+          simAccum += frameDt;
+          let simSteps = 0;
+          while (simAccum >= FIXED_DT && simSteps < MAX_CATCHUP_STEPS) {
+            if (g.over) break;
+            simAccum -= FIXED_DT;
+            simSteps++;
+            runSimTick(FIXED_DT);
+          }
+          if (simSteps >= MAX_CATCHUP_STEPS) simAccum = 0;
+        }
       }
 
       draw(g);
@@ -3985,23 +4057,6 @@ function TowerConquest() {
         setHud(stats);
         syncSpecials(g);
         lastHudStats = stats;
-      }
-
-      if (g.net && g.net.role === "host") {
-        netBroadcastTimer += frameDt;
-        if (netBroadcastTimer >= NET_SNAP_INTERVAL) {
-          netBroadcastTimer = 0;
-          const withCells = (netSnapCount % NET_KEYFRAME_EVERY) === 0; // count 0 = first snapshot
-          netSnapCount++;
-          g.net.channel.send({
-            type: "broadcast", event: "snapshot",
-            payload: {
-              g: remapSnapshotForGuest(g, withCells),
-              hud: remapHudForGuest(lastHudStats),
-              outcome: lastOutcomeSent === "win" ? "lose" : lastOutcomeSent === "lose" ? "win" : null,
-            },
-          });
-        }
       }
 
       raf = requestAnimationFrame(step);
@@ -6317,6 +6372,16 @@ function TowerConquest() {
               borderRadius: 8, padding: "4px 8px",
             }}>
               ⚠ {castError}
+            </div>
+          )}
+          {netWarn && (
+            <div style={{
+              width: "100%", maxWidth: 460, textAlign: "center",
+              fontSize: 11, fontWeight: 700, color: "#FFB020",
+              background: "rgba(255,176,32,0.12)", border: "1px solid #FFB02055",
+              borderRadius: 8, padding: "4px 8px",
+            }}>
+              ⚠ {netWarn}
             </div>
           )}
           <div style={{
