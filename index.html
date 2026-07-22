@@ -207,7 +207,19 @@ const REF_H = 800;
 // stretched or reshaped. This replaces the earlier "world follows the device
 // aspect", which let a wide host turn the shared map into a wide strip that left
 // a portrait phone guest's top and bottom thirds empty.
-const WORLD_ASPECT = 1206 / 2622;         // iPhone 17 Pro portrait, width/height (~19.5:9)
+//
+// The ratio is deliberately the phone PLAY-AREA shape, NOT the full-screen shape.
+// The board lives in the space left between the top HUD and the bottom ability
+// bar, which is shorter (and so proportionally WIDER) than the whole screen — on
+// an iPhone 14/17 Pro Max that box measures ~0.60 w/h, whereas the full screen is
+// the ~0.46 (19.5:9) of the panel. Using the full-screen 0.46 left the tall,
+// narrow world unable to fill the shorter, squarer play box, so every phone got
+// dark side bars even at its "correct" ratio. 0.60 makes a phone fill edge to
+// edge; a landscape PC still gets clean side bars, and the fixed-world fairness
+// (one shared shape for host and guest) is unchanged. Tune this one number if a
+// device/HUD state still shows a sliver: larger = wider (trims side bars, risks a
+// thin top/bottom bar), smaller = narrower (the reverse).
+const WORLD_ASPECT = 0.60;                // phone play-area width/height (see above)
 const WORLD = { W: REF_H * WORLD_ASPECT, H: REF_H };
 
 // Camera — tilted pseudo-3D board + zoom. The world stays flat 2D; rendering
