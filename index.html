@@ -4484,6 +4484,23 @@ function TowerConquest() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cw, ch);
     ctx.setTransform(dpr * f, 0, 0, dpr * f, dpr * offX, dpr * offY);
+    // Clip every board draw below to the world rect [0,W]x[0,H]. The tilted
+    // camera (proj) projects that flat rect into a TRAPEZOID — narrower at the
+    // top, wider (via PERSP) at the bottom — so the board's edges bow OUTSIDE
+    // the world rect, most at the bottom, least at the top. When the screen's
+    // shape matches WORLD (a portrait phone) viewFit fills it edge to edge and
+    // that overspill is simply cut off by the canvas, reading as a clean
+    // rectangle. But on an off-ratio screen (a landscape/desktop viewport)
+    // viewFit letterboxes, and the trapezoid then spills UNEVENLY into the side
+    // bars — lots at the wide bottom, little at the narrow top — leaving ragged
+    // dark triangles in the top corners ("missing sides"). Clipping to the world
+    // rect trims that spill back to a true rectangle, so the board is always a
+    // clean rect with solid letterbox bars, exactly as the fixed-ratio design
+    // intends. (matched by ctx.restore() after the last main-canvas board draw)
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, W, H);
+    ctx.clip();
     const P = (wx, wy) => proj(g, wx, wy);
 
     // Cached terrain base (organic noise + unified directional light + soft
@@ -4930,6 +4947,9 @@ function TowerConquest() {
     // draw over farther ones so overlapping counters still resolve sensibly.
     const plates = g.towers.slice().sort((a, b) => a.y - b.y);
     for (const t of plates) drawGarrisonPlate(ctx, t, g);
+
+    // End of the world-rect clip opened right after the fit transform above.
+    ctx.restore();
 
     // Any plate that visually falls inside the COMMIT % buttons' screen zone
     // gets redrawn onto the separate overlay canvas too (see overlayCanvasRef)
