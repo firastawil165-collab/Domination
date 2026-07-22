@@ -2207,6 +2207,14 @@ function TowerConquest() {
     const seed = Math.floor(Math.random() * 0x100000000) >>> 0;
     startGame(2, "ffa", false, seed);
     gameRef.current.net = netRef.current;
+    // CRITICAL (desync fix): startGame consumed a few draws from the RNG while
+    // building the initial state (aiTimers/aiTrain jitter), so the host's stream
+    // is a few positions ahead of the guest's — the guest rebuilds makeRng(seed)
+    // fresh in applyMatchStart. Rewind the host to a fresh stream too, so both
+    // peers' FIRST in-sim draw (e.g. a spawned row's sway phase) matches. The
+    // already-drawn values themselves travel in the state snapshot, so nothing
+    // else needs replaying.
+    gameRef.current.rng = makeRng(seed);
     netRef.current.channel.send({
       type: "broadcast", event: "match-start",
       payload: { seed, state: remapSnapshotForGuest(gameRef.current, true) },
