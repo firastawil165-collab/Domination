@@ -197,25 +197,18 @@ const START_HIGHLIGHT_DURATION = 5; // seconds the "this is you" ring shows arou
 // crawl and towers out-reach their own drawn range ring on small screens.
 // This one number sets the overall pace/zoom; raise it to zoom the board out.
 const REF_H = 800;
-const worldFromView = (W, H) => ({ W: REF_H * (H > 0 ? W / H : 1), H: REF_H });
-
-// ---- Speed normalization (iPhone 17 Pro Max = baseline device) ----
-// "Fill the screen" means a wider host makes a wider world (height is pinned to
-// REF_H, so extra screen shows up as extra WIDTH). Left alone, a landscape
-// desktop host's world is far bigger than a phone's, and since march/projectile
-// speeds are fixed world-units/sec, its troops crawl — the reported "way too
-// slow for the non-host when the host has a big screen." So we scale every speed
-// by how much bigger this game's world is than the iPhone 17 Pro Max reference
-// world (compared by diagonal, the map's overall linear size): a bigger map
-// marches proportionally faster, keeping travel time roughly constant across
-// devices. On the reference phone the factor is ~1; a landscape desktop is ~1.8.
-// Range is deliberately NOT scaled — it stays a fixed fraction of the play area
-// (see towerRange), which is what keeps a tower's drawn ring matching its hits.
-const REF_DEVICE = { W: 440, H: 956 };   // iPhone 17 Pro Max logical points (portrait)
-const REF_WORLD_DIAG = (() => { const w = worldFromView(REF_DEVICE.W, REF_DEVICE.H); return Math.hypot(w.W, w.H); })();
-// Clamped so a sliver of a viewport can't stall the match, nor an ultrawide make
-// it uncontrollably fast. Raise the upper clamp if very wide screens still drag.
-const speedScale = (g) => Math.max(0.75, Math.min(2.5, Math.hypot(g.W, g.H) / REF_WORLD_DIAG));
+// The play field ALWAYS has the iPhone 17 Pro portrait ratio, at a fixed size,
+// on every device — host and guest alike. So layout, distances, speed and range
+// are identical for everyone; there is no per-device reshaping, and nothing can
+// make one player's map wider (and therefore slower) than another's. Rendering
+// scales this one fixed world uniformly onto each screen (viewFit): a device
+// with this ratio fills the screen, and a differently-shaped one (e.g. a
+// landscape PC) gets letterbox bars on its long axis rather than the world being
+// stretched or reshaped. This replaces the earlier "world follows the device
+// aspect", which let a wide host turn the shared map into a wide strip that left
+// a portrait phone guest's top and bottom thirds empty.
+const WORLD_ASPECT = 1206 / 2622;         // iPhone 17 Pro portrait, width/height (~19.5:9)
+const WORLD = { W: REF_H * WORLD_ASPECT, H: REF_H };
 
 // Camera — tilted pseudo-3D board + zoom. The world stays flat 2D; rendering
 // squashes Y (TILT) and widens nearer rows (PERSP); input inverts the mapping.
@@ -715,7 +708,7 @@ function expectedLosses(g, src, dst, isTeam) {
   const totalDist = dist(src, dst);
   if (totalDist < 1) return 0;
   let losses = 0;
-  const marchSpeed = UNIT_SPEED * momentumMult(g, src.owner) * speedScale(g); // match the live march speed so exposure-time estimates stay accurate
+  const marchSpeed = UNIT_SPEED * momentumMult(g, src.owner);
   for (const d of g.towers) {
     if (isTeam(d.owner)) continue; // only hostile towers threaten this march
     const def = d.defs && d.defs[0];
@@ -1651,15 +1644,16 @@ function TowerConquest() {
   // (already player-relabeled) snapshot. `eliminated` travels as an array —
   // Sets aren't JSON-safe — and is rebuilt into a Set here.
   //
-  // No coordinate rescaling: host and guest both simulate in the same
-  // fixed-scale world (height REF_H, aspect-matched width — see worldFromView),
-  // so the host's coordinates are ALREADY in the guest's world space. The guest
-  // just adopts them and lets its own draw()-time viewFit scale that world onto
-  // its screen (letterboxing if the two screens' aspect ratios differ). This is
-  // what keeps speed and range identical for both players AND makes a tower's
-  // drawn range ring match where its arrows actually land: range is a world-unit
-  // radius scaled by the exact same fit as every position, so they can't drift
-  // apart the way they did when the guest rescaled the host's raw-pixel world.
+  // No coordinate rescaling: host and guest both use the same fixed WORLD (an
+  // iPhone-portrait rectangle, identical on every device), so the host's
+  // coordinates are ALREADY in the guest's world space. The guest just adopts
+  // them and lets its own draw()-time viewFit scale that fixed world onto its
+  // screen (a matching-ratio screen fills it; a differently-shaped one gets
+  // letterbox bars). This keeps speed and range identical for both players AND
+  // makes a tower's drawn range ring match where its arrows actually land: range
+  // is a world-unit radius scaled by the exact same fit as every position, so
+  // they can't drift apart the way they did when the guest rescaled the host's
+  // raw-pixel world.
   const applyGuestSnapshot = useCallback((payload) => {
     const g = payload.g;
     const src = g;
@@ -1914,11 +1908,12 @@ function TowerConquest() {
       gameMode = Math.random() < 0.75 ? "ffa" : "2v2";
       playersResolved = gameMode === "ffa" ? [2, 3, 4][Math.floor(Math.random() * 3)] : players;
     }
-    // Generate and simulate in fixed-scale world coordinates (height REF_H,
-    // aspect-matched width), NOT raw device pixels — so the layout, distances,
-    // speeds and ranges are identical on every device. draw() scales this world
-    // onto the actual canvas.
-    const { W, H } = worldFromView(viewSize().W, viewSize().H);
+    // Generate and simulate in the fixed iPhone-portrait world (WORLD), NOT raw
+    // device pixels and NOT the device's aspect — so the layout, distances,
+    // speeds and ranges are identical on every device and for host and guest
+    // alike. draw() scales this fixed world onto the actual canvas (viewFit),
+    // letterboxing screens whose shape differs from WORLD's.
+    const { W, H } = WORLD;
     const teamMode = gameMode === "2v2";
     const nPlayers = teamMode ? 4 : playersResolved;
     // Team assignment: FFA → everyone their own team; 2v2 → {0,1} vs {2,3}
@@ -2126,10 +2121,10 @@ function TowerConquest() {
     return { x: g.W / 2 + (sx - g.W / 2) / (CAM_ZOOM * p), y: g.H / 2 + dy };
   };
   // Uniform world->device fit for canvas `cw`x`ch`: one scale (no stretch),
-  // world centered, any leftover on the long axis left as letterbox margin.
-  // Host/solo generate the world at the device's own aspect, so f fills the
-  // screen and offX/offY are 0; only an online guest whose screen shape differs
-  // from the host's gets bars.
+  // world centered, any leftover on the long axis left as letterbox margin. The
+  // world is a fixed iPhone-portrait shape (WORLD), so a screen with that ratio
+  // fills fully (offX/offY ~ 0) and a differently-shaped one (e.g. a landscape
+  // PC) gets bars on its long axis — same on host and guest.
   const viewFit = (g, cw, ch) => {
     const f = Math.min(cw / g.W, ch / g.H) || 1;
     return { f, offX: (cw - g.W * f) / 2, offY: (ch - g.H * f) / 2 };
@@ -2138,11 +2133,9 @@ function TowerConquest() {
   // ----- Resize: rescale positions, keep the battle going -----
   useEffect(() => {
     const onResize = () => {
-      const g = gameRef.current;
       const c = canvasRef.current;
       if (!c) return;
       const { W, H } = viewSize();            // real device pixels (canvas buffer)
-      const wv = worldFromView(W, H);          // fixed-scale world dims (height pinned to REF_H)
       const dpr = window.devicePixelRatio || 1;
       c.width = W * dpr; c.height = H * dpr;
       c.style.width = W + "px"; c.style.height = H + "px";
@@ -2157,32 +2150,10 @@ function TowerConquest() {
         oc.style.width = W + "px"; oc.style.height = H + "px";
         oc.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
       }
-      // An online guest never rescales its world here: it adopts the host's
-      // world coordinates verbatim from each snapshot (both sides share REF_H),
-      // and only its own draw()-time fit changes on resize. The canvas-buffer
-      // resize above still runs for it. Host/solo reshape their world to the new
-      // device aspect: height stays REF_H (so sy is 1), width follows the aspect,
-      // so only x is rescaled — nothing about the vertical scale, and therefore
-      // nothing about speed/range, changes when the window resizes.
-      if (g && !(g.net && g.net.role === "guest")) {
-        const sx = wv.W / g.W, sy = wv.H / g.H;
-        if (sx !== 1 || sy !== 1) {
-          for (const t of g.towers) {
-            t.x *= sx; t.y *= sy;
-            if (t.defs) for (const d of t.defs) { d.x *= sx; d.y *= sy; }
-          }
-          for (const u of g.units) { u.x *= sx; u.y *= sy; }
-          for (const a of g.arrows) { a.x *= sx; a.y *= sy; }
-          for (const rg of g.rings) { rg.x *= sx; rg.y *= sy; }
-          for (const sl of g.slashes) { sl.x *= sx; sl.y *= sy; }
-          if (g.pointer) { g.pointer.x *= sx; g.pointer.y *= sy; }
-          for (const s of g.sparks) { s.x *= sx; s.y *= sy; }
-          for (const p of g.puffs) { p.x *= sx; p.y *= sy; }
-          g.W = wv.W; g.H = wv.H;
-          computeCells(g.towers, wv.W, wv.H);
-          buildTerrainTexture(g);
-        }
-      }
+      // The world is a FIXED size/shape (WORLD) now, so resizing never reshapes
+      // it — nothing about the simulation changes here. Only the canvas buffer is
+      // resized above; draw()'s viewFit re-fits the same fixed world to the new
+      // viewport (re-letterboxing as needed) on the very next frame.
     };
     onResize();
     window.addEventListener("resize", onResize);
@@ -3576,7 +3547,7 @@ function TowerConquest() {
             const px = -(t.y - u.y) / d, py = (t.x - u.x) / d;
             tx += px * u.off; ty += py * u.off;
           }
-          const spd = u.frozen ? 0 : u.speed * (u.speedMul || 1) * momentumMult(g, u.owner) * speedScale(g);
+          const spd = u.frozen ? 0 : u.speed * (u.speedMul || 1) * momentumMult(g, u.owner);
           const dd = Math.hypot(tx - u.x, ty - u.y) || 1;
           const wob = Math.sin(g.pulse * 9 + u.phase) * 6 * dt;
           u.x += ((tx - u.x) / dd) * spd * dt + (-(ty - u.y) / dd) * wob;
@@ -3699,7 +3670,7 @@ function TowerConquest() {
           }
           if (tgt && !arrowKilled.has(tgt.uid)) { a.lx = tgt.x; a.ly = tgt.y; }
           const d = Math.hypot(a.lx - a.x, a.ly - a.y) || 1;
-          const v = (a.boulder ? BOULDER_SPEED : ARROW_SPEED) * speedScale(g) * dt;
+          const v = (a.boulder ? BOULDER_SPEED : ARROW_SPEED) * dt;
           a.x += ((a.lx - a.x) / d) * v;
           a.y += ((a.ly - a.y) / d) * v;
           if (d <= v + 4) {
