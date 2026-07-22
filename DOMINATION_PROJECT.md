@@ -100,10 +100,21 @@ Goal: real accounts + matchmaking + live PvP, on top of the existing single-file
      smoothly 0→target, monotonic, new units stay put); live end-to-end smoothness can only be
      eyeballed on real devices, since the test harness throttles background-tab timers and
      can't run the host sim and the guest's 60fps render at full speed at once.
-   - **Possible next lever if still laggy**: the snapshot re-sends static tower `cell` Voronoi
-     polygons every frame (they never change after map-gen) — trimming those to a periodic
-     keyframe would cut payload/bandwidth notably. Not done yet; interpolation was the
-     higher-impact fix for the reported symptom.
+   - **Payload keyframing (this session)**: the snapshot used to re-send the static tower `cell`
+     Voronoi polygons every frame (they never change after map-gen) — by far the heaviest field.
+     Now `remapSnapshotForGuest(g, withCells)` includes them only on a keyframe: the host counts
+     snapshots (`netSnapCount`) and sets `withCells` every `NET_KEYFRAME_EVERY` (15, ~1s) plus the
+     very first (count 0); the other ~93% of snapshots omit `cell`. The guest caches cells by tower
+     id (`guestCellsRef`) from each keyframe and re-attaches them to every cell-less snapshot in
+     `applyGuestSnapshot`, so render / hit-test / terrain still see full geometry. A tower with no
+     cell yet (before the first keyframe, or a dropped one) is left as `[]` so the `cell.length < 3`
+     guards skip it; terrain-build now waits for `haveCells` so its AO borders aren't baked empty.
+     With the payload much smaller, the broadcast rate was raised 10→15/sec (`NET_SNAP_INTERVAL =
+     1/15`), lowering the guest's data-age and — since the guest's tween interval self-corrects to
+     the real arrival gap — its interpolation latency too, at lower net bandwidth than before.
+   - **Possible next lever if still laggy**: client-side prediction for the guest's OWN orders
+     (apply the drag locally on release, reconcile when the host's snapshot confirms) — the biggest
+     remaining win for "my own taps feel delayed," but needs rollback/reconcile. Not done yet.
    - **Known gaps**: hold-to-convert (castle<->tower) isn't networked yet — a no-op for the
      guest, host-only for now. No rematch — "Redeploy"/"Menu" both tear the room down after
      an online match; playing again means re-hosting/re-joining. Guest's hero is auto-assigned

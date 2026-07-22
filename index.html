@@ -108,6 +108,13 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // 0, same as the host. Tower/unit *ids* are untouched — only the `owner`
 // field and other player-indexed slots (teams, momentum, heroes, train,
 // lastCast) swap. Valid for 1v1 only, which is all online supports for now.
+// Host snapshot cadence. Broadcasting more often lowers the age of the guest's
+// freshest data (and, since the guest's tween interval self-corrects to the real
+// arrival gap, tightens its interpolation latency too). 15/sec instead of the old
+// 10/sec is affordable because most snapshots now omit the static `cell` polygons
+// (see remapSnapshotForGuest) — net bandwidth is lower even at the higher rate.
+const NET_SNAP_INTERVAL = 1 / 15;  // seconds between host snapshots
+const NET_KEYFRAME_EVERY = 15;     // re-send static cells every Nth snapshot (~1s)
 function makeRoomCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I — easy to read aloud
   let s = "";
@@ -124,7 +131,7 @@ function remapLastCastForGuest(lastCast) {
   }
   return out;
 }
-function remapSnapshotForGuest(g) {
+function remapSnapshotForGuest(g, withCells) {
   // Strip fields that must never travel over the wire:
   //  - `net` — holds the live Realtime channel (circular, not JSON-safe).
   //  - `terrainTex` — a live <canvas> baked at map-gen time. Not JSON-safe;
@@ -136,9 +143,19 @@ function remapSnapshotForGuest(g) {
   //    paint the host's hover highlight / drag line on the guest. The guest keeps
   //    its OWN copies across snapshots instead (see applyGuestSnapshot).
   const { net, terrainTex, drag, hover, lastTap, ...rest } = g;
+  // Per-tower `cell` (the Voronoi polygon) is static after map-gen and by far the
+  // heaviest field, so it only rides along on keyframe snapshots (withCells). On
+  // the ~90% of snapshots in between it's dropped; the guest re-attaches it from
+  // its own cache (guestCellsRef). Everything else on the tower still travels
+  // every snapshot (troops, owner, level, defs/buff state, flags).
   return {
     ...rest,
-    towers: g.towers.map((t) => ({ ...t, owner: netSwapOwner(t.owner) })),
+    towers: g.towers.map((t) => {
+      const { cell, ...trest } = t;
+      const nt = { ...trest, owner: netSwapOwner(t.owner) };
+      if (withCells) nt.cell = cell;
+      return nt;
+    }),
     units: g.units.map((u) => ({ ...u, owner: netSwapOwner(u.owner) })),
     orders: g.orders.map((o) => ({ ...o, owner: netSwapOwner(o.owner) })),
     arrows: g.arrows.map((a) => ({ ...a, owner: netSwapOwner(a.owner) })),
@@ -1627,6 +1644,15 @@ function TowerConquest() {
   // values below only drive the room modal's own UI.
   const netRef = useRef(null); // { channel, role: "host" | "guest", myPlayerId, code }
   const guestTerrainKeyRef = useRef(null); // "W x H" of the last locally-built terrain texture
+  // Guest-side cache of the static Voronoi `cell` polygons, by tower id. Cells
+  // never change after map-gen, so the host omits them from most snapshots and
+  // re-sends them only on a periodic keyframe (see remapSnapshotForGuest's
+  // `withCells` + the broadcast counter) — they're the single heaviest part of
+  // the payload. The guest caches whatever cells a keyframe carries and
+  // re-attaches them to every cell-less snapshot in between (see
+  // applyGuestSnapshot), so render / hit-test / terrain all still see full
+  // geometry. Reset per match alongside the terrain key.
+  const guestCellsRef = useRef(null); // Map<towerId, cellPolygon> | null
   // Guest-side interpolation buffer (see applyGuestSnapshot + the guest render
   // branch). Snapshots arrive ~10x/sec but the guest renders at 60fps; without
   // this, every soldier teleports in 100ms hops ("laggy, troops come out
@@ -1647,6 +1673,7 @@ function TowerConquest() {
     }
     netRef.current = null;
     guestTerrainKeyRef.current = null; // force a fresh terrain rebuild next match — see applyGuestSnapshot
+    guestCellsRef.current = null;      // drop cached cell polygons — a new match re-keyframes them
     setOnlineStatus("idle");
     setOnlineRoomCode("");
     setOnlineError("");
@@ -1690,16 +1717,33 @@ function TowerConquest() {
       gameRef.current.hover = prev.hover;
       gameRef.current.lastTap = prev.lastTap;
     }
+    // Re-attach the static Voronoi cells. A keyframe snapshot carries them (so we
+    // cache them by tower id); every cell-less snapshot in between gets them back
+    // from that cache. Before the first keyframe lands (or if one is dropped), a
+    // tower may have no cell yet — leave it as [] so the `cell.length < 3` guards
+    // in draw()/regionAt safely skip it instead of dereferencing undefined.
+    if (!guestCellsRef.current) guestCellsRef.current = new Map();
+    const cellCache = guestCellsRef.current;
+    for (const t of gameRef.current.towers) {
+      if (t.cell && t.cell.length >= 3) cellCache.set(t.id, t.cell);
+      else t.cell = cellCache.get(t.id) || [];
+    }
+    const haveCells = gameRef.current.towers.some((t) => t.cell.length >= 3);
     // Keyed on the world size (g.W×g.H, the host's world — same REF_H height on
     // both sides, width = host's aspect). buildTerrainTexture paints at g.W×g.H,
     // so a rebuild is needed only when the host's world dims change (host aspect
     // change), NOT when the guest merely resizes — draw()'s fit handles that.
+    // buildTerrainTexture bakes AO along the cell borders, so it must wait until
+    // we actually have cells (the first keyframe); until then draw() falls back
+    // to its flat fill for a frame or two, then the keyframe triggers the build.
     const terrainKey = Math.round(gameRef.current.W) + "x" + Math.round(gameRef.current.H);
     if (sameSession && prev.terrainTex && guestTerrainKeyRef.current === terrainKey) {
       gameRef.current.terrainTex = prev.terrainTex;
-    } else {
+    } else if (haveCells) {
       guestTerrainKeyRef.current = terrainKey;
       buildTerrainTexture(gameRef.current);
+    } else if (sameSession && prev.terrainTex) {
+      gameRef.current.terrainTex = prev.terrainTex; // no cells this frame — keep current texture
     }
     // Advance the interpolation buffer: this snapshot's positions become the
     // new "to", the old "to" becomes "from", and we record how long the last
@@ -3315,6 +3359,11 @@ function TowerConquest() {
     // rides along with (recomputed every hudTimer tick below, just like the
     // local setHud call already was — reused here rather than duplicated).
     let netBroadcastTimer = 0, lastHudStats = [], lastOutcomeSent = null;
+    // Snapshot counter driving keyframe cadence: every KEYFRAME_EVERY-th snapshot
+    // (and the very first, count 0) carries the static `cell` polygons; the rest
+    // omit them and the guest re-attaches from its cache. ~1s between keyframes at
+    // NET_SNAP_INTERVAL, so a dropped keyframe self-heals within a second.
+    let netSnapCount = 0;
 
     const step = (now) => {
       const g = gameRef.current;
@@ -3883,12 +3932,14 @@ function TowerConquest() {
 
       if (g.net && g.net.role === "host") {
         netBroadcastTimer += dt;
-        if (netBroadcastTimer >= 0.1) {
+        if (netBroadcastTimer >= NET_SNAP_INTERVAL) {
           netBroadcastTimer = 0;
+          const withCells = (netSnapCount % NET_KEYFRAME_EVERY) === 0; // count 0 = first snapshot
+          netSnapCount++;
           g.net.channel.send({
             type: "broadcast", event: "snapshot",
             payload: {
-              g: remapSnapshotForGuest(g),
+              g: remapSnapshotForGuest(g, withCells),
               hud: remapHudForGuest(lastHudStats),
               outcome: lastOutcomeSent === "win" ? "lose" : lastOutcomeSent === "lose" ? "win" : null,
             },
