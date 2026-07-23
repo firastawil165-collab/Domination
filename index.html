@@ -124,11 +124,22 @@ const MAX_CATCHUP_STEPS = 5; // cap sim steps per frame so a stall can't spiral
 // "command frames": every TICKS_PER_CMD_FRAME sim ticks is one command frame, so
 // inputs are exchanged at 10 Hz while the sim still runs at 60 Hz. A frame's
 // inputs take effect at its boundary on BOTH peers, so the two sims stay in
-// perfect step. LOCKSTEP_SEND_LEAD frames are pre-sent at match start to build a
-// small buffer that absorbs network jitter (this is the ~1-frame input delay).
+// perfect step. Sending is paced off EXECUTION (stay LOCKSTEP_SEND_LEAD command
+// frames ahead of the sim), not off the wall clock — so after any freeze
+// (backgrounded tab, app switch) the pipeline self-heals: both peers resume from
+// where they stalled with no permanent send deficit or runaway send lead, either
+// of which would read as permanent input lag. The lead is the ~2-frame input
+// delay that absorbs network jitter.
 const TICKS_PER_CMD_FRAME = 6;
 const CMD_FRAME_INTERVAL = TICKS_PER_CMD_FRAME * FIXED_DT; // 0.1s real time per command frame
 const LOCKSTEP_SEND_LEAD = 2;
+// Online pump limits. The sim banks wall time but clamps the bank: a long freeze
+// RESUMES (pause semantics) rather than fast-forwarding minutes of sim, and a
+// brief hitch catches up within one bank's worth of steps.
+const ONLINE_MAX_STEPS = 30;  // cap sim steps per pump call (0.5s of sim)
+const ONLINE_MAX_BANK = 0.5;  // max banked wall seconds a pump will ever try to burn
+const RESEND_STALL_MS = 1500; // stalled this long waiting on the peer -> ask for a resend
+const LOCKSTEP_HISTORY = 1200; // sent command frames kept for resend (~2 min)
 
 // Deterministic PRNG (mulberry32). For online lockstep both peers seed it from
 // the same match seed and consume the stream in the same order (unit spawn
@@ -202,7 +213,7 @@ function remapHudForGuest(hud) {
 }
 
 // ================= Constants =================
-const APP_VERSION = "0.259"; // bump by 0.001 each update
+const APP_VERSION = "0.260"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -1692,8 +1703,9 @@ function TowerConquest() {
   // Online lockstep state (both peers). `tick` is the local sim tick; command
   // frame = floor(tick / TICKS_PER_CMD_FRAME). `pending` collects local inputs
   // to broadcast on the next send; `localFrames`/`remote` hold each side's inputs
-  // by frame; `sendFrame` is the next frame we'll broadcast, `sendAccum` paces
-  // sending at CMD_FRAME_INTERVAL. Non-null only during an online match.
+  // by frame; `sendFrame` is the next frame we'll broadcast — sending is paced
+  // off execution (stay LOCKSTEP_SEND_LEAD frames ahead of the sim, see
+  // pumpOnline). Non-null only during an online match.
   const lockstepRef = useRef(null);
   // Incoming peer command frames, kept in a ref that exists BEFORE lockstep is
   // initialized. The host starts broadcasting frames the instant it sends
@@ -1735,9 +1747,6 @@ function TowerConquest() {
     lockstepRef.current = {
       tick: 0,
       sendFrame: 0,
-      // Pre-bank a lead so the first frame immediately sends LOCKSTEP_SEND_LEAD
-      // command frames — a small buffer that absorbs jitter (the input delay).
-      sendAccum: LOCKSTEP_SEND_LEAD * CMD_FRAME_INTERVAL,
       pending: [],
       localFrames: new Map(),          // frame -> our own cmds (kept to apply on execution)
       remote: remoteFramesRef.current,  // frame -> peer's cmds; shared with the frame handler
@@ -1745,8 +1754,13 @@ function TowerConquest() {
       lastChkFrame: -1,                // most recent boundary we hashed (rides along on sends)
       lastChkHash: 0,
       desyncFrame: null,               // first frame a mismatch was detected (for the warning)
+      stallSince: null,                // performance.now() when exec first stalled waiting on the peer (null = running)
+      lastResendReq: 0,                // last time we asked the peer to resend missing frames (rate limit)
+      waitWarn: false,                 // "Waiting for opponent" banner currently shown
       started: true,
     };
+    window.__ls = lockstepRef.current; // debug: inspectable from the console
+    window.__g = gameRef.current;
   };
   const enqueueLocalCmd = (cmd) => {
     const ls = lockstepRef.current;
@@ -1806,7 +1820,13 @@ function TowerConquest() {
   // devtools on a phone), so a determinism regression is caught during testing
   // rather than silently ruining the match.
   const recordRemoteFrame = (payload) => {
-    remoteFramesRef.current.set(payload.frame, payload.cmds || []);
+    if (payload.frames) {
+      // Batched form: a resend response carrying a whole block of frames in one
+      // message (see resendFrames). No checksum ride-along on these.
+      for (const f of payload.frames) remoteFramesRef.current.set(f.frame, f.cmds || []);
+    } else {
+      remoteFramesRef.current.set(payload.frame, payload.cmds || []);
+    }
     const ls = lockstepRef.current;
     if (ls && ls.desyncFrame == null && payload.chkFrame >= 0 && ls.checksums.has(payload.chkFrame) &&
         ls.checksums.get(payload.chkFrame) !== payload.chkHash) {
@@ -1814,6 +1834,20 @@ function TowerConquest() {
       console.warn(`[lockstep] DESYNC at frame ${payload.chkFrame}: local=${ls.checksums.get(payload.chkFrame)} remote=${payload.chkHash}`);
       setNetWarn("Online desync — the two games drifted apart. Please rematch.");
     }
+  };
+  // The peer lost some of our frames (its realtime socket dropped and rejoined
+  // while it was suspended in the background) and is stalled waiting for them:
+  // re-broadcast everything we've sent from the requested frame on, batched into
+  // a single message. Served from localFrames, which keeps LOCKSTEP_HISTORY
+  // frames of sent history for exactly this (see the pruning at execution).
+  const resendFrames = (payload) => {
+    const ls = lockstepRef.current, net = netRef.current;
+    if (!ls || !net || !net.channel) return;
+    const frames = [];
+    for (let F = payload.from; F < ls.sendFrame; F++) {
+      if (ls.localFrames.has(F)) frames.push({ frame: F, cmds: ls.localFrames.get(F) });
+    }
+    if (frames.length) net.channel.send({ type: "broadcast", event: "frame", payload: { frames } });
   };
 
   // Guest side: load the host's one-time match-start (shared seed + full initial
@@ -1855,6 +1889,7 @@ function TowerConquest() {
       // it at that frame's boundary (see the game loop). Also carries a state hash
       // for desync detection.
       .on("broadcast", { event: "frame" }, ({ payload }) => recordRemoteFrame(payload))
+      .on("broadcast", { event: "resend" }, ({ payload }) => resendFrames(payload))
       .on("presence", { event: "sync" }, () => {
         const count = Object.keys(channel.presenceState()).length;
         setOnlineStatus((s) => (s === "starting" || s === "playing" ? s : (count >= 2 ? "ready" : "waiting")));
@@ -1889,6 +1924,7 @@ function TowerConquest() {
       // them so nothing is lost; see remoteFramesRef.)
       .on("broadcast", { event: "match-start" }, ({ payload }) => applyMatchStart(payload))
       .on("broadcast", { event: "frame" }, ({ payload }) => recordRemoteFrame(payload))
+      .on("broadcast", { event: "resend" }, ({ payload }) => resendFrames(payload))
       .on("presence", { event: "sync" }, () => {
         const count = Object.keys(channel.presenceState()).length;
         setOnlineStatus((s) => (s === "starting" || s === "playing" ? s : (count >= 2 ? "ready" : "waiting")));
@@ -3441,24 +3477,16 @@ function TowerConquest() {
     // win/lose SFX + outcome screen so they fire exactly once.
     let lastHudStats = [], lastOutcomeSent = null;
 
-    const step = (now) => {
-      const g = gameRef.current;
-      // Real elapsed wall-clock time this animation frame. Drives presentation
-      // and network cadence (hud tick, lockstep send pacing) — NOT the sim, which
-      // advances in fixed FIXED_DT steps below so it's framerate-independent and
-      // identical on two clients (see the drivers after runSimTick).
-      const frameDt = Math.min(0.05, (now - last) / 1000);
-      last = now;
-      if (!g) return;
-
-      // ----- One fixed-timestep sim tick -----
-      // The entire sim body lives in this closure so BOTH drivers below advance
-      // the sim identically, one FIXED_DT step at a time: the solo accumulator
-      // (free-running) and the online lockstep executor (gated on exchanged
-      // inputs at command-frame boundaries). Same dt every step ⇒ the sim is
-      // framerate-independent and, given the same seed + inputs, bit-identical on
-      // two clients. (Body kept at its original indentation to minimize the diff.)
-      const runSimTick = (dt) => {
+    // ----- One fixed-timestep sim tick -----
+    // The entire sim body lives here so BOTH drivers below advance the sim
+    // identically, one FIXED_DT step at a time: the solo accumulator (free-
+    // running, in the rAF step) and the online lockstep pump (gated on exchanged
+    // inputs at command-frame boundaries; driven by the rAF step while visible
+    // and by the background worker while the tab/app is hidden). Same dt every
+    // step ⇒ the sim is framerate-independent and, given the same seed + inputs,
+    // bit-identical on two clients. (Body kept at its original indentation to
+    // minimize the diff.)
+    const runSimTick = (g, dt) => {
         g.pulse += dt;
         // Battle heat decays continuously; feeds the ambient battle bed below.
         if (g.battleHeat > 0) g.battleHeat = Math.max(0, g.battleHeat - BATTLE_HEAT_DECAY * dt);
@@ -3958,60 +3986,108 @@ function TowerConquest() {
           g.slashes[i].life += dt;
           if (g.slashes[i].life >= g.slashes[i].dur) g.slashes.splice(i, 1);
         }
-      }; // end runSimTick
+    }; // end runSimTick
+
+    // ----- Online lockstep pump -----
+    // Broadcast one command frame of buffered local inputs. Sending is paced off
+    // EXECUTION (see pumpOnline): we keep our sent frames LOCKSTEP_SEND_LEAD
+    // ahead of the frame the sim is about to execute, instead of ticking sends
+    // off the wall clock. That makes the pipeline self-healing across a freeze
+    // (backgrounded tab/app): a wall-clock sender either races unboundedly ahead
+    // of a stalled sim (the opponent's side) or falls permanently behind after
+    // waking up (the hidden side) — both of which used to read as permanent lag
+    // after an app switch. Exec-paced, both peers simply resume in step.
+    const sendOneFrame = (g, ls) => {
+      const cmds = ls.pending;
+      ls.pending = [];
+      ls.localFrames.set(ls.sendFrame, cmds);
+      g.net.channel.send({
+        type: "broadcast", event: "frame",
+        payload: { frame: ls.sendFrame, cmds, chkFrame: ls.lastChkFrame, chkHash: ls.lastChkHash },
+      });
+      ls.sendFrame++;
+    };
+    // Advance the online sim by up to `wallDt` seconds: send our inputs, then
+    // execute tick-by-tick at 60 Hz, waiting at every command-frame boundary
+    // until BOTH peers' inputs for that frame are in hand. If the remote packet
+    // hasn't arrived we stall (render the last state) rather than guess — that's
+    // what keeps the two sims identical. The wall-time bank is CLAMPED: time
+    // spent frozen or stalled is dropped, so a long absence resumes cleanly at
+    // 1x instead of fast-forwarding a burst of banked sim time. Called from the
+    // rAF step while visible and from the background worker while hidden.
+    const pumpOnline = (g, ls, wallDt) => {
+      if (g.over) { simAccum = 0; return; }
+      simAccum = Math.min(simAccum + wallDt, ONLINE_MAX_BANK);
+      let simSteps = 0;
+      while (simAccum >= FIXED_DT && simSteps < ONLINE_MAX_STEPS) {
+        if (g.over) break;
+        if (ls.tick % TICKS_PER_CMD_FRAME === 0) {
+          const F = ls.tick / TICKS_PER_CMD_FRAME;
+          // Exec-paced send: make sure the peer has our inputs through F + lead
+          // before we execute F. Only the first send of a burst carries pending
+          // inputs; the rest are empty frames.
+          while (ls.sendFrame <= F + LOCKSTEP_SEND_LEAD) sendOneFrame(g, ls);
+          if (!ls.remote.has(F)) {
+            // Stall: waiting on the peer's input. Don't bank the wait (pause
+            // semantics), and if it drags on, ask the peer to resend — its
+            // frames may have been lost while our socket reconnected after a
+            // background suspension.
+            simAccum = Math.min(simAccum, FIXED_DT);
+            const nowMs = performance.now();
+            if (ls.stallSince == null) ls.stallSince = nowMs;
+            if (nowMs - ls.stallSince > RESEND_STALL_MS && nowMs - ls.lastResendReq > RESEND_STALL_MS) {
+              ls.lastResendReq = nowMs;
+              g.net.channel.send({ type: "broadcast", event: "resend", payload: { from: F } });
+            }
+            // Long stall (peer's app fully suspended — nothing to do but wait):
+            // say so on screen instead of looking frozen. Never clobbers the
+            // sticky desync warning.
+            if (nowMs - ls.stallSince > 3000 && !ls.waitWarn && ls.desyncFrame == null) {
+              ls.waitWarn = true;
+              setNetWarn("Waiting for opponent…");
+            }
+            break;
+          }
+          if (ls.stallSince != null) {
+            ls.stallSince = null;
+            if (ls.waitWarn) {
+              ls.waitWarn = false;
+              setNetWarn((w) => (w === "Waiting for opponent…" ? null : w));
+            }
+          }
+          // Hash the state at this boundary (before applying F's inputs) so
+          // both peers hash the exact same pre-input state; it rides along on
+          // our next sends for the peer to compare (desync detection).
+          const chk = lockstepChecksum(g);
+          ls.checksums.set(F, chk);
+          ls.lastChkFrame = F;
+          ls.lastChkHash = chk;
+          if (ls.checksums.size > 128) ls.checksums.delete(F - 128);
+          applyFrameCmds(g, ls, F);
+          // Keep our sent frames around for a while (resend history), prune old.
+          ls.localFrames.delete(F - LOCKSTEP_HISTORY);
+          ls.remote.delete(F);
+        }
+        simAccum -= FIXED_DT;
+        simSteps++;
+        ls.tick++;
+        runSimTick(g, FIXED_DT);
+      }
+    };
+
+    const step = (now) => {
+      const g = gameRef.current;
+      // Real elapsed wall-clock time this animation frame. `wallDt` is uncapped
+      // (the online pump clamps its own bank); `frameDt` is capped for
+      // presentation and the solo sim so a hitch can't spiral.
+      const wallDt = (now - last) / 1000;
+      const frameDt = Math.min(0.05, wallDt);
+      last = now;
+      if (!g) return;
 
       const ls = g.net ? lockstepRef.current : null;
       if (ls && ls.started) {
-        // ----- Online lockstep driver -----
-        // (1) Send: broadcast our buffered inputs, one command frame per interval,
-        // always running ahead of execution by the pre-banked lead so the peer has
-        // our inputs before it needs them.
-        ls.sendAccum += frameDt;
-        while (ls.sendAccum >= CMD_FRAME_INTERVAL) {
-          ls.sendAccum -= CMD_FRAME_INTERVAL;
-          const cmds = ls.pending;
-          ls.pending = [];
-          ls.localFrames.set(ls.sendFrame, cmds);
-          g.net.channel.send({
-            type: "broadcast", event: "frame",
-            payload: { frame: ls.sendFrame, cmds, chkFrame: ls.lastChkFrame, chkHash: ls.lastChkHash },
-          });
-          ls.sendFrame++;
-        }
-        // (2) Execute: advance the sim tick-by-tick at 60 Hz, but at every
-        // command-frame boundary wait until BOTH peers' inputs for that frame are
-        // in hand, then apply them. If the remote packet hasn't arrived yet we
-        // stall (render the last state) rather than guess — that's what keeps the
-        // two sims identical. MAX_CATCHUP_STEPS caps a post-stall catch-up burst.
-        if (!g.over) {
-          simAccum += frameDt;
-          let simSteps = 0;
-          while (simAccum >= FIXED_DT && simSteps < MAX_CATCHUP_STEPS) {
-            if (g.over) break;
-            if (ls.tick % TICKS_PER_CMD_FRAME === 0) {
-              const F = ls.tick / TICKS_PER_CMD_FRAME;
-              if (!(ls.localFrames.has(F) && ls.remote.has(F))) break; // stall: waiting on input
-              // Hash the state at this boundary (before applying F's inputs) so
-              // both peers hash the exact same pre-input state; it rides along on
-              // our next sends for the peer to compare (desync detection).
-              const chk = lockstepChecksum(g);
-              ls.checksums.set(F, chk);
-              ls.lastChkFrame = F;
-              ls.lastChkHash = chk;
-              if (ls.checksums.size > 128) ls.checksums.delete(F - 128);
-              applyFrameCmds(g, ls, F);
-              ls.localFrames.delete(F);
-              ls.remote.delete(F);
-            }
-            simAccum -= FIXED_DT;
-            simSteps++;
-            ls.tick++;
-            runSimTick(FIXED_DT);
-          }
-          if (simSteps >= MAX_CATCHUP_STEPS) simAccum = 0;
-        } else {
-          simAccum = 0;
-        }
+        pumpOnline(g, ls, wallDt);
       } else {
         // ----- Solo driver -----
         // Free-running fixed-step accumulator: run as many whole FIXED_DT steps as
@@ -4026,7 +4102,7 @@ function TowerConquest() {
             if (g.over) break;
             simAccum -= FIXED_DT;
             simSteps++;
-            runSimTick(FIXED_DT);
+            runSimTick(g, FIXED_DT);
           }
           if (simSteps >= MAX_CATCHUP_STEPS) simAccum = 0;
         }
@@ -4070,7 +4146,38 @@ function TowerConquest() {
       raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
-    return () => { cancelAnimationFrame(raf); SoundEngine.stopBattle(); };
+
+    // ----- Background pump (online only) -----
+    // rAF stops entirely while the tab/app is hidden, and main-thread timers get
+    // throttled to a crawl — but dedicated Worker timers keep ticking. A tiny
+    // inline worker posts every 100ms; while hidden, its ticks drive the online
+    // pump (no drawing) so the sim keeps running and our command frames keep
+    // flowing — the visible opponent never stalls just because we switched apps.
+    // While visible the rAF step drives the pump and worker ticks are ignored.
+    // (A fully suspended app — phone lock, iOS app switch — can't run anything;
+    // that case falls back to the stall + resume + resend path in pumpOnline.)
+    let worker = null, workerUrl = null;
+    try {
+      workerUrl = URL.createObjectURL(new Blob(["setInterval(() => postMessage(0), 100);"], { type: "text/javascript" }));
+      worker = new Worker(workerUrl);
+      worker.onmessage = () => {
+        if (!document.hidden) return; // rAF is driving
+        const g = gameRef.current;
+        const ls = g && g.net ? lockstepRef.current : null;
+        if (!ls || !ls.started) return;
+        const now = performance.now();
+        const wallDt = (now - last) / 1000;
+        last = now;
+        pumpOnline(g, ls, wallDt);
+      };
+    } catch (e) { /* blob workers unavailable (strict CSP) — background pumping is best-effort */ }
+
+    return () => {
+      cancelAnimationFrame(raf);
+      if (worker) worker.terminate();
+      if (workerUrl) URL.revokeObjectURL(workerUrl);
+      SoundEngine.stopBattle();
+    };
   }, [screen]);
 
   // ================= Rendering =================

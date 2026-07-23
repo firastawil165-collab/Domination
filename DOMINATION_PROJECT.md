@@ -75,6 +75,33 @@ lockstep: both peers simulate identically from a shared start and exchange only 
 - **Not yet networked**: hold-to-convert (still solo-only). AI-vs-AI online (random-vs-random)
   would need AI to run deterministically on both peers.
 
+**Phase 5 (done): background/app-switch resilience.** Backgrounding the tab/app used to
+permanently lag both peers: rAF stops when hidden, so the hidden peer stopped sending
+(stalling the opponent), and because sending was paced off the wall clock, the deficit never
+healed after returning (the opponent's `sendFrame` had also raced unboundedly ahead of its
+stalled sim, delaying all post-resume inputs by the gap). Fixes, all in `pumpOnline`:
+- **Exec-paced sending** — `sendFrame` stays exactly `LOCKSTEP_SEND_LEAD` command frames
+  ahead of the frame the sim is about to execute (sent at the boundary, right before the
+  input-wait check), instead of ticking off wall time. After any freeze both peers simply
+  resume in step; there is no send deficit or runaway lead to recover from, and at most
+  ~lead frames are ever in flight.
+- **Background worker pump** — a tiny inline blob Worker posts every 100ms (worker timers
+  aren't throttled while hidden, unlike rAF/main-thread timers); while `document.hidden`
+  its ticks drive `pumpOnline` (sim + sends, no drawing), so the game genuinely keeps
+  running during a tab switch and the visible opponent never stalls. While visible, the rAF
+  step drives the pump and worker ticks are ignored.
+- **Pause semantics** — the sim's wall-time bank is clamped (`ONLINE_MAX_BANK`, and to one
+  tick while input-stalled), so a full suspension (phone lock / iOS app switch, where
+  nothing can run) resumes cleanly at 1x rather than fast-forwarding banked time.
+- **Resend protocol** — if a peer's realtime socket dropped and rejoined while suspended,
+  broadcasts sent in the gap are gone (Supabase broadcast has no replay). A peer stalled
+  longer than `RESEND_STALL_MS` broadcasts `resend {from}`; the other replies with one
+  batched `frame {frames:[...]}` message served from its sent history (`localFrames`, now
+  pruned after `LOCKSTEP_HISTORY`=1200 frames instead of deleted at execution).
+- **"Waiting for opponent…" banner** — a stall >3s shows a non-sticky `netWarn` (cleared on
+  unstall; never clobbers the sticky desync warning) so a fully-suspended opponent reads as
+  waiting, not frozen.
+
 **History (host-authoritative snapshot model, v0.255–v0.26x, now replaced):**
 3. **Phase 3 (done, v0.255): live gameplay sync.** Host-authoritative, as planned — the host
    runs the real simulation completely unchanged (`startGame(2, "ffa")`, same as vs-AI) and
