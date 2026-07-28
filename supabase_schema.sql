@@ -134,3 +134,120 @@ drop policy if exists "host can update own match" on public.matches;
 create policy "host can update own match"
   on public.matches for update
   using (auth.uid() = host_id);
+
+
+-- ============ server-owned match timeline (v0.261) ============
+-- The fix for "a player leaves and the game freezes."
+--
+-- Online play runs a deterministic simulation on BOTH clients (Supabase has
+-- nowhere to run a 60Hz game loop), but the two clients used to be each other's
+-- clock: neither could advance a command frame until the other's inputs for it
+-- arrived, so one player backgrounding the app froze the match for the player
+-- still looking at it. What lives here is the missing third party — a timeline
+-- that belongs to the server:
+--
+--   * `started_at` is a Postgres timestamp, and command frame F is defined to
+--     execute at started_at + F * 100ms. That makes "what frame is the match on"
+--     a question about real time rather than about who still has the app open,
+--     so a match keeps aging while both players are away and whoever comes back
+--     finds the troops that regenerated meanwhile.
+--   * clients wait on a DEADLINE, not on each other. Past it a frame is sealed
+--     with the absent player's input empty and play continues without them.
+--   * `match_snapshots` is what a returning player re-anchors to when nobody is
+--     live to hand them state — and what lets a match survive both players
+--     closing the app entirely.
+--
+-- Access is deliberately open (see the policies): online play is a private room
+-- reached by a 5-character code, with no sign-in, exactly as it works today. The
+-- room code is the only secret, and a client that can already run the whole
+-- simulation locally gains nothing from writing to these rows that it couldn't
+-- do over the Realtime channel anyway. Tighten this if online ever grows a
+-- ranked/public mode, where a forged snapshot would actually be worth something.
+
+create table if not exists public.online_matches (
+  id uuid primary key default gen_random_uuid(),
+  room_code text not null,
+  seed bigint not null,
+  -- THE anchor. Every frame deadline on every device is measured from this.
+  started_at timestamptz not null default now(),
+  ended_at timestamptz,
+  outcome text check (outcome in ('host', 'guest')), -- who won, in canonical labeling
+  -- Full initial state, canonical (host) labeling, including the per-tower
+  -- Voronoi `cell` polygons. Those are static after map generation and are the
+  -- heaviest thing in the state by far, so they travel exactly once — here — and
+  -- every later snapshot omits them. A player rejoining after force-quitting the
+  -- app rebuilds the whole board's geometry from this row.
+  initial_state jsonb not null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists online_matches_room_code_idx
+  on public.online_matches (room_code, started_at desc);
+
+alter table public.online_matches enable row level security;
+
+drop policy if exists "online matches are publicly readable" on public.online_matches;
+create policy "online matches are publicly readable"
+  on public.online_matches for select using (true);
+
+drop policy if exists "anyone can open an online match" on public.online_matches;
+create policy "anyone can open an online match"
+  on public.online_matches for insert with check (true);
+
+drop policy if exists "anyone can close an online match" on public.online_matches;
+create policy "anyone can close an online match"
+  on public.online_matches for update using (true);
+
+grant select, insert, update on public.online_matches to anon, authenticated;
+
+
+-- One row per match: the most recent state either player persisted. Kept as a
+-- single upserted row rather than a history — nothing needs the past, only the
+-- latest point to resume from.
+create table if not exists public.match_snapshots (
+  match_id uuid primary key references public.online_matches(id) on delete cascade,
+  frame int not null,          -- command frame this state is AT
+  state jsonb not null,        -- canonical labeling, no cells (see initial_state)
+  updated_at timestamptz not null default now()
+);
+
+alter table public.match_snapshots enable row level security;
+
+drop policy if exists "snapshots are publicly readable" on public.match_snapshots;
+create policy "snapshots are publicly readable"
+  on public.match_snapshots for select using (true);
+
+-- Read-only to clients: writes go exclusively through save_match_snapshot below,
+-- which enforces that a newer frame can't be clobbered by an older one.
+grant select on public.match_snapshots to anon, authenticated;
+
+
+-- Snapshot writes must be conditional: both players persist, and a client that
+-- is still fast-forwarding through a gap holds an OLD state that must never
+-- overwrite a current one. PostgREST's upsert can't put a WHERE on the conflict
+-- branch, so the write goes through here instead, and the newer frame always
+-- wins. security definer so the open policies above don't need an insert/update
+-- policy on the table at all — this function is the only way in.
+create or replace function public.save_match_snapshot(p_match uuid, p_frame int, p_state jsonb)
+returns void as $$
+  insert into public.match_snapshots (match_id, frame, state, updated_at)
+  values (p_match, p_frame, p_state, now())
+  on conflict (match_id) do update
+    set frame = excluded.frame,
+        state = excluded.state,
+        updated_at = now()
+    where public.match_snapshots.frame < excluded.frame;
+$$ language sql security definer set search_path = public;
+
+grant execute on function public.save_match_snapshot(uuid, int, jsonb) to anon, authenticated;
+
+
+-- The reference clock. Clients probe this a few times, keep the sample with the
+-- fastest round-trip, and measure every frame deadline against it — so both
+-- devices agree what time the match is on regardless of their own clocks.
+create or replace function public.server_now()
+returns timestamptz as $$
+  select now();
+$$ language sql stable;
+
+grant execute on function public.server_now() to anon, authenticated;

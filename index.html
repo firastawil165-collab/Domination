@@ -102,10 +102,37 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // guest renders behind), whose snapshot age + interpolation delay + input
 // round-trip made the guest feel laggy no matter how the payload was tuned.
 //
+// ---- The timeline belongs to the server (v0.261) ----
+// Lockstep as originally written made the two peers each other's clock: a frame
+// could not execute until the OTHER side's inputs for it arrived, so an opponent
+// who backgrounded the app froze the match for the player still staring at it.
+// That wait is now a DEADLINE instead of a block, and the deadline is set by
+// Postgres, not by either player:
+//
+//   * `online_matches.started_at` is a server timestamp, and command frame F
+//     executes at started_at + F * CMD_FRAME_MS. Both peers estimate that clock
+//     through NetClock. So the match has a position in time that exists whether
+//     or not anybody's app is running — close the game for five minutes, reopen
+//     it, and the battle is five minutes older, with the troops to show for it.
+//   * A frame is SEALED PEER_AWAY_MS past its scheduled time. Whatever inputs
+//     arrived are in; the absent player's are empty. Nobody ever freezes waiting.
+//     An away player just stops giving orders — their buildings keep regenerating
+//     and stay perfectly capturable, which is the point.
+//   * Nobody guesses a window they slept through. A peer that was suspended, or
+//     that finds evidence of drift, RE-ANCHORS: it takes a state snapshot from
+//     the live peer (or from Postgres if nobody is live) and resumes from that
+//     frame. Divergence is therefore self-healing rather than fatal, which is why
+//     the old sticky "desync — please rematch" banner is gone.
+//   * Whoever is running persists a snapshot every SNAPSHOT_INTERVAL_MS, so the
+//     match survives both players leaving, and survives an app restart.
+//
+// The sim itself still runs on the clients — Supabase has no place to run a game
+// loop — but no client owns the clock, which is the part that was hurting.
+//
 // Every "owner === 0" check throughout the render/input/specials code assumes the
 // LOCAL player is player 0 — dozens of call sites. Rather than thread a dynamic
 // "my player id" through all of them, each peer relabels 0<->1 so it sees ITSELF
-// as player 0 (the guest's initial state is owner-swapped via remapSnapshotForGuest;
+// as player 0 (the guest swaps canonical state on the way in, see serializeState;
 // the host is already 0). That makes the two states mirror images, so lockstep
 // commands apply in a canonical order and AI is disabled online — see the game
 // loop and applyFrameCmds. Tower/unit *ids* are untouched. 1v1 only for now.
@@ -132,14 +159,40 @@ const MAX_CATCHUP_STEPS = 5; // cap sim steps per frame so a stall can't spiral
 // delay that absorbs network jitter.
 const TICKS_PER_CMD_FRAME = 6;
 const CMD_FRAME_INTERVAL = TICKS_PER_CMD_FRAME * FIXED_DT; // 0.1s real time per command frame
-const LOCKSTEP_SEND_LEAD = 2;
-// Online pump limits. The sim banks wall time but clamps the bank: a long freeze
-// RESUMES (pause semantics) rather than fast-forwarding minutes of sim, and a
-// brief hitch catches up within one bank's worth of steps.
-const ONLINE_MAX_STEPS = 30;  // cap sim steps per pump call (0.5s of sim)
-const ONLINE_MAX_BANK = 0.5;  // max banked wall seconds a pump will ever try to burn
-const RESEND_STALL_MS = 1500; // stalled this long waiting on the peer -> ask for a resend
+const CMD_FRAME_MS = CMD_FRAME_INTERVAL * 1000;            // same, in ms (the clock works in ms)
+// How far ahead of the authoritative frame we stamp our own inputs. This is the
+// input delay, and it's also the budget for a packet to cross the network before
+// its frame's deadline — raised from 2 to 4 (200ms -> 400ms) now that a frame is
+// SEALED at its deadline rather than waited on forever: a packet that misses its
+// frame costs a resync, so give it room. Supabase Realtime round-trips well
+// inside 400ms in practice.
+const LOCKSTEP_SEND_LEAD = 4;
+// ---- Server-owned timeline (v0.261) ----
+// The match's frame clock is anchored to the Postgres timestamp in
+// `online_matches.started_at`: command frame F executes at
+// started_at + F * CMD_FRAME_MS on the SERVER clock, which both peers estimate
+// via NetClock. Nobody "hosts" the timeline — it advances on its own, so a match
+// keeps aging while an app is backgrounded, suspended, or closed outright, and a
+// returning player finds the troops that regenerated in their absence.
+const ONLINE_MAX_STEPS = 30;   // sim ticks per pump call at normal pace (0.5s of sim)
+const CATCHUP_MAX_TICKS = 900; // sim ticks per pump call while fast-forwarding (15s of sim)
+const CATCHUP_FRAMES = 20;     // this far behind the authoritative frame -> "catching up" (burst + overlay)
+// A frame is SEALED — executed with whatever inputs are in hand — this long after
+// its scheduled time. Past the deadline the peer is treated as away and their
+// input for that frame is empty. This is what replaced the old "wait forever"
+// stall: the battle never freezes because someone closed the app.
+const PEER_AWAY_MS = 2000;
+// Our own sim going this long without a pump means we were suspended (phone lock,
+// iOS app switch, tab discarded). We can't trust anything we'd simulate through
+// that gap — the peer may have kept playing and their inputs are gone — so we
+// re-anchor to a snapshot instead of guessing.
+const SELF_STALE_MS = 2500;
+const RESEND_STALL_MS = 700;   // waiting this long on a frame -> nudge the peer to resend
 const LOCKSTEP_HISTORY = 1200; // sent command frames kept for resend (~2 min)
+const SNAPSHOT_INTERVAL_MS = 5000; // how often a running peer persists state to Postgres
+const RESYNC_TIMEOUT_MS = 3500;    // no live peer answered our snapshot request -> fall back to the DB
+const CLOCK_SYNC_SAMPLES = 3;      // server-clock probes per sync (best round-trip wins)
+const CLOCK_RESYNC_MS = 60000;     // re-probe the server clock this often during a match
 
 // Deterministic PRNG (mulberry32). For online lockstep both peers seed it from
 // the same match seed and consume the stream in the same order (unit spawn
@@ -148,12 +201,25 @@ const LOCKSTEP_HISTORY = 1200; // sent command frames kept for resend (~2 min)
 // matters when two clients must agree. Returns floats in [0,1).
 function makeRng(seed) {
   let a = seed >>> 0;
-  return function () {
+  const rng = function () {
     a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
+  // The generator's whole state is this one 32-bit word, so it can ride along in
+  // a snapshot. A peer re-anchoring mid-match has to resume the shared stream
+  // exactly where the running peer left it — rebuilding from the seed would
+  // rewind to position 0 and every later draw (spawn sway, cast rolls) would
+  // diverge, which is precisely the drift lockstep exists to prevent.
+  rng.state = () => a >>> 0;
+  rng.seek = (v) => { a = v | 0; };
+  return rng;
+}
+function makeRngAt(seed, state) {
+  const rng = makeRng(seed);
+  if (state != null) rng.seek(state);
+  return rng;
 }
 function makeRoomCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I — easy to read aloud
@@ -161,8 +227,97 @@ function makeRoomCode() {
   for (let i = 0; i < 5; i++) s += chars[Math.floor(Math.random() * chars.length)];
   return s;
 }
+// ---- Server clock ----
+// The whole no-freeze design rests on both peers agreeing what time it is, so the
+// match timeline can belong to the server instead of to whichever player happens
+// to still have the app open. Postgres is the reference clock: `server_now()` is
+// probed a few times and the sample with the fastest round-trip wins (its
+// one-way error is bounded by rtt/2, so the quickest probe is the most accurate).
+// A few tens of ms of residual error is harmless — frame NUMBERS decide what
+// executes, and the clock only decides when.
+const NetClock = {
+  offset: 0,        // serverNow - Date.now()
+  synced: false,
+  rtt: Infinity,
+  lastSync: 0,
+  async sync() {
+    let best = null;
+    for (let i = 0; i < CLOCK_SYNC_SAMPLES; i++) {
+      const t0 = Date.now();
+      const { data, error } = await sb.rpc("server_now");
+      const t1 = Date.now();
+      if (error || !data) continue;
+      const rtt = t1 - t0;
+      // Server timestamp corresponds to a moment ~rtt/2 after we sent the probe.
+      const offset = Date.parse(data) + rtt / 2 - t1;
+      if (!best || rtt < best.rtt) best = { rtt, offset };
+    }
+    if (!best) return false;
+    this.offset = best.offset;
+    this.rtt = best.rtt;
+    this.synced = true;
+    this.lastSync = Date.now();
+    return true;
+  },
+  now() { return Date.now() + this.offset; },
+};
+
+// ---- Match persistence (Supabase) ----
+// A match row is what makes the timeline server-owned: `started_at` is a Postgres
+// timestamp, so frame numbers are a pure function of real time and nobody's local
+// clock or app lifecycle gets a vote. The row also carries the initial state
+// (with the Voronoi cells and the map geometry), which is what lets a player who
+// force-quit and reopened the app rebuild the board from scratch.
+async function createMatchRow(roomCode, seed, initialState) {
+  const { data, error } = await sb
+    .from("online_matches")
+    .insert({ room_code: roomCode, seed, initial_state: initialState })
+    .select("id, started_at")
+    .single();
+  if (error) throw error;
+  return { matchId: data.id, startedAtMs: Date.parse(data.started_at) };
+}
+async function fetchMatchRow(matchId) {
+  const { data, error } = await sb
+    .from("online_matches")
+    .select("id, room_code, seed, started_at, ended_at, outcome, initial_state")
+    .eq("id", matchId)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+// Upserted through an RPC rather than a plain PostgREST upsert because the write
+// must be conditional: two peers both persist, and an older frame from a peer
+// that is catching up must never clobber a newer one (PostgREST can't express a
+// WHERE on the conflict branch).
+async function saveSnapshot(matchId, frame, state) {
+  const { error } = await sb.rpc("save_match_snapshot", { p_match: matchId, p_frame: frame, p_state: state });
+  if (error) throw error;
+}
+async function fetchSnapshot(matchId) {
+  const { data, error } = await sb
+    .from("match_snapshots").select("frame, state").eq("match_id", matchId).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+async function endMatchRow(matchId, outcome) {
+  await sb.from("online_matches").update({ ended_at: new Date().toISOString(), outcome }).eq("id", matchId).is("ended_at", null);
+}
+// The one thing kept on the device: enough to find your way back into a match
+// after a full app restart. Everything else is refetched from the server.
+const RESUME_KEY = "domination.activeMatch";
+function rememberActiveMatch(info) {
+  try { localStorage.setItem(RESUME_KEY, JSON.stringify(info)); } catch (e) { /* private mode */ }
+}
+function readActiveMatch() {
+  try { return JSON.parse(localStorage.getItem(RESUME_KEY) || "null"); } catch (e) { return null; }
+}
+function forgetActiveMatch() {
+  try { localStorage.removeItem(RESUME_KEY); } catch (e) { /* private mode */ }
+}
+
 function netSwapOwner(o) { return o === 0 ? 1 : o === 1 ? 0 : o; } // NEUTRAL (-1) passes through
-function remapLastCastForGuest(lastCast) {
+function netSwapLastCast(lastCast) {
   const out = {};
   for (const key in lastCast) {
     const idx = key.indexOf("_");
@@ -171,41 +326,103 @@ function remapLastCastForGuest(lastCast) {
   }
   return out;
 }
-function remapSnapshotForGuest(g, withCells) {
+// Serialize the live sim into a wire/DB state blob.
+//
+// Everything that leaves this device — match-start, a resync snapshot, a row in
+// Postgres — is written in ONE canonical labeling: the host's, where player 0 is
+// the host. Locally each peer relabels itself as player 0 (see the design note at
+// the top of this section), so the guest passes `swap: true` on the way out and
+// again on the way in. The swap is its own inverse, so the same function serves
+// both directions. Canonical-on-the-wire is what lets EITHER peer be the one that
+// hands out a snapshot — which matters now that the surviving player, host or
+// guest, is the one who re-anchors whoever comes back.
+//
+//  - `withCells` — the per-tower Voronoi polygon, static after map-gen and by far
+//    the heaviest field. Rides along only on the initial state (stored once on
+//    the match row); resync snapshots omit it and the receiver re-attaches its own
+//    cached copy, or pulls the match row if it has none (fresh app start).
+//  - `light` — drops the purely cosmetic particle arrays. They decay on their own
+//    and never feed back into the sim, so a peer adopting a snapshot without them
+//    loses nothing but a few sparks already on screen.
+function serializeState(g, { swap = false, withCells = false, light = false } = {}) {
   // Strip fields that must never travel over the wire:
   //  - `net` — holds the live Realtime channel (circular, not JSON-safe).
   //  - `terrainTex` — a live <canvas> baked at map-gen time. Not JSON-safe;
   //    left in it arrives as `{}`, and draw()'s `ctx.drawImage(g.terrainTex,…)`
-  //    (the first thing it draws each frame) throws, blanking the guest's whole
-  //    canvas. The guest rebuilds its own copy locally (see applyGuestSnapshot).
-  //  - `drag` / `hover` / `lastTap` — the HOST's own transient pointer state.
-  //    These belong to whoever is looking at the screen; broadcasting them would
-  //    paint the host's hover highlight / drag line on the guest. The guest keeps
-  //    its OWN copies across snapshots instead (see applyGuestSnapshot).
-  const { net, terrainTex, drag, hover, lastTap, ...rest } = g;
-  // Per-tower `cell` (the Voronoi polygon) is static after map-gen and by far the
-  // heaviest field, so it only rides along on keyframe snapshots (withCells). On
-  // the ~90% of snapshots in between it's dropped; the guest re-attaches it from
-  // its own cache (guestCellsRef). Everything else on the tower still travels
-  // every snapshot (troops, owner, level, defs/buff state, flags).
-  return {
+  //    (the first thing it draws each frame) throws, blanking the receiver's whole
+  //    canvas. The receiver rebuilds its own copy locally (see deserializeState).
+  //  - `rng` — a closure; rebuilt from `seed` + `rngCalls` on the far side.
+  //  - `drag` / `hover` / `lastTap` — transient pointer state belonging to
+  //    whoever is looking at THIS screen. Broadcasting them would paint one
+  //    player's hover highlight and drag line on the other's board.
+  const { net, terrainTex, rng, drag, hover, lastTap, ...rest } = g;
+  const sw = swap ? netSwapOwner : (o) => o;
+  const out = {
     ...rest,
     towers: g.towers.map((t) => {
       const { cell, ...trest } = t;
-      const nt = { ...trest, owner: netSwapOwner(t.owner) };
+      const nt = { ...trest, owner: sw(t.owner) };
       if (withCells) nt.cell = cell;
       return nt;
     }),
-    units: g.units.map((u) => ({ ...u, owner: netSwapOwner(u.owner) })),
-    orders: g.orders.map((o) => ({ ...o, owner: netSwapOwner(o.owner) })),
-    arrows: g.arrows.map((a) => ({ ...a, owner: netSwapOwner(a.owner) })),
-    teams: [g.teams[1], g.teams[0]],
-    momentum: g.momentum ? [g.momentum[1], g.momentum[0]] : g.momentum,
-    heroes: g.heroes ? [g.heroes[1], g.heroes[0]] : g.heroes,
-    eliminated: Array.from(g.eliminated).map(netSwapOwner),
-    trainProgress: g.aiTrain[1],
-    aiTrain: [0, g.trainProgress],
-    lastCast: remapLastCastForGuest(g.lastCast || {}),
+    units: g.units.map((u) => ({ ...u, owner: sw(u.owner) })),
+    orders: g.orders.map((o) => ({ ...o, owner: sw(o.owner) })),
+    arrows: g.arrows.map((a) => ({ ...a, owner: sw(a.owner) })),
+    eliminated: Array.from(g.eliminated).map(sw),
+    rngState: g.rng && g.rng.state ? g.rng.state() : null, // where the shared PRNG stream stands
+  };
+  if (swap) {
+    out.teams = [g.teams[1], g.teams[0]];
+    out.momentum = g.momentum ? [g.momentum[1], g.momentum[0]] : g.momentum;
+    out.heroes = g.heroes ? [g.heroes[1], g.heroes[0]] : g.heroes;
+    out.trainProgress = g.aiTrain[1];
+    out.aiTrain = [0, g.trainProgress];
+    out.lastCast = netSwapLastCast(g.lastCast || {});
+  }
+  if (light) { out.sparks = []; out.puffs = []; out.rings = []; out.slashes = []; }
+  return out;
+}
+// Mirror an already-serialized blob 0<->1. Same relabeling serializeState does,
+// but operating on plain JSON rather than a live sim — the guest runs incoming
+// canonical state through this on the way in. Deliberately NOT written as
+// "serializeState(blob)": that would read `blob.rng.state()` off an object whose
+// rng is long gone and blank out the PRNG position.
+function netSwapSerialized(s) {
+  return {
+    ...s,
+    towers: s.towers.map((t) => ({ ...t, owner: netSwapOwner(t.owner) })),
+    units: s.units.map((u) => ({ ...u, owner: netSwapOwner(u.owner) })),
+    orders: s.orders.map((o) => ({ ...o, owner: netSwapOwner(o.owner) })),
+    arrows: s.arrows.map((a) => ({ ...a, owner: netSwapOwner(a.owner) })),
+    eliminated: (s.eliminated || []).map(netSwapOwner),
+    teams: [s.teams[1], s.teams[0]],
+    momentum: s.momentum ? [s.momentum[1], s.momentum[0]] : s.momentum,
+    heroes: s.heroes ? [s.heroes[1], s.heroes[0]] : s.heroes,
+    trainProgress: s.aiTrain[1],
+    aiTrain: [0, s.trainProgress],
+    lastCast: netSwapLastCast(s.lastCast || {}),
+  };
+}
+// Rebuild a live sim object from a serialized state. `swap` mirrors it back into
+// this peer's own labeling (guest only); `cells` re-attaches cached Voronoi
+// polygons to towers that arrived without them.
+function deserializeState(s, { swap = false, cells = null, net = null } = {}) {
+  const base = swap ? netSwapSerialized(s) : s;
+  const towers = base.towers.map((t) => {
+    if (t.cell) return t;
+    const cached = cells && cells.get(t.id);
+    return cached ? { ...t, cell: cached } : t;
+  });
+  return {
+    ...base,
+    towers,
+    eliminated: new Set(base.eliminated || []),
+    // Functions don't survive JSON. Rebuilding from the seed alone would rewind
+    // the stream to position 0 and desync anyone still running; `rngState` is the
+    // generator's exact word, so the restored stream resumes in place.
+    rng: makeRngAt(base.seed, base.rngState),
+    net,
+    drag: null, hover: null, lastTap: null,
   };
 }
 function remapHudForGuest(hud) {
@@ -213,7 +430,7 @@ function remapHudForGuest(hud) {
 }
 
 // ================= Constants =================
-const APP_VERSION = "0.260"; // bump by 0.001 each update
+const APP_VERSION = "0.261"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -1678,35 +1895,37 @@ function TowerConquest() {
     await sb.auth.signOut();
   };
 
-  // ---- Online: private 1v1 room (see the remapSnapshotForGuest block above
-  // for the overall design). `netRef` is the live channel + role, kept in a
-  // ref (not state) since the game loop reads it every frame; the useState
-  // values below only drive the room modal's own UI.
+  // ---- Online: private 1v1 room (see the serializeState block above for the
+  // overall design). `netRef` is the live channel + role, kept in a ref (not
+  // state) since the game loop reads it every frame; the useState values below
+  // only drive the room modal's own UI.
   const netRef = useRef(null); // { channel, role: "host" | "guest", myPlayerId, code }
   const guestTerrainKeyRef = useRef(null); // "W x H" of the last locally-built terrain texture
-  // Guest-side cache of the static Voronoi `cell` polygons, by tower id. Cells
-  // never change after map-gen, so the host omits them from most snapshots and
-  // re-sends them only on a periodic keyframe (see remapSnapshotForGuest's
-  // `withCells` + the broadcast counter) — they're the single heaviest part of
-  // the payload. The guest caches whatever cells a keyframe carries and
-  // re-attaches them to every cell-less snapshot in between (see
-  // applyGuestSnapshot), so render / hit-test / terrain all still see full
-  // geometry. Reset per match alongside the terrain key.
+  // Local cache of the static Voronoi `cell` polygons, by tower id. Cells never
+  // change after map-gen and are by far the heaviest field, so they travel once
+  // (on the initial state, which also lives on the match row) and every resync
+  // snapshot afterwards omits them — the receiver re-attaches them from here, or
+  // pulls the match row if it has none, which is the case after an app restart.
+  // Reset per match alongside the terrain key.
   const guestCellsRef = useRef(null); // Map<towerId, cellPolygon> | null
-  // Guest-side interpolation buffer (see applyGuestSnapshot + the guest render
-  // branch). Snapshots arrive ~10x/sec but the guest renders at 60fps; without
-  // this, every soldier teleports in 100ms hops ("laggy, troops come out
-  // weird"). We keep the previous and current snapshot's unit/arrow positions
-  // (by uid) plus their arrival times, and tween between them each frame so
-  // motion is smooth — at the cost of rendering ~one snapshot interval behind.
-  const guestInterpRef = useRef({ from: null, to: null, startTime: 0, interval: 0.1 });
   // Online lockstep state (both peers). `tick` is the local sim tick; command
   // frame = floor(tick / TICKS_PER_CMD_FRAME). `pending` collects local inputs
   // to broadcast on the next send; `localFrames`/`remote` hold each side's inputs
   // by frame; `sendFrame` is the next frame we'll broadcast — sending is paced
-  // off execution (stay LOCKSTEP_SEND_LEAD frames ahead of the sim, see
-  // pumpOnline). Non-null only during an online match.
+  // off the AUTHORITATIVE frame (stay LOCKSTEP_SEND_LEAD ahead of the server
+  // clock, see pumpOnline). Non-null only during an online match.
   const lockstepRef = useRef(null);
+  // The live match's server-side identity: the Postgres row id and the
+  // `started_at` anchor (in ms) that the whole frame timeline hangs off. Held in
+  // a ref because the pump reads it every frame.
+  const matchRef = useRef(null); // { matchId, startedAtMs, roomCode, role }
+  // Non-null while we're re-anchoring to a snapshot (suspended app, drift, or a
+  // fresh rejoin). The pump refuses to advance the sim while this is set — half
+  // an old state and half a new one is exactly the drift we're avoiding.
+  const resyncRef = useRef(null); // { since, requestedFrame, source } | null
+  // Which peer connection state the UI should show. Kept as state (not a ref)
+  // because it drives an on-screen banner.
+  const [netPeer, setNetPeer] = useState("connected"); // connected | away | resyncing | catchup
   // Incoming peer command frames, kept in a ref that exists BEFORE lockstep is
   // initialized. The host starts broadcasting frames the instant it sends
   // match-start, which can arrive at the guest before it finishes processing
@@ -1720,16 +1939,32 @@ function TowerConquest() {
   const [joinCodeInput, setJoinCodeInput] = useState("");
   const [onlineError, setOnlineError] = useState("");
 
-  const leaveOnlineRoom = useCallback(() => {
+  // Tear down the room. `abandon` (the player deliberately quit to the menu, as
+  // opposed to the app simply closing) also forgets the resume pointer, so we
+  // don't offer to rejoin a match they walked away from. The match ROW is left
+  // open either way: quitting isn't losing, and the timeline keeps running — walk
+  // back in through the room code and the battle is still there.
+  const leaveOnlineRoom = useCallback((abandon = true) => {
+    const ls = lockstepRef.current, m = matchRef.current;
+    // Best-effort parting snapshot: if we were the one keeping the sim moving,
+    // this is what a returning opponent (or our own next session) picks up from.
+    // Fire-and-forget — the page may be going away underneath us.
+    if (ls && m && gameRef.current && gameRef.current.net && !gameRef.current.over) {
+      try { persistSnapshot(gameRef.current, ls, m); } catch (e) { /* best effort */ }
+    }
     if (netRef.current && netRef.current.channel) {
       try { sb.removeChannel(netRef.current.channel); } catch (e) { /* already gone */ }
     }
     netRef.current = null;
+    matchRef.current = null;
+    resyncRef.current = null;
     guestTerrainKeyRef.current = null; // force a fresh terrain rebuild next match
     guestCellsRef.current = null;
     lockstepRef.current = null;        // drop the lockstep command buffers
     remoteFramesRef.current = new Map(); // and any buffered peer frames from a prior match
+    if (abandon) forgetActiveMatch();
     setNetWarn(null);
+    setNetPeer("connected");
     setOnlineStatus("idle");
     setOnlineRoomCode("");
     setOnlineError("");
@@ -1743,28 +1978,55 @@ function TowerConquest() {
   // two simulations stay in perfect step. Each peer relabels itself as player 0
   // (so the dozens of `owner === 0` render/input sites are untouched), which
   // makes the two states mirror images — hence the canonical apply order below.
-  const initLockstep = () => {
+  // `atFrame` is where this peer's sim starts: 0 for a fresh match, or the frame
+  // a snapshot was taken at when re-anchoring mid-battle.
+  const initLockstep = (atFrame = 0) => {
     lockstepRef.current = {
-      tick: 0,
-      sendFrame: 0,
+      tick: atFrame * TICKS_PER_CMD_FRAME,
+      sendFrame: atFrame,
+      baseFrame: atFrame,              // where this run of the sim began; anything
+                                       // older than it is from a history we've dropped
+                                       // and must not be mistaken for evidence of drift
       pending: [],
       localFrames: new Map(),          // frame -> our own cmds (kept to apply on execution)
       remote: remoteFramesRef.current,  // frame -> peer's cmds; shared with the frame handler
       checksums: new Map(),            // frame -> our state hash at that frame's boundary
       lastChkFrame: -1,                // most recent boundary we hashed (rides along on sends)
       lastChkHash: 0,
-      desyncFrame: null,               // first frame a mismatch was detected (for the warning)
-      stallSince: null,                // performance.now() when exec first stalled waiting on the peer (null = running)
+      peerFrame: -1,                   // furthest frame the peer told us it had executed
+      peerAway: false,                 // sealing their frames empty because they stopped talking
+      awaySince: null,                 // server-clock ms when the peer first missed a deadline
       lastResendReq: 0,                // last time we asked the peer to resend missing frames (rate limit)
-      waitWarn: false,                 // "Waiting for opponent" banner currently shown
+      lastPumpMs: Date.now(),          // wall clock of the previous pump — a big gap means we were suspended
+      lastSnapshotMs: 0,               // when we last persisted state to Postgres
+      serveAt: null,                   // { frame, needCells } a peer is waiting on us for
+      catchingUp: false,               // fast-forwarding a gap (drives the on-screen notice)
       started: true,
     };
     window.__ls = lockstepRef.current; // debug: inspectable from the console
     window.__g = gameRef.current;
   };
+  // The authoritative command frame right now, straight off the server clock.
+  // This is the number both peers are steering toward, and the reason a match
+  // ages while nobody is watching it.
+  const authFrame = (m) => Math.floor((NetClock.now() - m.startedAtMs) / CMD_FRAME_MS);
+  // Persist current state so the match survives everyone closing the app. Written
+  // in canonical (host) labeling and without the Voronoi cells — a reader either
+  // has them cached or pulls them off the match row's initial state.
+  const persistSnapshot = (g, ls, m) => {
+    if (!g || !ls || !m || !m.matchId) return;
+    const frame = Math.floor(ls.tick / TICKS_PER_CMD_FRAME);
+    ls.lastSnapshotMs = Date.now();
+    const state = serializeState(g, { swap: g.net.role !== "host", light: true });
+    saveSnapshot(m.matchId, frame, state).catch((e) => console.warn("[net] snapshot write failed:", e.message));
+  };
   const enqueueLocalCmd = (cmd) => {
     const ls = lockstepRef.current;
-    if (ls) ls.pending.push(cmd);
+    // Refuse input mid-handover. A command queued now would go out stamped for a
+    // frame in the history we're about to discard: the peer would execute it and
+    // we never would, which is a divergence manufactured out of nothing.
+    if (!ls || resyncRef.current) return;
+    ls.pending.push(cmd);
   };
   // Apply one command in THIS peer's own labeling: `who` is the originator as this
   // peer sees it (0 = self/local, 1 = the opponent/remote). The owner check keeps
@@ -1814,29 +2076,53 @@ function TowerConquest() {
     for (const u of g.units) { mix(Math.round(u.x)); mix(Math.round(u.y)); mix(canon(u.owner) + 2); }
     return h >>> 0;
   };
-  // Frame-handler side (both peers): buffer the peer's inputs, and if the packet
-  // reports a state hash for a frame we've already executed, compare it to ours.
-  // A mismatch means the sims drifted — surfaced once, on screen (there's no
-  // devtools on a phone), so a determinism regression is caught during testing
-  // rather than silently ruining the match.
+  // Frame-handler side (both peers): buffer the peer's inputs, note how far they
+  // have executed, and compare any state hash they report for a frame we already
+  // ran. Two things can prove our two sims no longer agree:
+  //
+  //   * a hash mismatch — genuine determinism drift, or the aftermath of one of
+  //     us sealing a frame the other didn't;
+  //   * a packet for a frame we have ALREADY executed — it missed its deadline
+  //     here but may have made it there, so our histories differ from that frame.
+  //
+  // Neither is fatal any more. The peer that is BEHIND re-anchors to the other's
+  // state (behind = fewer frames executed; the one who kept playing holds the
+  // real continuation, and on a tie the guest yields so both sides reach the same
+  // verdict without negotiating).
   const recordRemoteFrame = (payload) => {
+    const ls = lockstepRef.current, net = netRef.current;
+    const execFrame = ls ? Math.floor(ls.tick / TICKS_PER_CMD_FRAME) : -1;
+    // A frame counts as LATE only if we ran past it during THIS run of the sim.
+    // Frames older than baseFrame belong to a history we deliberately discarded
+    // when we re-anchored, and arrive routinely right after a handover.
+    const isLate = (frame, cmds) => ls && frame >= ls.baseFrame && frame < execFrame && (cmds || []).length > 0;
+    let late = false;
     if (payload.frames) {
       // Batched form: a resend response carrying a whole block of frames in one
       // message (see resendFrames). No checksum ride-along on these.
-      for (const f of payload.frames) remoteFramesRef.current.set(f.frame, f.cmds || []);
+      for (const f of payload.frames) {
+        if (isLate(f.frame, f.cmds)) late = true;
+        remoteFramesRef.current.set(f.frame, f.cmds || []);
+      }
     } else {
+      if (isLate(payload.frame, payload.cmds)) late = true;
       remoteFramesRef.current.set(payload.frame, payload.cmds || []);
     }
-    const ls = lockstepRef.current;
-    if (ls && ls.desyncFrame == null && payload.chkFrame >= 0 && ls.checksums.has(payload.chkFrame) &&
-        ls.checksums.get(payload.chkFrame) !== payload.chkHash) {
-      ls.desyncFrame = payload.chkFrame;
-      console.warn(`[lockstep] DESYNC at frame ${payload.chkFrame}: local=${ls.checksums.get(payload.chkFrame)} remote=${payload.chkHash}`);
-      setNetWarn("Online desync — the two games drifted apart. Please rematch.");
+    if (!ls || !net) return;
+    if (payload.execFrame != null) ls.peerFrame = Math.max(ls.peerFrame, payload.execFrame);
+    // Any packet at all means they're back.
+    if (ls.peerAway) { ls.peerAway = false; ls.awaySince = null; setNetPeer("connected"); }
+    const drifted = payload.chkFrame >= 0 && ls.checksums.has(payload.chkFrame) &&
+                    ls.checksums.get(payload.chkFrame) !== payload.chkHash;
+    if (late || drifted) {
+      const reason = late ? `late input for frame ${payload.frame}` : `hash mismatch at frame ${payload.chkFrame}`;
+      const behind = ls.peerFrame > execFrame || (ls.peerFrame === execFrame && net.role === "guest");
+      console.warn(`[net] histories diverged (${reason}); ${behind ? "re-anchoring to peer" : "holding — peer will re-anchor"}`);
+      if (behind) requestResync("drift");
     }
   };
   // The peer lost some of our frames (its realtime socket dropped and rejoined
-  // while it was suspended in the background) and is stalled waiting for them:
+  // while it was suspended in the background) and is waiting on them:
   // re-broadcast everything we've sent from the requested frame on, batched into
   // a single message. Served from localFrames, which keeps LOCKSTEP_HISTORY
   // frames of sent history for exactly this (see the pruning at execution).
@@ -1850,99 +2136,327 @@ function TowerConquest() {
     if (frames.length) net.channel.send({ type: "broadcast", event: "frame", payload: { frames } });
   };
 
-  // Guest side: load the host's one-time match-start (shared seed + full initial
-  // state, already owner-swapped so the guest is player 0), rebuild the RNG from
-  // the seed, and begin the lockstep loop. After this the guest simulates locally
-  // just like the host — no more per-frame snapshots.
-  const applyMatchStart = useCallback((payload) => {
-    const s = payload.state;
-    gameRef.current = {
-      ...s,
-      eliminated: new Set(s.eliminated || []),
-      net: netRef.current,
-      seed: payload.seed,
-      rng: makeRng(payload.seed), // functions don't survive JSON — rebuild from the shared seed
-      drag: null, hover: null, lastTap: null,
-    };
-    guestTerrainKeyRef.current = null;
-    buildTerrainTexture(gameRef.current);
-    initLockstep();
+  // ---- Re-anchoring ----
+  // Everything that can put this peer out of step — a suspended app, a rejoin
+  // after closing the game, proof that the two histories diverged — funnels
+  // through here. We stop simulating, ask whoever is live for their state at a
+  // frame slightly in the future, and restart from it. Asking for a FUTURE frame
+  // (rather than "now") is what makes the handover seamless: the live peer keeps
+  // playing, broadcasts its inputs as usual, and hands over a state at a frame we
+  // will both agree on, with no gap either of us has to guess at.
+  const requestResync = (source) => {
+    const net = netRef.current, m = matchRef.current;
+    if (!net || !m || resyncRef.current) return;
+    const at = authFrame(m) + LOCKSTEP_SEND_LEAD;
+    resyncRef.current = { since: Date.now(), requestedFrame: at, source };
+    setNetPeer("resyncing");
+    if (net.channel) {
+      net.channel.send({
+        type: "broadcast", event: "snapshot-request",
+        payload: { at, needCells: !guestCellsRef.current },
+      });
+    }
+  };
+  // A peer asked us for our state. Answer at the frame they named, once our sim
+  // has actually reached it — replying with a state from before that frame would
+  // hand them a past they'd then have to replay blind.
+  const serveSnapshotRequest = (payload) => {
+    const ls = lockstepRef.current;
+    if (!ls || !gameRef.current || !gameRef.current.net) return;
+    ls.serveAt = { frame: Math.max(payload.at | 0, Math.floor(ls.tick / TICKS_PER_CMD_FRAME)), needCells: !!payload.needCells };
+  };
+  const sendSnapshot = (g, ls, frame, needCells) => {
+    const net = netRef.current;
+    if (!net || !net.channel) return;
+    net.channel.send({
+      type: "broadcast", event: "snapshot",
+      payload: {
+        frame,
+        state: serializeState(g, { swap: g.net.role !== "host", withCells: needCells, light: true }),
+      },
+    });
+  };
+  // Adopt canonical state as our own and restart the sim from `frame`. Used for
+  // every entry into a running match: a live peer's answer, a Postgres snapshot,
+  // or the initial state off the match row.
+  const adoptState = useCallback((canonState, frame, { rebuildTerrain = true } = {}) => {
+    const net = netRef.current;
+    if (!net) return;
+    const cells = guestCellsRef.current;
+    const g = deserializeState(canonState, { swap: net.role !== "host", cells, net });
+    // Cache any cells that rode along, so later snapshots can travel without them.
+    if (canonState.towers.some((t) => t.cell)) {
+      const map = new Map();
+      for (const t of g.towers) if (t.cell) map.set(t.id, t.cell);
+      guestCellsRef.current = map;
+    }
+    gameRef.current = g;
+    if (rebuildTerrain) { guestTerrainKeyRef.current = null; buildTerrainTexture(g); }
+    initLockstep(frame);
+    // Frames from before the handover belong to a history we just replaced; drop
+    // them. Frames AT or AFTER it are the peer's live inputs, already in flight
+    // because they send LOCKSTEP_SEND_LEAD ahead — throwing those away would
+    // leave us sealing empty frames the peer had already filled.
+    for (const f of Array.from(remoteFramesRef.current.keys())) {
+      if (f < frame) remoteFramesRef.current.delete(f);
+    }
+    resyncRef.current = null;
+    setNetPeer("connected");
+    setNetWarn(null);
     setOutcome(null);
     setPaused(false);
+  }, []);
+  const applySnapshot = useCallback((payload) => {
+    const r = resyncRef.current;
+    if (!r) return;               // not waiting on one — ignore (it was meant for the other peer)
+    adoptState(payload.state, payload.frame);
+  }, [adoptState]);
+  // Nobody answered. Rebuild from Postgres instead: the match row for the map and
+  // the seed, the snapshot row for wherever the battle had got to. Then the pump
+  // fast-forwards from that frame to the authoritative present — legitimately, and
+  // identically on both peers, because with no one connected nobody was issuing
+  // orders through the gap.
+  const resyncFromServer = useCallback(async (matchId) => {
+    const row = await fetchMatchRow(matchId);
+    if (!row) throw new Error("that match is no longer on the server");
+    if (row.ended_at) return { ended: true, outcome: row.outcome };
+    const snap = await fetchSnapshot(matchId);
+    // The initial state is the only place the Voronoi cells live, so seed the
+    // cache from it whenever we don't already have them (fresh app start).
+    if (!guestCellsRef.current) {
+      const map = new Map();
+      for (const t of row.initial_state.towers) if (t.cell) map.set(t.id, t.cell);
+      guestCellsRef.current = map;
+    }
+    adoptState(snap ? snap.state : row.initial_state, snap ? snap.frame : 0);
+    return { ended: false };
+  }, [adoptState]);
+
+  // Guest side: load the host's one-time match-start — the shared seed, the full
+  // initial state in canonical (host) labeling, and crucially the match row's id
+  // and `started_at`, which is the server anchor the whole frame timeline hangs
+  // off. After this the guest simulates locally just like the host.
+  const applyMatchStart = useCallback(async (payload) => {
+    matchRef.current = {
+      matchId: payload.matchId,
+      startedAtMs: Date.parse(payload.startedAt),
+      roomCode: netRef.current ? netRef.current.code : "",
+      role: "guest",
+    };
+    rememberActiveMatch({ matchId: payload.matchId, roomCode: matchRef.current.roomCode, role: "guest" });
+    // Can't place ourselves on the timeline without knowing what time the server
+    // thinks it is, so make sure that's in hand before the first frame executes.
+    if (!NetClock.synced) await NetClock.sync();
+    adoptState(payload.state, 0);
     setMenuOpen(false);
     setShowHelp(false);
     setOnlineOpen(false);
     setOnlineStatus("playing");
     setScreen("play");
-  }, []);
+  }, [adoptState]);
+
+  // Both roles wire the same channel: input frames, resend requests, and the
+  // snapshot handover that lets either side re-anchor the other. Only the guest
+  // listens for match-start (the host is the one sending it).
+  const openRoomChannel = useCallback((code, role, onError) => {
+    const channel = sb.channel(`domination-room-${code}`, {
+      config: { broadcast: { self: false }, presence: { key: Math.random().toString(36).slice(2) } },
+    });
+    netRef.current = { channel, role, myPlayerId: role === "host" ? 0 : 1, code };
+    let everSubscribed = false;
+    channel
+      // Lockstep: the peer's per-command-frame input packet. Buffered by frame
+      // number (in the pre-init ref, which initLockstep adopts); the sim consumes
+      // it at that frame's boundary (see the game loop). Also carries their exec
+      // frame and a state hash, for the divergence check.
+      .on("broadcast", { event: "frame" }, ({ payload }) => recordRemoteFrame(payload))
+      .on("broadcast", { event: "resend" }, ({ payload }) => resendFrames(payload))
+      // Handover: someone is rejoining (or re-anchoring) and needs our state.
+      .on("broadcast", { event: "snapshot-request" }, ({ payload }) => serveSnapshotRequest(payload))
+      .on("broadcast", { event: "snapshot" }, ({ payload }) => applySnapshot(payload))
+      .on("presence", { event: "sync" }, () => {
+        const count = Object.keys(channel.presenceState()).length;
+        setOnlineStatus((s) => (s === "starting" || s === "playing" ? s : (count >= 2 ? "ready" : "waiting")));
+      });
+    if (role === "guest") {
+      channel.on("broadcast", { event: "match-start" }, ({ payload }) => applyMatchStart(payload));
+    }
+    channel.subscribe(async (status) => {
+      if (status === "SUBSCRIBED") {
+        await channel.track({ joinedAt: Date.now() });
+        // A SECOND subscribe means the socket dropped and came back. Broadcast has
+        // no replay, so whatever the peer sent in the gap is gone for good — don't
+        // pretend otherwise, just re-anchor.
+        if (everSubscribed && lockstepRef.current) requestResync("reconnect");
+        everSubscribed = true;
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        if (onError) onError();
+      }
+    });
+    return channel;
+  }, [applyMatchStart, applySnapshot]);
 
   const hostOnlineRoom = useCallback(() => {
     leaveOnlineRoom();
     const code = makeRoomCode();
-    const channel = sb.channel(`domination-room-${code}`, {
-      config: { broadcast: { self: false }, presence: { key: Math.random().toString(36).slice(2) } },
+    openRoomChannel(code, "host", () => {
+      setOnlineError("Connection lost. Try hosting a new room.");
+      setOnlineStatus("error");
     });
-    netRef.current = { channel, role: "host", myPlayerId: 0, code };
-    channel
-      // Lockstep: the guest's per-command-frame input packet. Buffered by frame
-      // number (in the pre-init ref, which initLockstep adopts); the sim consumes
-      // it at that frame's boundary (see the game loop). Also carries a state hash
-      // for desync detection.
-      .on("broadcast", { event: "frame" }, ({ payload }) => recordRemoteFrame(payload))
-      .on("broadcast", { event: "resend" }, ({ payload }) => resendFrames(payload))
-      .on("presence", { event: "sync" }, () => {
-        const count = Object.keys(channel.presenceState()).length;
-        setOnlineStatus((s) => (s === "starting" || s === "playing" ? s : (count >= 2 ? "ready" : "waiting")));
-      })
-      .subscribe(async (status) => {
-        if (status === "SUBSCRIBED") {
-          await channel.track({ joinedAt: Date.now() });
-        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-          setOnlineError("Connection lost. Try hosting a new room.");
-          setOnlineStatus("error");
-        }
-      });
+    NetClock.sync(); // warm the server clock while the room waits for a second player
     setOnlineRoomCode(code);
     setOnlineStatus("waiting");
     setOnlineTab("host");
     setOnlineError("");
     setOnlineOpen(true);
-  }, [leaveOnlineRoom]);
+  }, [leaveOnlineRoom, openRoomChannel]);
 
   const joinOnlineRoom = useCallback((rawCode) => {
     const code = rawCode.trim().toUpperCase();
     if (!code) return;
     leaveOnlineRoom();
-    const channel = sb.channel(`domination-room-${code}`, {
-      config: { broadcast: { self: false }, presence: { key: Math.random().toString(36).slice(2) } },
+    openRoomChannel(code, "guest", () => {
+      setOnlineError("Couldn't reach that room. Check the code and try again.");
+      setOnlineStatus("error");
     });
-    netRef.current = { channel, role: "guest", myPlayerId: 1, code };
-    channel
-      // Lockstep: the one-time match start (seed + initial state), then the host's
-      // per-command-frame input packets buffered by frame for the sim to consume.
-      // (Frames can arrive before match-start finishes — the pre-init ref catches
-      // them so nothing is lost; see remoteFramesRef.)
-      .on("broadcast", { event: "match-start" }, ({ payload }) => applyMatchStart(payload))
-      .on("broadcast", { event: "frame" }, ({ payload }) => recordRemoteFrame(payload))
-      .on("broadcast", { event: "resend" }, ({ payload }) => resendFrames(payload))
-      .on("presence", { event: "sync" }, () => {
-        const count = Object.keys(channel.presenceState()).length;
-        setOnlineStatus((s) => (s === "starting" || s === "playing" ? s : (count >= 2 ? "ready" : "waiting")));
-      })
-      .subscribe(async (status) => {
-        if (status === "SUBSCRIBED") {
-          await channel.track({ joinedAt: Date.now() });
-        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-          setOnlineError("Couldn't reach that room. Check the code and try again.");
-          setOnlineStatus("error");
-        }
-      });
+    NetClock.sync();
     setOnlineRoomCode(code);
     setOnlineStatus("waiting");
     setOnlineTab("join");
     setOnlineError("");
     setOnlineOpen(true);
-  }, [leaveOnlineRoom, applyMatchStart]);
+  }, [leaveOnlineRoom, openRoomChannel]);
+
+  // ---- Walking back into a match in progress ----
+  // The one thing this whole change exists for. Reopen the room channel, ask
+  // whoever is still playing for their state, and fall back to Postgres if the
+  // room is empty. Either way the battle we rejoin is as old as the wall clock
+  // says it should be — the towers kept regenerating while the app was shut.
+  const [resumeInfo, setResumeInfo] = useState(null);   // { matchId, roomCode, role } | null
+  const [resuming, setResuming] = useState(false);
+  const rejoinMatch = useCallback(async (info) => {
+    setResuming(true);
+    setOnlineError("");
+    try {
+      const row = await fetchMatchRow(info.matchId);
+      if (!row || row.ended_at) {
+        forgetActiveMatch();
+        setResumeInfo(null);
+        setOnlineError(row && row.ended_at ? "That match already finished." : "That match is no longer on the server.");
+        return;
+      }
+      await NetClock.sync();
+      leaveOnlineRoom(false);            // drop any stale channel, keep the resume pointer
+      matchRef.current = {
+        matchId: row.id,
+        startedAtMs: Date.parse(row.started_at), // the server anchor — our clock never gets a vote
+        roomCode: info.roomCode,
+        role: info.role,
+      };
+      openRoomChannel(info.roomCode, info.role, () => {
+        setOnlineError("Couldn't reach the room — resuming from the server instead.");
+      });
+      // Load the server's copy first so there's a board on screen immediately,
+      // then ask the live peer (if any) for a fresher one. The pump holds the sim
+      // still until that request resolves or times out.
+      const res = await resyncFromServer(row.id);
+      if (res.ended) {
+        forgetActiveMatch();
+        setResumeInfo(null);
+        setOnlineError("That match already finished.");
+        return;
+      }
+      setOnlineStatus("playing");
+      setOnlineOpen(false);
+      setMenuOpen(false);
+      setScreen("play");
+      requestResync("rejoin");
+    } catch (e) {
+      console.warn("[net] rejoin failed:", e);
+      setOnlineError(`Couldn't rejoin: ${e.message}`);
+    } finally {
+      setResuming(false);
+    }
+  }, [leaveOnlineRoom, openRoomChannel, resyncFromServer]);
+  // The match reached a result. Close the row so neither side is offered a
+  // rejoin into a battle that's already decided, and so the loser — who may have
+  // been away when it happened — is told the outcome rather than handed a board.
+  // `outcome` is written from the winner's point of view in canonical labeling.
+  const closeOnlineMatch = useCallback((localOutcome) => {
+    const m = matchRef.current, net = netRef.current;
+    if (!m || !m.matchId || !net) return;
+    const localIsHost = net.role === "host";
+    const localWon = localOutcome === "win";
+    const winner = localWon === localIsHost ? "host" : "guest";
+    matchRef.current = { ...m, closed: true };
+    forgetActiveMatch();
+    setResumeInfo(null);
+    endMatchRow(m.matchId, winner).catch((e) => console.warn("[net] couldn't close the match row:", e.message));
+  }, []);
+
+  // Re-anchor watchdog. If no live peer answered our snapshot request in time —
+  // they're away too, or gone for good — rebuild from Postgres instead and let
+  // the pump fast-forward to the present. Nobody was issuing orders through a gap
+  // with both players absent, so replaying it as empty frames is exactly right.
+  useEffect(() => {
+    let busy = false;
+    const id = setInterval(async () => {
+      const r = resyncRef.current, m = matchRef.current;
+      if (busy || !r || !m || Date.now() - r.since < RESYNC_TIMEOUT_MS) return;
+      busy = true;
+      try {
+        const res = await resyncFromServer(m.matchId);
+        if (res.ended) {
+          setNetWarn("This match already finished.");
+          resyncRef.current = null;
+          setNetPeer("connected");
+        }
+      } catch (e) {
+        // Can't reach the server either. Resume on what we already have rather
+        // than sitting frozen — the drift check will re-anchor us later if the
+        // peer turns out to have moved on without us.
+        console.warn("[net] server re-anchor failed:", e.message);
+        resyncRef.current = null;
+        setNetPeer("connected");
+        setNetWarn("Reconnected without the server — the battle may be a little out of date.");
+      } finally {
+        busy = false;
+      }
+    }, 500);
+    return () => clearInterval(id);
+  }, [resyncFromServer]);
+
+  // Leaving the app is the moment its state matters most: whatever we persist
+  // here is what the opponent (or our own next session) resumes from. `pagehide`
+  // rather than `beforeunload` — it's the one that actually fires on iOS.
+  useEffect(() => {
+    const save = () => {
+      const g = gameRef.current, ls = lockstepRef.current, m = matchRef.current;
+      if (g && g.net && !g.over && ls && m && !resyncRef.current) persistSnapshot(g, ls, m);
+    };
+    const onHide = () => { if (document.hidden) save(); };
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("pagehide", save);
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("pagehide", save);
+    };
+  }, []);
+
+  // Offer the resume on the menu if the device remembers an unfinished match.
+  useEffect(() => {
+    const info = readActiveMatch();
+    if (!info || !info.matchId) return;
+    let cancelled = false;
+    fetchMatchRow(info.matchId)
+      .then((row) => {
+        if (cancelled) return;
+        if (!row || row.ended_at) { forgetActiveMatch(); return; }
+        setResumeInfo(info);
+      })
+      .catch(() => { /* offline — leave the pointer alone and try again next launch */ });
+    return () => { cancelled = true; };
+  }, []);
 
   // Which opponent's pill (by pid) currently has its ability-details popup
   // open, if any — tapping a pill in the Top HUD toggles this. Reset when a
@@ -2233,13 +2747,15 @@ function TowerConquest() {
   // startGame exactly as the vs-AI path does, then tags the freshly-built
   // gameRef with the room's net info so the game loop and input handlers
   // know to broadcast/forward instead of running solo.
-  const startOnlineMatch = useCallback(() => {
+  const startOnlineMatch = useCallback(async () => {
     if (!netRef.current || netRef.current.role !== "host") return;
-    setOnlineStatus("playing");
-    // The host generates the map and picks the shared seed, then broadcasts a
-    // single match-start: seed + full initial state (owner-swapped so the guest
-    // is player 0, cells included). Both peers then run the identical sim from
-    // that point, exchanging only per-frame inputs (lockstep) — no more snapshots.
+    setOnlineStatus("starting");
+    // The host generates the map and picks the shared seed, then registers the
+    // match with Postgres — and it's the ROW, not the host, that starts the
+    // clock: `started_at` is the anchor both peers measure every frame against
+    // from here on. Only once that exists does the match-start go out, carrying
+    // the seed, the full initial state (canonical labeling, cells included) and
+    // the anchor itself.
     const seed = Math.floor(Math.random() * 0x100000000) >>> 0;
     startGame(2, "ffa", false, seed);
     gameRef.current.net = netRef.current;
@@ -2251,13 +2767,34 @@ function TowerConquest() {
     // already-drawn values themselves travel in the state snapshot, so nothing
     // else needs replaying.
     gameRef.current.rng = makeRng(seed);
-    netRef.current.channel.send({
-      type: "broadcast", event: "match-start",
-      payload: { seed, state: remapSnapshotForGuest(gameRef.current, true) },
-    });
-    initLockstep();
-    setOnlineOpen(false);
-  }, [startGame]);
+    const initial = serializeState(gameRef.current, { withCells: true });
+    try {
+      if (!NetClock.synced) await NetClock.sync();
+      const { matchId, startedAtMs } = await createMatchRow(netRef.current.code, seed, initial);
+      matchRef.current = { matchId, startedAtMs, roomCode: netRef.current.code, role: "host" };
+      rememberActiveMatch({ matchId, roomCode: netRef.current.code, role: "host" });
+      // Cells travel once and are cached on both sides from here on.
+      const cells = new Map();
+      for (const t of gameRef.current.towers) if (t.cell) cells.set(t.id, t.cell);
+      guestCellsRef.current = cells;
+      netRef.current.channel.send({
+        type: "broadcast", event: "match-start",
+        payload: { seed, matchId, startedAt: new Date(startedAtMs).toISOString(), state: initial },
+      });
+      initLockstep();
+      setOnlineStatus("playing");
+      setOnlineOpen(false);
+    } catch (e) {
+      // Without a match row there is no shared clock, and without that we'd be
+      // right back to two peers freezing each other. Don't start half a match.
+      console.warn("[net] couldn't register the match:", e);
+      setScreen("menu");
+      leaveOnlineRoom();
+      setOnlineError(`Couldn't start the match: ${e.message}`);
+      setOnlineStatus("error");
+      setOnlineOpen(true);
+    }
+  }, [startGame, leaveOnlineRoom]);
 
   // Two owners are allied if they share a team. Neutral (-1) is nobody's ally.
   const sameTeam = (g, a, b) =>
@@ -3951,12 +4488,12 @@ function TowerConquest() {
         for (let pid = 0; pid < g.numPlayers; pid++)
           if (!g.eliminated.has(pid)) aliveTeams.add(g.teams[pid]);
         const myTeam = g.teams[0];
-        if (!g.tutorial && !aliveTeams.has(myTeam)) { g.over = true; setOutcome("lose"); lastOutcomeSent = "lose"; SoundEngine.lose(); SoundEngine.stopBattle(); }
+        if (!g.tutorial && !aliveTeams.has(myTeam)) { g.over = true; setOutcome("lose"); lastOutcomeSent = "lose"; closeOnlineMatch("lose"); SoundEngine.lose(); SoundEngine.stopBattle(); }
         // The tutorial deliberately does NOT end on a win: the player wiping out the
         // rival is the second-to-last STEP, and slamming the victory screen up here
         // would skip the wrap-up step entirely. The tutorial ends when the player
         // taps "Finish Tutorial" on that final overlay instead.
-        else if (!g.tutorial && aliveTeams.size === 1) { g.over = true; setOutcome("win"); lastOutcomeSent = "win"; SoundEngine.win(); SoundEngine.stopBattle(); }
+        else if (!g.tutorial && aliveTeams.size === 1) { g.over = true; setOutcome("win"); lastOutcomeSent = "win"; closeOnlineMatch("win"); SoundEngine.win(); SoundEngine.stopBattle(); }
 
         // Tutorial: once the requested action is detected, hold the step open
         // for `settleFor` seconds so the player actually sees the effect (a
@@ -3988,76 +4525,113 @@ function TowerConquest() {
         }
     }; // end runSimTick
 
-    // ----- Online lockstep pump -----
+    // ----- Online pump (server-anchored lockstep) -----
     // Broadcast one command frame of buffered local inputs. Sending is paced off
-    // EXECUTION (see pumpOnline): we keep our sent frames LOCKSTEP_SEND_LEAD
-    // ahead of the frame the sim is about to execute, instead of ticking sends
-    // off the wall clock. That makes the pipeline self-healing across a freeze
-    // (backgrounded tab/app): a wall-clock sender either races unboundedly ahead
-    // of a stalled sim (the opponent's side) or falls permanently behind after
-    // waking up (the hidden side) — both of which used to read as permanent lag
-    // after an app switch. Exec-paced, both peers simply resume in step.
+    // the AUTHORITATIVE frame — we keep our sent frames LOCKSTEP_SEND_LEAD ahead
+    // of where the server clock says the match is, not ahead of our own sim.
+    // That distinction is the whole fix: pacing off our own execution meant a
+    // peer whose sim had stalled also stopped sending, which stalled the other
+    // peer in turn, which is how one player's app switch froze both games. Tied
+    // to the server clock, a peer that falls behind still emits its frames on
+    // schedule, and one that was away resumes without a send deficit.
     const sendOneFrame = (g, ls) => {
       const cmds = ls.pending;
       ls.pending = [];
       ls.localFrames.set(ls.sendFrame, cmds);
       g.net.channel.send({
         type: "broadcast", event: "frame",
-        payload: { frame: ls.sendFrame, cmds, chkFrame: ls.lastChkFrame, chkHash: ls.lastChkHash },
+        payload: {
+          frame: ls.sendFrame, cmds,
+          chkFrame: ls.lastChkFrame, chkHash: ls.lastChkHash,
+          execFrame: Math.floor(ls.tick / TICKS_PER_CMD_FRAME), // how far we've actually run
+        },
       });
       ls.sendFrame++;
     };
-    // Advance the online sim by up to `wallDt` seconds: send our inputs, then
-    // execute tick-by-tick at 60 Hz, waiting at every command-frame boundary
-    // until BOTH peers' inputs for that frame are in hand. If the remote packet
-    // hasn't arrived we stall (render the last state) rather than guess — that's
-    // what keeps the two sims identical. The wall-time bank is CLAMPED: time
-    // spent frozen or stalled is dropped, so a long absence resumes cleanly at
-    // 1x instead of fast-forwarding a burst of banked sim time. Called from the
-    // rAF step while visible and from the background worker while hidden.
-    const pumpOnline = (g, ls, wallDt) => {
-      if (g.over) { simAccum = 0; return; }
-      simAccum = Math.min(simAccum + wallDt, ONLINE_MAX_BANK);
-      let simSteps = 0;
-      while (simAccum >= FIXED_DT && simSteps < ONLINE_MAX_STEPS) {
+    // Advance the online sim toward the AUTHORITATIVE frame — the one the server
+    // clock says the match is on right now. There is no wall-time bank any more:
+    // the target is a position on a timeline that exists independently of this
+    // device, so a peer that was asleep for a minute simply has 600 frames to get
+    // through, and one that never left has none. Both arrive at the same place.
+    //
+    // At each command-frame boundary we execute with whatever inputs are in hand.
+    // Missing peer inputs are worth a short wait (they're probably in flight), but
+    // only until the frame's deadline — after that the frame is SEALED with their
+    // input empty and the battle carries on without them. That single change is
+    // what stops one player closing the app from freezing the other.
+    //
+    // Called from the rAF step while visible, and from the background worker
+    // while hidden.
+    const pumpOnline = (g, ls) => {
+      const m = matchRef.current;
+      if (!m || g.over || !NetClock.synced) return;
+      const nowMs = Date.now();
+      const target = authFrame(m);
+
+      // Keep our own input frames flowing on the server's schedule before
+      // anything else, including while we're re-anchoring — see sendOneFrame.
+      // They're empty during a handover (we're issuing no orders mid-swap), and a
+      // peer that keeps hearing from us doesn't have to sit out our full deadline
+      // before it can answer the snapshot request we just sent it.
+      while (ls.sendFrame <= target + LOCKSTEP_SEND_LEAD) sendOneFrame(g, ls);
+
+      // Hold the sim still while re-anchoring: simulating on state we're about to
+      // throw away is how you turn a recoverable gap into real drift.
+      if (resyncRef.current) { ls.lastPumpMs = nowMs; return; }
+
+      // A long gap between pumps means the app was suspended, not merely slow. We
+      // can't simulate through it — the peer may have been playing the whole time
+      // and their inputs went to a socket we weren't holding — so re-anchor.
+      if (nowMs - ls.lastPumpMs > SELF_STALE_MS) {
+        ls.lastPumpMs = nowMs;
+        requestResync("resume");
+        return;
+      }
+      ls.lastPumpMs = nowMs;
+
+      let F = Math.floor(ls.tick / TICKS_PER_CMD_FRAME);
+      // Way behind (rejoined, or the phone was locked): burn through the gap in
+      // bigger bites and tell the player why the board is racing.
+      const behind = target - F;
+      const wasCatching = ls.catchingUp;
+      ls.catchingUp = behind > CATCHUP_FRAMES;
+      if (ls.catchingUp !== wasCatching) setNetPeer(ls.catchingUp ? "catchup" : (ls.peerAway ? "away" : "connected"));
+      const budget = ls.catchingUp ? CATCHUP_MAX_TICKS : ONLINE_MAX_STEPS;
+
+      let ticks = 0;
+      while (ticks < budget) {
         if (g.over) break;
         if (ls.tick % TICKS_PER_CMD_FRAME === 0) {
-          const F = ls.tick / TICKS_PER_CMD_FRAME;
-          // Exec-paced send: make sure the peer has our inputs through F + lead
-          // before we execute F. Only the first send of a burst carries pending
-          // inputs; the rest are empty frames.
-          while (ls.sendFrame <= F + LOCKSTEP_SEND_LEAD) sendOneFrame(g, ls);
+          F = ls.tick / TICKS_PER_CMD_FRAME;
+          if (F > target) break; // caught up to the present — the rest is the future
           if (!ls.remote.has(F)) {
-            // Stall: waiting on the peer's input. Don't bank the wait (pause
-            // semantics), and if it drags on, ask the peer to resend — its
-            // frames may have been lost while our socket reconnected after a
-            // background suspension.
-            simAccum = Math.min(simAccum, FIXED_DT);
-            const nowMs = performance.now();
-            if (ls.stallSince == null) ls.stallSince = nowMs;
-            if (nowMs - ls.stallSince > RESEND_STALL_MS && nowMs - ls.lastResendReq > RESEND_STALL_MS) {
-              ls.lastResendReq = nowMs;
-              g.net.channel.send({ type: "broadcast", event: "resend", payload: { from: F } });
+            // Their input for this frame isn't here. Wait, but only until the
+            // frame's deadline: PEER_AWAY_MS past the moment the server clock says
+            // F was due. Sealing on an ABSOLUTE time (rather than on how long
+            // we've personally been waiting) is what keeps two peers' verdicts
+            // about a marginal packet close enough to agree on.
+            const dueAt = m.startedAtMs + F * CMD_FRAME_MS + PEER_AWAY_MS;
+            if (NetClock.now() < dueAt) {
+              // Still in the grace window. Nudge them to resend — their socket may
+              // have dropped and rejoined, and Realtime broadcast has no replay.
+              if (nowMs - ls.lastResendReq > RESEND_STALL_MS) {
+                ls.lastResendReq = nowMs;
+                g.net.channel.send({ type: "broadcast", event: "resend", payload: { from: F } });
+              }
+              break;
             }
-            // Long stall (peer's app fully suspended — nothing to do but wait):
-            // say so on screen instead of looking frozen. Never clobbers the
-            // sticky desync warning.
-            if (nowMs - ls.stallSince > 3000 && !ls.waitWarn && ls.desyncFrame == null) {
-              ls.waitWarn = true;
-              setNetWarn("Waiting for opponent…");
-            }
-            break;
-          }
-          if (ls.stallSince != null) {
-            ls.stallSince = null;
-            if (ls.waitWarn) {
-              ls.waitWarn = false;
-              setNetWarn((w) => (w === "Waiting for opponent…" ? null : w));
+            // Deadline passed: seal the frame with no orders from them. They keep
+            // regenerating and stay capturable — they just aren't giving orders.
+            ls.remote.set(F, []);
+            if (!ls.peerAway) {
+              ls.peerAway = true;
+              ls.awaySince = NetClock.now();
+              if (!ls.catchingUp) setNetPeer("away");
             }
           }
           // Hash the state at this boundary (before applying F's inputs) so
           // both peers hash the exact same pre-input state; it rides along on
-          // our next sends for the peer to compare (desync detection).
+          // our next sends for the peer to compare (drift detection).
           const chk = lockstepChecksum(g);
           ls.checksums.set(F, chk);
           ls.lastChkFrame = F;
@@ -4067,27 +4641,43 @@ function TowerConquest() {
           // Keep our sent frames around for a while (resend history), prune old.
           ls.localFrames.delete(F - LOCKSTEP_HISTORY);
           ls.remote.delete(F);
+          // A peer asked for our state at a frame; we've now reached it.
+          if (ls.serveAt && F >= ls.serveAt.frame) {
+            sendSnapshot(g, ls, F, ls.serveAt.needCells);
+            ls.serveAt = null;
+          }
         }
-        simAccum -= FIXED_DT;
-        simSteps++;
+        ticks++;
         ls.tick++;
         runSimTick(g, FIXED_DT);
       }
+
+      // Persist periodically so the match outlives both apps being closed. Skipped
+      // while fast-forwarding — a catching-up peer's state is mid-flight and must
+      // never overwrite a current one (saveSnapshot also refuses older frames).
+      if (!ls.catchingUp && nowMs - ls.lastSnapshotMs > SNAPSHOT_INTERVAL_MS) persistSnapshot(g, ls, m);
+      // Keep the clock honest over a long match — device clocks drift, and every
+      // frame deadline is measured against this one.
+      if (nowMs - NetClock.lastSync > CLOCK_RESYNC_MS) { NetClock.lastSync = nowMs; NetClock.sync(); }
     };
 
     const step = (now) => {
       const g = gameRef.current;
-      // Real elapsed wall-clock time this animation frame. `wallDt` is uncapped
-      // (the online pump clamps its own bank); `frameDt` is capped for
-      // presentation and the solo sim so a hitch can't spiral.
-      const wallDt = (now - last) / 1000;
-      const frameDt = Math.min(0.05, wallDt);
+      // `frameDt` is capped for presentation and the solo sim so a hitch can't
+      // spiral. The online pump takes no delta at all — it steers on the server
+      // clock, not on how much time this device thinks has passed.
+      const frameDt = Math.min(0.05, (now - last) / 1000);
       last = now;
       if (!g) return;
 
       const ls = g.net ? lockstepRef.current : null;
       if (ls && ls.started) {
-        pumpOnline(g, ls, wallDt);
+        pumpOnline(g, ls);
+      } else if (g.net) {
+        // Online, but the match isn't on the timeline yet — the host is still
+        // waiting on Postgres to hand back `started_at`. Draw the board, simulate
+        // nothing: a few frames run here would put this peer ahead of frame 0 and
+        // the two sims would start out of step.
       } else {
         // ----- Solo driver -----
         // Free-running fixed-step accumulator: run as many whole FIXED_DT steps as
@@ -4154,8 +4744,9 @@ function TowerConquest() {
     // pump (no drawing) so the sim keeps running and our command frames keep
     // flowing — the visible opponent never stalls just because we switched apps.
     // While visible the rAF step drives the pump and worker ticks are ignored.
-    // (A fully suspended app — phone lock, iOS app switch — can't run anything;
-    // that case falls back to the stall + resume + resend path in pumpOnline.)
+    // (A fully suspended app — phone lock, iOS app switch — can't run anything at
+    // all; that case is handled on wake by the SELF_STALE_MS re-anchor in
+    // pumpOnline, and in the meantime the opponent seals our frames and plays on.)
     let worker = null, workerUrl = null;
     try {
       workerUrl = URL.createObjectURL(new Blob(["setInterval(() => postMessage(0), 100);"], { type: "text/javascript" }));
@@ -4165,10 +4756,8 @@ function TowerConquest() {
         const g = gameRef.current;
         const ls = g && g.net ? lockstepRef.current : null;
         if (!ls || !ls.started) return;
-        const now = performance.now();
-        const wallDt = (now - last) / 1000;
-        last = now;
-        pumpOnline(g, ls, wallDt);
+        last = performance.now(); // keep the rAF delta honest for the frame we return on
+        pumpOnline(g, ls);
       };
     } catch (e) { /* blob workers unavailable (strict CSP) — background pumping is best-effort */ }
 
@@ -6024,9 +6613,23 @@ function TowerConquest() {
               </button>
             </div>
 
+            {/* An online match you walked out of is still running on the server
+                clock — this walks back into it. Offered whenever the device
+                remembers a match whose row is still open. */}
+            {resumeInfo && (
+              <button onClick={() => { SoundEngine.click(); rejoinMatch(resumeInfo); }}
+                disabled={resuming}
+                style={chip({
+                  marginTop: 24, background: "#2E7D32", color: "#FFFFFF",
+                  fontWeight: 800, fontSize: 15, padding: "12px 30px", border: "1px solid #1B5E20",
+                  opacity: resuming ? 0.6 : 1,
+                })}>
+                {resuming ? "Rejoining…" : `↩ Rejoin match ${resumeInfo.roomCode}`}
+              </button>
+            )}
             <button onClick={() => { if (netRef.current) leaveOnlineRoom(); startGame(numPlayers, mode); }}
               style={chip({
-                marginTop: 28, background: "#FFD23F", color: "#1F2A44",
+                marginTop: resumeInfo ? 14 : 28, background: "#FFD23F", color: "#1F2A44",
                 fontWeight: 800, fontSize: 17, padding: "14px 42px", border: "1px solid #E2A100",
               })}>
               Deploy
@@ -6497,6 +7100,24 @@ function TowerConquest() {
               borderRadius: 8, padding: "4px 8px",
             }}>
               ⚠ {netWarn}
+            </div>
+          )}
+          {/* Connection state. Deliberately worded so none of it reads as "the
+              game has stopped" — because it hasn't. An away opponent isn't a
+              pause any more, it's just an opponent who isn't giving orders while
+              their towers keep filling up. */}
+          {gameRef.current && gameRef.current.net && netPeer !== "connected" && (
+            <div style={{
+              width: "100%", maxWidth: 460, textAlign: "center",
+              fontSize: 11, fontWeight: 700,
+              color: netPeer === "away" ? "#8FC7FF" : "#FFD23F",
+              background: netPeer === "away" ? "rgba(143,199,255,0.12)" : "rgba(255,210,63,0.12)",
+              border: `1px solid ${netPeer === "away" ? "#8FC7FF55" : "#FFD23F55"}`,
+              borderRadius: 8, padding: "4px 8px",
+            }}>
+              {netPeer === "away" && "Opponent away — the battle continues"}
+              {netPeer === "resyncing" && "Catching up with the battle…"}
+              {netPeer === "catchup" && "Fast-forwarding time you missed…"}
             </div>
           )}
           <div style={{

@@ -102,6 +102,54 @@ stalled sim, delaying all post-resume inputs by the gap). Fixes, all in `pumpOnl
   unstall; never clobbers the sticky desync warning) so a fully-suspended opponent reads as
   waiting, not frozen.
 
+**Phase 6 (done, v0.261): the timeline belongs to the server.** Phase 5 made an app switch
+survivable but not painless — the underlying rule was still "no frame executes until the
+other peer's inputs for it arrive," so the two clients were each other's clock. A player who
+closed the app froze the match for the player still looking at it, and the "Waiting for
+opponent…" banner was the honest name for a game that had stopped. The ask was to move the
+game logic to a server so play continues regardless; the constraint was staying on Supabase,
+which has nowhere to run a 60Hz loop. What actually mattered turned out to be smaller than
+"run the sim server-side": **nobody needed to own the simulation, they needed to stop owning
+the clock.**
+
+- **Server-anchored frames.** A match now has a Postgres row (`online_matches`), and its
+  `started_at` defines the timeline: command frame F executes at `started_at + F*100ms`.
+  `NetClock` estimates that clock (3 probes of a `server_now()` RPC, fastest round-trip
+  wins, re-probed every 60s). `pumpOnline` no longer banks wall time — it steers toward
+  `authFrame()`. So the match has a position in time whether or not any app is running,
+  which is what makes "close the game, come back later, find more troops" simply fall out.
+- **Deadlines, not waits.** A frame is sealed `PEER_AWAY_MS` (2s) past its scheduled time
+  with whatever inputs arrived; an absent player's are empty. They keep regenerating and
+  stay perfectly capturable — they just stop giving orders. Sealing on an ABSOLUTE time
+  rather than "how long I've personally waited" is what keeps two peers' verdicts on a
+  marginal packet in agreement. `LOCKSTEP_SEND_LEAD` went 2 → 4 to widen the window, and
+  sends are paced off the authoritative frame rather than off local execution, so a peer
+  whose sim is behind still emits on schedule instead of stalling the other.
+- **Re-anchoring replaces desyncing.** Everything that can put a peer out of step —
+  suspension (`SELF_STALE_MS` gap between pumps), a channel reconnect, a rejoin, a late
+  input for an already-executed frame, a checksum mismatch — funnels into `requestResync`:
+  stop simulating, ask the live peer for state at a frame slightly in the FUTURE (so the
+  handover has no gap either side must guess at), adopt it, resume. The peer that is behind
+  yields (tie → guest), so both sides reach the same verdict without negotiating. The old
+  sticky "desync — please rematch" banner is gone; drift is now self-healing.
+- **Snapshots.** Whoever is running persists state every 5s and on `pagehide`
+  (`save_match_snapshot`, an RPC because the write must refuse older frames — a peer still
+  fast-forwarding holds stale state). With both players away, a returning one rebuilds from
+  the snapshot plus the match row (the only place the Voronoi `cell` polygons live) and
+  fast-forwards to the present. A "↩ Rejoin match" button appears on the menu whenever the
+  device remembers a match whose row is still open.
+- **Canonical wire format.** `remapSnapshotForGuest` became `serializeState` /
+  `deserializeState` / `netSwapSerialized`: everything leaving the device is in HOST
+  labeling and the guest swaps both ways (the swap is its own involution). Necessary because
+  EITHER peer may now be the one handing out a snapshot. `makeRng` also exposes
+  `state()`/`seek()` — a re-anchoring peer must resume the shared PRNG stream exactly where
+  the running peer left it, since rebuilding from the seed would rewind it to position 0.
+
+Still client-simulated, and deliberately so: both clients run the deterministic sim, and the
+open RLS policies mean a determined player could forge a snapshot. That's the same trust
+model private-room play already had, and the note in `supabase_schema.sql` flags it as the
+thing to tighten first if online ever grows a ranked or public mode.
+
 **History (host-authoritative snapshot model, v0.255–v0.26x, now replaced):**
 3. **Phase 3 (done, v0.255): live gameplay sync.** Host-authoritative, as planned — the host
    runs the real simulation completely unchanged (`startGame(2, "ffa")`, same as vs-AI) and
