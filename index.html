@@ -430,7 +430,7 @@ function remapHudForGuest(hud) {
 }
 
 // ================= Constants =================
-const APP_VERSION = "0.261"; // bump by 0.001 each update
+const APP_VERSION = "0.262"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -1843,6 +1843,10 @@ function TowerConquest() {
   const [hud, setHud] = useState([]);
   const [outcome, setOutcome] = useState(null);
   const [paused, setPaused] = useState(false);
+  // Set only by the leave-the-app auto-pause below (never by the menu or the
+  // tutorial), so the "PAUSED" overlay shows up for exactly that case and the
+  // player has a way back in — nothing else clears `paused` for them.
+  const [autoPaused, setAutoPaused] = useState(false);
   const pausedRef = useRef(false);
   useEffect(() => {
     pausedRef.current = paused;
@@ -2443,6 +2447,34 @@ function TowerConquest() {
     };
   }, []);
 
+  // Leaving the app during a LOCAL match pauses it. rAF already stops while
+  // we're hidden, so the sim freezes either way — the point of the explicit
+  // pause is that it doesn't silently un-freeze the instant we come back and
+  // hand the player a battle that moved on without them. Online is deliberately
+  // excluded: both peers walk a shared server timeline, so pausing one side
+  // desyncs it (that's what the background worker pump keeps alive instead).
+  useEffect(() => {
+    if (screen !== "play") { setAutoPaused(false); return; }
+    const pauseForBackground = () => {
+      const g = gameRef.current;
+      if (!g || g.net || g.over) return;
+      // Already paused for another reason (menu open, tutorial step waiting) —
+      // leave that state alone so resuming stays that owner's job.
+      if (pausedRef.current) return;
+      setPaused(true);
+      setAutoPaused(true);
+    };
+    // visibilitychange/pagehide only: a plain window `blur` also fires for the
+    // URL bar or another window on top, where the game is still on screen.
+    const onVis = () => { if (document.hidden) pauseForBackground(); };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("pagehide", pauseForBackground);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("pagehide", pauseForBackground);
+    };
+  }, [screen]);
+
   // Offer the resume on the menu if the device remembers an unfinished match.
   useEffect(() => {
     const info = readActiveMatch();
@@ -2725,6 +2757,7 @@ function TowerConquest() {
     setOutcome(null);
     setMenuOpen(false);
     setShowHelp(false);
+    setAutoPaused(false); // a fresh match never inherits the last one's app-switch pause
     if (tutorial) {
       applyTutorialStep(gameRef.current, 0);
       setTutorialStep(0);
@@ -6930,6 +6963,38 @@ function TowerConquest() {
 
       {screen === "play" && (
         <>
+          {/* Paused because the app was backgrounded mid-match (local games only).
+              The whole sheet is the resume target — a tap anywhere gets back in,
+              and it doubles as the gesture that revives a suspended AudioContext. */}
+          {autoPaused && !outcome && (
+            <div onClick={() => {
+              SoundEngine.resume();
+              SoundEngine.click();
+              setAutoPaused(false);
+              setPaused(false);
+            }}
+              style={{
+                position: "absolute", inset: 0, zIndex: 60,
+                display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                gap: 14, background: "rgba(10,14,24,0.88)", backdropFilter: "blur(2px)",
+                padding: 24, textAlign: "center", cursor: "pointer",
+              }}>
+              <div style={{ fontSize: 11, letterSpacing: 3, color: "#FFD23F", fontWeight: 800 }}>
+                PAUSED
+              </div>
+              <div style={{ fontSize: 21, fontWeight: 800, color: "#E8EEF9", maxWidth: 420 }}>
+                Battle on hold
+              </div>
+              <div style={{ fontSize: 14, color: "#B8C0D6", maxWidth: 420, lineHeight: 1.6 }}>
+                You left the app, so the field froze exactly where you left it.
+              </div>
+              <button
+                style={chip({ background: "#FFD23F", color: "#0A0E18", fontWeight: 800, border: "1px solid #FFD23F", padding: "10px 22px", fontSize: 15 })}>
+                Resume →
+              </button>
+            </div>
+          )}
+
           {/* Tutorial step overlay — explains the current step, then either lets
               the player try it live (unpausing) or advances straight to the next
               explanation. */}
