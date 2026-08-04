@@ -315,6 +315,16 @@ function readActiveMatch() {
 function forgetActiveMatch() {
   try { localStorage.removeItem(RESUME_KEY); } catch (e) { /* private mode */ }
 }
+// The hero you picked last time. Validated against HEROES on read (below, where
+// selectedHero is initialized) rather than trusted blindly — a stored id from an
+// older build whose hero no longer exists must not crash the menu.
+const HERO_KEY = "domination.lastHero";
+function rememberHero(id) {
+  try { localStorage.setItem(HERO_KEY, id); } catch (e) { /* private mode */ }
+}
+function readRememberedHero() {
+  try { return localStorage.getItem(HERO_KEY); } catch (e) { return null; }
+}
 
 function netSwapOwner(o) { return o === 0 ? 1 : o === 1 ? 0 : o; } // NEUTRAL (-1) passes through
 function netSwapLastCast(lastCast) {
@@ -430,7 +440,7 @@ function remapHudForGuest(hud) {
 }
 
 // ================= Constants =================
-const APP_VERSION = "0.262"; // bump by 0.001 each update
+const APP_VERSION = "0.263"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -1819,7 +1829,20 @@ function TowerConquest() {
   // Tempo is the default so a player who never opens the hero picker still
   // gets a sensible starting kit (Rally/Speed/Tower Defense as of this
   // session's Rally<->Slow Down swap with Warlord).
-  const [selectedHero, setSelectedHero] = useState("tempo");
+  // Seeded from the last hero this device picked (see rememberHero/HERO_KEY), so
+  // reopening the game lands on your hero instead of resetting to Tactician.
+  // Falls back to "tempo" for a first run, private mode, or a stored id that no
+  // longer names a real hero.
+  const [selectedHero, setSelectedHero] = useState(() => {
+    const saved = readRememberedHero();
+    return saved && HEROES[saved] ? saved : "tempo";
+  });
+  // Every write goes through here so no picker can set the hero without also
+  // recording it — the hero screen and the menu chip both change it.
+  const pickHero = useCallback((id) => {
+    setSelectedHero(id);
+    rememberHero(id);
+  }, []);
   // Player-chosen seconds-per-train-stage (the menu's SKILL TIMER option).
   // Kept in React state so the menu re-renders on change, and mirrored into the
   // module-level TRAIN_STAGE by pickSkillTimer below — the game loop, the
@@ -6891,7 +6914,7 @@ function TowerConquest() {
                   const h = HEROES[id];
                   const active = selectedHero === id;
                   return (
-                    <button key={id} onClick={() => { SoundEngine.click(); setSelectedHero(id); }}
+                    <button key={id} onClick={() => { SoundEngine.click(); pickHero(id); }}
                       style={chip({
                         background: active ? "#FFF6DC" : "#F4F7FC",
                         borderColor: active ? readableAccent(h.color, 0.55) : "#D7E1EE",
