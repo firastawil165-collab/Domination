@@ -440,7 +440,7 @@ function remapHudForGuest(hud) {
 }
 
 // ================= Constants =================
-const APP_VERSION = "0.263"; // bump by 0.001 each update
+const APP_VERSION = "0.264"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -666,16 +666,16 @@ const momentumMult = (g, owner) =>
 const levelDefenseMult = (t) => 1 + ((t.level || 1) - 1) * 0.05;
 function applyMomentumKill(g, attackerOwner, defenderOwner) {
   if (!g.momentum) return;
-  if (attackerOwner >= 0 && attackerOwner < g.numPlayers) {
+  if (attackerOwner >= 0 && attackerOwner < g.numPlayers && !momentumLocked(g, attackerOwner)) {
     g.momentum[attackerOwner] = clampMomentum(g.momentum[attackerOwner] - MOMENTUM_KILL_STEP);
   }
-  if (defenderOwner >= 0 && defenderOwner < g.numPlayers) {
+  if (defenderOwner >= 0 && defenderOwner < g.numPlayers && !momentumLocked(g, defenderOwner)) {
     g.momentum[defenderOwner] = clampMomentum(g.momentum[defenderOwner] + MOMENTUM_KILL_STEP);
   }
 }
 function applyMomentumCapture(g, capturerOwner) {
   if (!g.momentum) return;
-  if (capturerOwner >= 0 && capturerOwner < g.numPlayers) {
+  if (capturerOwner >= 0 && capturerOwner < g.numPlayers && !momentumLocked(g, capturerOwner)) {
     g.momentum[capturerOwner] = clampMomentum(g.momentum[capturerOwner] + MOMENTUM_CAPTURE_BONUS);
   }
 }
@@ -683,7 +683,7 @@ function applyMomentumCapture(g, capturerOwner) {
 // economy is itself rewarded with a small momentum bump, independent of combat.
 function applyMomentumBuild(g, owner) {
   if (!g.momentum) return;
-  if (owner >= 0 && owner < g.numPlayers) {
+  if (owner >= 0 && owner < g.numPlayers && !momentumLocked(g, owner)) {
     g.momentum[owner] = clampMomentum(g.momentum[owner] + MOMENTUM_BUILD_BONUS);
   }
 }
@@ -788,6 +788,48 @@ const DIFFICULTIES = [
 ];
 const DEFAULT_DIFFICULTY = "regular";
 const towerFireCd = (t) => ARROW_FIRE_CD / fireLevelMult(t);
+
+// ================= Endless mode =================
+// A solo survival mode with no rival EMPIRE at all — just a hostile SWARM that
+// owns no buildings, runs no economy and makes no decisions. It exists purely as
+// drones poured onto the board from gates on the map's edges, one escalating
+// phase at a time, forever. The swarm still occupies a normal owner slot (id 1)
+// so every existing system — factions/colors, clashes, tower fire, capture —
+// applies to it unchanged; what's different is only that nothing spawns it a
+// base and nothing gives it a turn (see the aiAct/aiSpecials guards).
+const ENDLESS_SWARM = 1;            // the swarm's owner id
+const ENDLESS_MIN_BUILDINGS = 10;   // the map never has fewer buildings than this
+const ENDLESS_PLAYER_BUILDINGS = 2; // you start holding exactly this many; every other building is neutral
+const ENDLESS_PREP = 20;            // seconds of quiet before phase 1 — enough to take a neutral or two first
+const ENDLESS_BREAK = 12;           // seconds between one phase being cleared and the next opening
+const ENDLESS_WAVE_SECONDS = 8;     // a phase's whole wave walks out of its gates over roughly this long...
+const ENDLESS_MIN_SPAWN_RATE = 6;   // ...but never slower than this many drones/sec, so tiny early waves stay brisk
+const ENDLESS_MAX_GATES = 8;
+// Wave size by phase (1-based): +10 per phase up to 100, then +20 up to 200,
+// then +50 with no ceiling. 10,20,…,100,120,140,160,180,200,250,300,350,…
+function endlessWaveSize(phase) {
+  if (phase <= 10) return phase * 10;
+  if (phase <= 15) return 100 + (phase - 10) * 20;
+  return 200 + (phase - 15) * 50;
+}
+// Gates open on more sides of the map as the phases climb — two to begin with,
+// up to ENDLESS_MAX_GATES, so a late wave really does arrive from everywhere at
+// once rather than as one thick column.
+const endlessGateCount = (phase) => Math.min(ENDLESS_MAX_GATES, 2 + Math.floor((phase - 1) / 2));
+// The board is drawn through a tilted, ZOOMED camera (see proj) and then clipped
+// to the world rect, so the world's own left/right edges sit off-screen — by how
+// much depends on the row, since PERSP widens nearer rows. This is the widest
+// half-width at world row `wy` that still projects inside the visible board, and
+// it's what makes an edge spawn actually visible instead of materializing in
+// cropped space. (Vertically CAM_ZOOM * TILT == 1, so y=0..H is all on screen and
+// needs no equivalent.)
+const visibleHalfWidthAt = (W, H, wy) => (W / 2) / (CAM_ZOOM * (1 + ((wy - H / 2) / H) * PERSP));
+const ENDLESS_EDGE_INSET = 8; // px inside that visible boundary that drones step onto the board
+// The swarm's momentum is pinned at exactly 1.0 (100%) — it never wins or loses
+// it. Guarding the three apply* entry points below (rather than special-casing
+// momentumMult) means g.momentum[ENDLESS_SWARM] literally never moves, so the
+// number the HUD reads and the number combat uses can't drift apart.
+const momentumLocked = (g, owner) => !!g.endless && owner === ENDLESS_SWARM;
 
 
 // Specials share one "train" of loading capacity instead of independent cooldowns.
@@ -1522,6 +1564,60 @@ function generateMap(numPlayers, W, H, teamMode = false) {
   return { towers, perPlayer, neutrals };
 }
 
+// ---- Endless map ----
+// Nothing symmetric to balance here: the swarm owns no buildings, so the board
+// is just YOUR starting pair plus a field of neutrals to expand into. At least
+// ENDLESS_MIN_BUILDINGS in total (capped by MAX_CASTLES, which the renderer and
+// the Voronoi pass are sized around), your two placed side by side on one arc so
+// they start as mutually-supporting neighbours rather than two lone islands.
+// Everything else alternates between an outer and an inner ring, plus one
+// level-2/3 watchtower dead center — the same shape generateMap uses, minus the
+// per-player rotation, since there's only one player to place.
+function generateEndlessMap(W, H) {
+  const total = Math.min(MAX_CASTLES, ENDLESS_MIN_BUILDINGS + Math.floor(Math.random() * 3)); // 10-12
+  const cx = W / 2, cy = H / 2;
+  const rx = W / 2 - mapEdgeMarginX(W), ry = H / 2 - MAP_EDGE_MARGIN_Y;
+  const ell = (f, ang) => ({ x: cx + Math.cos(ang) * f * rx, y: cy + Math.sin(ang) * f * ry });
+  const raw = [];
+  const slots = total - 1;                       // every building except the center one
+  const step = (Math.PI * 2) / slots;
+  const a0 = Math.random() * Math.PI * 2;        // which way the home pair faces, rolled per match
+  for (let k = 0; k < slots; k++) {
+    const home = k < ENDLESS_PLAYER_BUILDINGS;
+    // Home pair share one radius so they sit as a pair; neutrals alternate
+    // between the outer and inner ring so the map has depth to fight through
+    // instead of one flat circle of identical prizes.
+    const f = home ? 0.8 : (k % 2 ? 0.5 : 0.86);
+    const p = ell(f, a0 + k * step);
+    raw.push({
+      x: p.x, y: p.y,
+      owner: home ? 0 : NEUTRAL,
+      level: home ? 1 : pick([1, 1, 2, 2, 3]),
+      // A neutral watchtower is a permanent gun emplacement with no regen —
+      // exactly what you want against waves, and exactly why it costs you a
+      // castle's worth of economy to hold one. Roughly a third of the field.
+      type: home ? "castle" : (Math.random() < 0.32 ? "tower" : "castle"),
+    });
+  }
+  raw.push({ x: cx, y: cy, owner: NEUTRAL, level: pick([2, 3]), type: "tower" });
+
+  const towers = raw.map((p, i) => ({
+    id: i, x: p.x, y: p.y,
+    owner: p.owner, type: p.type,
+    troops: p.type === "tower" ? towerCapacity({ level: p.level }) : START_TROOPS,
+    level: p.level, cell: [],
+  }));
+
+  computeCells(towers, W, H);
+  recenterCastles(towers, W, H);
+
+  return {
+    towers,
+    perPlayer: ENDLESS_PLAYER_BUILDINGS,
+    neutrals: towers.filter((t) => t.owner === NEUTRAL).length,
+  };
+}
+
 // ================= Sound =================
 // Everything here is synthesized with the Web Audio API — no external audio files,
 // keeping this a single self-contained HTML document. AudioContext only starts on
@@ -1825,7 +1921,7 @@ function TowerConquest() {
   const gameRef = useRef(null);
   const [screen, setScreen] = useState("menu");
   const [numPlayers, setNumPlayers] = useState(2);
-  const [mode, setMode] = useState("ffa"); // "ffa" | "2v2"
+  const [mode, setMode] = useState("ffa"); // "ffa" | "2v2" | "random" | "endless"
   // Tempo is the default so a player who never opens the hero picker still
   // gets a sensible starting kit (Rally/Speed/Tower Defense as of this
   // session's Rally<->Slow Down swap with Warlord).
@@ -1864,6 +1960,11 @@ function TowerConquest() {
   const [pct, setPct] = useState(100);
   const pctRef = useRef(100);
   const [hud, setHud] = useState([]);
+  // Endless mode's phase readout, refreshed on the same tick as `hud` and null in
+  // every other mode. Kept separate from `hud` (which is strictly per-player
+  // standings) because the swarm has no standings worth showing — between waves
+  // it owns nothing and its pill drops off the HUD entirely.
+  const [endlessHud, setEndlessHud] = useState(null);
   const [outcome, setOutcome] = useState(null);
   const [paused, setPaused] = useState(false);
   // Set only by the leave-the-app auto-pause below (never by the menu or the
@@ -2646,10 +2747,15 @@ function TowerConquest() {
     const seed = (seedIn != null ? seedIn : Math.floor(Math.random() * 0x100000000)) >>> 0;
     const rng = makeRng(seed);
     const teamMode = gameMode === "2v2";
-    const nPlayers = teamMode ? 4 : playersResolved;
+    // Endless is always exactly two owner slots: you (0) and the swarm
+    // (ENDLESS_SWARM = 1), each their own team. The menu's combatant count is
+    // ignored — there's only ever one thing attacking you, it just arrives in
+    // ever-larger quantities.
+    const endless = gameMode === "endless";
+    const nPlayers = endless ? 2 : teamMode ? 4 : playersResolved;
     // Team assignment: FFA → everyone their own team; 2v2 → {0,1} vs {2,3}
     const teams = teamMode ? [0, 0, 1, 1] : Array.from({ length: nPlayers }, (_, i) => i);
-    const map = generateMap(nPlayers, W, H, teamMode);
+    const map = endless ? generateEndlessMap(W, H) : generateMap(nPlayers, W, H, teamMode);
     if (tutorial) {
       // Keep the tutorial forgiving: every castle except the player's own starts at
       // level 1, so nothing the player attacks is beefed up beyond the baseline.
@@ -2701,7 +2807,11 @@ function TowerConquest() {
     // aiSpecials bails out entirely (see its early return). Never applied to the
     // tutorial, whose scripted pacing assumes its one AI opponent behaves
     // normally. The human's own hero is untouched either way.
-    const noAiHeroes = !tutorial && !opponentHeroes;
+    // The endless swarm is heroless by design, whatever the menu says — it has
+    // no buildings to Fortify, no economy to Rally and nobody driving it, so a
+    // kit would be dead weight it could never use. Forced here rather than left
+    // to the menu toggle so the mode can't be started with rival heroes on.
+    const noAiHeroes = endless || (!tutorial && !opponentHeroes);
     const aiPool = tutorial ? [] : HERO_IDS.filter((id) => id !== humanHero);
     for (let i = aiPool.length - 1; i > 0; i--) { // Fisher-Yates shuffle
       const j = Math.floor(Math.random() * (i + 1));
@@ -2721,6 +2831,19 @@ function TowerConquest() {
       heroes, // heroes[owner] -> HEROES key (or null with noAiHeroes); see CAST_FNS/aiSpecials/specials-UI
       noAiHeroes, // read by aiSpecials + the standings pills, so it survives into the match
       mode: gameMode,
+      // Endless mode's phase clock, or null in every other mode. Its presence is
+      // also the mode flag itself — `if (g.endless)` gates the wave director, the
+      // uncapped player economy, the swarm's pinned momentum, the suppressed AI
+      // turn, and the "no win condition" branch of the outcome check.
+      //   phase  — 0 during the opening prep, then 1, 2, 3, … forever
+      //   state  — "break" (counting down) | "spawning" | "holding" (wave committed)
+      //   timer  — seconds left in a "break"
+      //   size   — this phase's total wave size (endlessWaveSize)
+      //   left   — of that wave, how many are still to walk in
+      //   cleared— highest phase fully survived, for the outcome screen
+      endless: endless
+        ? { phase: 0, state: "break", timer: ENDLESS_PREP, size: 0, left: 0, accum: 0, rate: 0, gates: [], cleared: 0 }
+        : null,
       selectedMode: tutorial ? "ffa" : gameModeIn, // the RAW menu choice, pre-random-resolution —
                                                     // see startGame's Redeploy caveat: "random"
                                                     // must stay "random" here even though `mode`
@@ -2991,6 +3114,144 @@ function TowerConquest() {
     if (n < 1) return;
     attacker.troops -= n;
     g.orders.push({ owner: attacker.owner, src: attacker.id, dst: target.id, remaining: n, accum: 0, spawned: 0 });
+  }
+
+  // ================= Endless mode: the wave director =================
+  // The swarm has no buildings and no orders — nothing to march OUT of — so its
+  // troops are pushed straight into g.units at a board-edge gate with a
+  // destination already set. From that point on they're ordinary soldiers: they
+  // clash in the field, get shot by towers, and damage/capture what they reach,
+  // all through the same code every other unit uses.
+
+  // `s` in [0,1) -> a point on the VISIBLE board's perimeter, walking top ->
+  // right -> bottom -> left. The visible half-width shrinks with the row (see
+  // visibleHalfWidthAt), so the left/right stretches are measured from the
+  // half-width at their own y — using the flat world rect instead would open
+  // those gates in cropped space and drones would appear out of thin air part-way
+  // in.
+  function endlessEdgePoint(g, s) {
+    const { W, H } = g;
+    const inset = ENDLESS_EDGE_INSET;
+    const halfAt = (y) => visibleHalfWidthAt(W, H, y) - inset;
+    const q = ((s % 1) + 1) % 1 * 4;
+    if (q < 1) {                                    // top edge, left -> right
+      const y = inset;
+      return { x: W / 2 + (q - 0.5) * 2 * halfAt(y), y };
+    }
+    if (q < 2) {                                    // right edge, top -> bottom
+      const y = inset + (q - 1) * (H - 2 * inset);
+      return { x: W / 2 + halfAt(y), y };
+    }
+    if (q < 3) {                                    // bottom edge, right -> left
+      const y = H - inset;
+      return { x: W / 2 + (0.5 - (q - 2)) * 2 * halfAt(y), y };
+    }
+    const y = H - inset - (q - 3) * (H - 2 * inset); // left edge, bottom -> top
+    return { x: W / 2 - halfAt(y), y };
+  }
+
+  // This phase's entry points: endlessGateCount(phase) of them, spread evenly
+  // around the perimeter with a little jitter so consecutive phases don't reuse
+  // the exact same spots. Rolled once when the phase opens, not per drone, so a
+  // wave reads as columns pushing in from N places rather than a uniform drizzle.
+  function endlessGates(g, phase) {
+    const count = endlessGateCount(phase);
+    const base = g.rng();
+    const gates = [];
+    for (let k = 0; k < count; k++) {
+      const s = base + k / count + (g.rng() - 0.5) * (0.5 / count);
+      gates.push(endlessEdgePoint(g, s));
+    }
+    return gates;
+  }
+
+  // "They immediately attack a random building": a drone's target is drawn
+  // uniformly from the buildings YOU hold, the moment it spawns — no scouting,
+  // no reconsidering, no picking the weakest. If you've been pushed off the board
+  // entirely they fall back to anything the swarm doesn't own (i.e. neutrals), so
+  // a wave still has somewhere to be while your last troops are marching to
+  // retake something.
+  function endlessTarget(g) {
+    let pool = g.towers.filter((t) => t.owner === 0);
+    if (!pool.length) pool = g.towers.filter((t) => t.owner !== ENDLESS_SWARM);
+    if (!pool.length) return null;
+    return pool[Math.floor(g.rng() * pool.length)];
+  }
+
+  // One rank of drones walking in through `gate`, all headed at the same
+  // randomly-drawn building — deliberately the same rows-of-4 formation an
+  // ordinary order marches in (see the orders loop), so a wave reads as troops
+  // rather than confetti. Returns how many actually spawned.
+  function endlessSpawnRow(g, gate, n) {
+    const target = endlessTarget(g);
+    if (!target) return 0;
+    const ang = Math.atan2(target.y - gate.y, target.x - gate.x);
+    const px = -Math.sin(ang), py = Math.cos(ang); // perpendicular to the march direction
+    const rowPhase = g.rng() * Math.PI * 2;        // one shared sway phase per rank, as the orders loop does
+    // The rank spreads sideways from the gate, which can push its outer files
+    // past the visible boundary the gate itself was placed just inside of —
+    // clamp them back in so the whole row is on screen from its first frame.
+    const half = visibleHalfWidthAt(g.W, g.H, gate.y) - 2;
+    for (let c = 0; c < n; c++) {
+      const lateral = (c - (n - 1) / 2) * 9;
+      g.units.push({
+        uid: g.uidSeq++,
+        owner: ENDLESS_SWARM,
+        x: Math.min(g.W / 2 + half, Math.max(g.W / 2 - half, gate.x + px * lateral)),
+        y: Math.min(g.H - 2, Math.max(2, gate.y + py * lateral)),
+        dst: target.id,
+        off: lateral,
+        speed: UNIT_SPEED,
+        phase: rowPhase,
+      });
+    }
+    return n;
+  }
+
+  // The phase clock, one sim tick at a time. Three states, cycling forever:
+  //   "break"    — counting down to the next phase (ENDLESS_PREP before the
+  //                first one, ENDLESS_BREAK between the rest)
+  //   "spawning" — this phase's wave is streaming out of its gates
+  //   "holding"  — the wave is fully committed; the phase ends when the last
+  //                drone is off the field, killed or spent arriving somewhere
+  // Nothing here can end the match: the loss check lives with the normal
+  // elimination sweep, and endless has no win condition at all.
+  function runEndlessPhases(g, dt) {
+    const e = g.endless;
+    if (e.state === "break") {
+      e.timer -= dt;
+      if (e.timer > 0) return;
+      e.phase++;
+      e.size = endlessWaveSize(e.phase);
+      e.left = e.size;
+      e.accum = 0;
+      // Big waves pour out faster rather than taking proportionally longer, so a
+      // phase always lands as a wave and not as a half-hour siege — floored at
+      // ENDLESS_MIN_SPAWN_RATE so the small early ones aren't a trickle either.
+      e.rate = Math.max(ENDLESS_MIN_SPAWN_RATE, e.size / ENDLESS_WAVE_SECONDS);
+      e.gates = endlessGates(g, e.phase);
+      e.state = "spawning";
+      SoundEngine.barrage(0.7); // wave horn
+      return;
+    }
+    if (e.state === "spawning") {
+      e.accum += e.rate * dt;
+      let guard = 0;
+      while (e.accum >= 4 && e.left > 0 && guard++ < 64) {
+        e.accum -= 4; // always a full rank's worth, even for a smaller final rank
+        const gate = e.gates[Math.floor(g.rng() * e.gates.length)];
+        const spawned = endlessSpawnRow(g, gate, Math.min(4, e.left));
+        if (!spawned) { e.left = 0; break; } // nothing on the board left to attack — the match is already decided
+        e.left -= spawned;
+      }
+      if (e.left <= 0) e.state = "holding";
+      return;
+    }
+    if (!g.units.some((u) => u.owner === ENDLESS_SWARM)) {
+      e.cleared = e.phase;
+      e.state = "break";
+      e.timer = ENDLESS_BREAK;
+    }
   }
 
   // ----- Input: press a tower, drag to the target, release to march -----
@@ -4095,6 +4356,7 @@ function TowerConquest() {
         if (g.momentum) {
           const revertRate = MOMENTUM_REVERT_STEP / MOMENTUM_REVERT_INTERVAL;
           for (let pid = 0; pid < g.numPlayers; pid++) {
+            if (momentumLocked(g, pid)) continue; // endless swarm: pinned at 1.0, so there's nothing to revert toward
             if (g.momentum[pid] < 1) g.momentum[pid] = Math.min(1, g.momentum[pid] + revertRate * dt);
             else if (g.momentum[pid] > 1) g.momentum[pid] = Math.max(1, g.momentum[pid] - revertRate * dt);
           }
@@ -4147,7 +4409,18 @@ function TowerConquest() {
           const cap = towerCapacity(t);
           if (t.troops >= cap) continue;
           let room = cap - t.troops; // this building's own capacity still allows this much
-          if (t.owner !== NEUTRAL) {
+          // Endless: YOUR side has no population budget at all. Troop production
+          // there is deliberately uncapped — a phase-15 wave is 200 drones, which
+          // you simply cannot meet on an army ceiling set by ten buildings — so
+          // every building of yours keeps refilling to its own capacity no matter
+          // how large the force already marching around the board is. The
+          // per-building capacity itself still applies (a castle doesn't become
+          // an infinite stack), so what's actually lifted is the "troops in the
+          // field throttle regen at home" rule: you can keep producing and
+          // banking an army indefinitely. Every other side, and every other mode,
+          // keeps the normal shared budget.
+          const uncapped = g.endless && t.owner !== NEUTRAL && g.teams[t.owner] === g.teams[0];
+          if (t.owner !== NEUTRAL && !uncapped) {
             const team = g.teams[t.owner];
             room = Math.min(room, Math.max(0, budgetCapacity[team] - totalPop[team]));
           }
@@ -4494,7 +4767,11 @@ function TowerConquest() {
           // matters for determinism — its g.rng() reset would otherwise pull from
           // the shared RNG stream and desync the two sims. The opponent's train
           // (aiTrain) still advances below so their casts can charge.
-          if (!g.eliminated.has(pid) && !g.net) {
+          // No AI turn for the endless swarm either — it isn't a rival empire
+          // making decisions, it's a wave director (runEndlessPhases below). Any
+          // building it happens to capture just sits there as a scar on the map
+          // for you to take back; it never launches attacks of its own.
+          if (!g.eliminated.has(pid) && !g.net && !g.endless) {
             g.aiTimers[pid] -= dt;
             if (g.aiTimers[pid] <= 0) {
               if (!g.tutorial) aiAct(g, pid);
@@ -4514,6 +4791,13 @@ function TowerConquest() {
             g.tutorialWaveTimer = 2.5 + Math.random() * 1.5;
           }
         }
+        // Endless: advance the phase clock — open the next wave, stream it out of
+        // its gates, or wait for the field to clear. Runs after the AI block
+        // above (which it replaces in this mode) and before the elimination
+        // sweep, so a wave spawned this tick is already on the board when the
+        // sweep decides who's still alive.
+        if (g.endless) runEndlessPhases(g, dt);
+
         // Evaluate AI specials a few times a second (keeps the cluster search cheap)
         g.aiFxTimer -= dt;
         if (g.aiFxTimer <= 0) {
@@ -4549,7 +4833,14 @@ function TowerConquest() {
         // rival is the second-to-last STEP, and slamming the victory screen up here
         // would skip the wrap-up step entirely. The tutorial ends when the player
         // taps "Finish Tutorial" on that final overlay instead.
-        else if (!g.tutorial && aliveTeams.size === 1) { g.over = true; setOutcome("win"); lastOutcomeSent = "win"; closeOnlineMatch("win"); SoundEngine.win(); SoundEngine.stopBattle(); }
+        // Endless has NO win condition — there's always another phase — and the
+        // win branch would otherwise fire almost immediately: the swarm owns
+        // nothing between waves, so the elimination sweep marks it out and
+        // "aliveTeams.size === 1" reads as "every rival eliminated" the instant
+        // the board clears. Losing works exactly as it does everywhere else
+        // (the branch above): you're out when you hold no buildings, no units
+        // and no queued orders.
+        else if (!g.tutorial && !g.endless && aliveTeams.size === 1) { g.over = true; setOutcome("win"); lastOutcomeSent = "win"; closeOnlineMatch("win"); SoundEngine.win(); SoundEngine.stopBattle(); }
 
         // Tutorial: once the requested action is detected, hold the step open
         // for `settleFor` seconds so the player actually sees the effect (a
@@ -4785,6 +5076,17 @@ function TowerConquest() {
           });
         }
         setHud(stats);
+        // `left` is still-to-spawn and `onField` is already walking around, so
+        // their sum is "how much of this wave is still coming for you" — the one
+        // number that actually matters while a phase is live.
+        const e = g.endless;
+        setEndlessHud(e ? {
+          phase: e.phase,
+          state: e.state,
+          timer: Math.max(0, Math.ceil(e.timer)),
+          size: e.size,
+          remaining: e.left + g.units.reduce((n, u) => n + (u.owner === ENDLESS_SWARM ? 1 : 0), 0),
+        } : null);
         syncSpecials(g);
         lastHudStats = stats;
       }
@@ -6204,6 +6506,35 @@ function TowerConquest() {
                 marginLeft: "auto", display: "flex", flexDirection: "column",
                 alignItems: "flex-end", gap: 4,
               }}>
+                {/* Endless: the phase readout stands in for the opponent pill.
+                    There genuinely isn't a rival to show standings for — between
+                    waves the swarm holds nothing and its pill drops off the HUD —
+                    so what goes here instead is the only thing worth tracking:
+                    which phase you're on, and how much of it is still coming. */}
+                {endlessHud && (
+                  <div style={{
+                    background: "rgba(10,14,24,0.32)",
+                    border: `1px solid ${endlessHud.state === "break" ? "#46577d" : FACTIONS[ENDLESS_SWARM].dim + "88"}`,
+                    borderRadius: 10, padding: "5px 10px",
+                    display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2,
+                    minWidth: 116,
+                  }}>
+                    <div style={{
+                      fontSize: 12, fontWeight: 800, letterSpacing: 2,
+                      color: endlessHud.state === "break" ? "rgba(232,235,242,0.75)" : FACTIONS[ENDLESS_SWARM].color,
+                    }}>
+                      PHASE {endlessHud.state === "break" ? endlessHud.phase + 1 : endlessHud.phase}
+                    </div>
+                    <div style={{
+                      fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, fontWeight: 700,
+                      color: "rgba(232,235,242,0.7)", whiteSpace: "nowrap",
+                    }}>
+                      {endlessHud.state === "break"
+                        ? `incoming in ${endlessHud.timer}s`
+                        : `${endlessHud.remaining} / ${endlessHud.size} left`}
+                    </div>
+                  </div>
+                )}
                 {rightPills.map(renderPill)}
               </div>
             )}
@@ -6565,6 +6896,7 @@ function TowerConquest() {
                     <li>Double-tap a full building to upgrade it (costs half its troops).</li>
                     <li>Pick a <b style={{ color: "#1F2A44" }}>hero</b> before deploying — each one gives you 3 specials to use in battle.</li>
                     <li>Everyone starts even. Capture every rival's last building to win.</li>
+                    <li><b style={{ color: "#1F2A44" }}>Endless</b>: you start with 2 buildings and no troop cap. Waves pour in from every side of the map, bigger every phase, and there's no winning — only how long you last.</li>
                   </ul>
                 </div>
               </div>
@@ -6573,7 +6905,7 @@ function TowerConquest() {
               <div>
                 <div style={{ fontSize: 13, letterSpacing: 3, color: "#8592A8", marginBottom: 14 }}>MODE</div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "stretch" }}>
-                  {[["ffa", "Free-for-all"], ["2v2", "Teams · 2v2"], ["random", "Random"]].map(([m, label]) => (
+                  {[["ffa", "Free-for-all"], ["2v2", "Teams · 2v2"], ["random", "Random"], ["endless", "Endless"]].map(([m, label]) => (
                     <button key={m} onClick={() => setMode(m)}
                       style={chip({
                         background: mode === m ? "#FFF6DC" : "#F4F7FC",
@@ -6609,6 +6941,11 @@ function TowerConquest() {
                   ) : mode === "2v2" ? (
                     <div style={{ fontSize: 12, color: "#6B7684" }}>
                       you + 1 AI ally vs 2 AI enemies
+                    </div>
+                  ) : mode === "endless" ? (
+                    <div style={{ fontSize: 12, color: "#6B7684" }}>
+                      hold out against waves from every side — 2 buildings to start,
+                      no troop cap, no way to win
                     </div>
                   ) : (
                     <div style={{ fontSize: 12, color: "#6B7684" }}>
@@ -7090,9 +7427,14 @@ function TowerConquest() {
                   {outcome === "win" ? "SECTOR SECURED" : "OVERRUN"}
                 </div>
                 <div style={{ color: "#8a93ab", fontSize: 12 }}>
-                  {outcome === "win"
-                    ? (gameRef.current?.mode === "2v2" ? "Enemy team wiped out." : "Every rival eliminated.")
-                    : (gameRef.current?.mode === "2v2" ? "Your team has fallen." : "Your last forces have fallen.")}
+                  {/* Endless can only ever end one way (see the outcome check —
+                      it has no win branch), so the endless line is the score:
+                      how many whole phases you cleared before being overrun. */}
+                  {gameRef.current?.endless
+                    ? `Broke through on phase ${gameRef.current.endless.phase || 1} — ${gameRef.current.endless.cleared} cleared.`
+                    : outcome === "win"
+                      ? (gameRef.current?.mode === "2v2" ? "Enemy team wiped out." : "Every rival eliminated.")
+                      : (gameRef.current?.mode === "2v2" ? "Your team has fallen." : "Your last forces have fallen.")}
                 </div>
               </div>
               <div style={{ display: "flex", gap: 8, pointerEvents: "auto" }}>
