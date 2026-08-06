@@ -440,7 +440,7 @@ function remapHudForGuest(hud) {
 }
 
 // ================= Constants =================
-const APP_VERSION = "0.266"; // bump by 0.001 each update
+const APP_VERSION = "0.267"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -827,13 +827,14 @@ const ENDLESS_MAX_TARGETS = 3;
 const ENDLESS_RANK_WIDTH = 8;
 const ENDLESS_RANK_DEPTH = 5;
 const ENDLESS_RANK_GAP = 8;         // px between stacked ranks, measured back along the march direction
-// Wave size by phase (1-based): the first wave is 30, +10 per phase up to 100,
-// then +20 up to 200, then +50 with no ceiling.
-// 30,40,…,100,120,140,160,180,200,250,300,350,…
+// Wave size by phase (1-based): the first wave is 100, +50 per phase until it
+// reaches 300 (phase 5), then +100 per phase until it reaches 1000 (phase 12),
+// then +200 per phase with no ceiling.
+// 100,150,200,250,300,400,500,600,700,800,900,1000,1200,1400,1600,…
 function endlessWaveSize(phase) {
-  if (phase <= 8) return 20 + phase * 10;
-  if (phase <= 13) return 100 + (phase - 8) * 20;
-  return 200 + (phase - 13) * 50;
+  if (phase <= 5) return 50 + phase * 50;
+  if (phase <= 12) return 300 + (phase - 5) * 100;
+  return 1000 + (phase - 12) * 200;
 }
 // The board is drawn through a tilted, ZOOMED camera (see proj) and then clipped
 // to the world rect, so the world's own left/right edges sit off-screen — by how
