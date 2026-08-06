@@ -440,7 +440,7 @@ function remapHudForGuest(hud) {
 }
 
 // ================= Constants =================
-const APP_VERSION = "0.265"; // bump by 0.001 each update
+const APP_VERSION = "0.266"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -798,8 +798,13 @@ const towerFireCd = (t) => ARROW_FIRE_CD / fireLevelMult(t);
 // applies to it unchanged; what's different is only that nothing spawns it a
 // base and nothing gives it a turn (see the aiAct/aiSpecials guards).
 const ENDLESS_SWARM = 1;            // the swarm's owner id
-const ENDLESS_MIN_BUILDINGS = 10;   // the map never has fewer buildings than this
-const ENDLESS_PLAYER_BUILDINGS = 2; // you start holding exactly this many; every other building is neutral
+// There is nothing to conquer in endless: the board is ENDLESS_BUILDINGS plain
+// level-1 castles and every one of them is yours from the first frame. No
+// neutrals to expand into and no watchtowers, because the mode isn't about
+// taking ground — it's about holding all of it. (MAX_CASTLES is 12, which is
+// what the renderer and the Voronoi pass are sized around, so this is the most
+// buildings the board can carry.)
+const ENDLESS_BUILDINGS = 12;
 const ENDLESS_PREP = 20;            // seconds of quiet before phase 1 — enough to take a neutral or two first
 const ENDLESS_BREAK = 12;           // seconds between one phase being cleared and the next opening
 // A phase arrives as a MASS, not a drizzle: the whole wave is on the board
@@ -1579,57 +1584,40 @@ function generateMap(numPlayers, W, H, teamMode = false) {
 }
 
 // ---- Endless map ----
-// Nothing symmetric to balance here: the swarm owns no buildings, so the board
-// is just YOUR starting pair plus a field of neutrals to expand into. At least
-// ENDLESS_MIN_BUILDINGS in total (capped by MAX_CASTLES, which the renderer and
-// the Voronoi pass are sized around), your two placed side by side on one arc so
-// they start as mutually-supporting neighbours rather than two lone islands.
-// Everything else alternates between an outer and an inner ring, plus one
-// level-2/3 watchtower dead center — the same shape generateMap uses, minus the
-// per-player rotation, since there's only one player to place.
+// Nothing to balance and nothing to divide up: every building on the board is
+// yours, a plain level-1 castle, from the opening frame. No neutrals, no
+// watchtowers, no starting-level roll — the only asymmetry in the mode is the
+// swarm pouring in from outside. Laid out as a ring of castles alternating
+// between an outer and an inner radius, plus one in the middle, then relaxed
+// (computeCells/recenterCastles) so the regions come out evenly sized.
 function generateEndlessMap(W, H) {
-  const total = Math.min(MAX_CASTLES, ENDLESS_MIN_BUILDINGS + Math.floor(Math.random() * 3)); // 10-12
   const cx = W / 2, cy = H / 2;
   const rx = W / 2 - mapEdgeMarginX(W), ry = H / 2 - MAP_EDGE_MARGIN_Y;
   const ell = (f, ang) => ({ x: cx + Math.cos(ang) * f * rx, y: cy + Math.sin(ang) * f * ry });
   const raw = [];
-  const slots = total - 1;                       // every building except the center one
+  const slots = ENDLESS_BUILDINGS - 1;           // every building except the center one
   const step = (Math.PI * 2) / slots;
-  const a0 = Math.random() * Math.PI * 2;        // which way the home pair faces, rolled per match
+  const a0 = Math.random() * Math.PI * 2;        // ring rotation, rolled per match
   for (let k = 0; k < slots; k++) {
-    const home = k < ENDLESS_PLAYER_BUILDINGS;
-    // Home pair share one radius so they sit as a pair; neutrals alternate
-    // between the outer and inner ring so the map has depth to fight through
-    // instead of one flat circle of identical prizes.
-    const f = home ? 0.8 : (k % 2 ? 0.5 : 0.86);
-    const p = ell(f, a0 + k * step);
-    raw.push({
-      x: p.x, y: p.y,
-      owner: home ? 0 : NEUTRAL,
-      level: home ? 1 : pick([1, 1, 2, 2, 3]),
-      // A neutral watchtower is a permanent gun emplacement with no regen —
-      // exactly what you want against waves, and exactly why it costs you a
-      // castle's worth of economy to hold one. Roughly a third of the field.
-      type: home ? "castle" : (Math.random() < 0.32 ? "tower" : "castle"),
-    });
+    // Alternating radii rather than one flat circle, so the map has some depth
+    // to maneuver in and a wave has to cross a couple of regions to reach the
+    // far side.
+    const p = ell(k % 2 ? 0.5 : 0.86, a0 + k * step);
+    raw.push({ x: p.x, y: p.y });
   }
-  raw.push({ x: cx, y: cy, owner: NEUTRAL, level: pick([2, 3]), type: "tower" });
+  raw.push({ x: cx, y: cy });
 
   const towers = raw.map((p, i) => ({
     id: i, x: p.x, y: p.y,
-    owner: p.owner, type: p.type,
-    troops: p.type === "tower" ? towerCapacity({ level: p.level }) : START_TROOPS,
-    level: p.level, cell: [],
+    owner: 0, type: "castle",
+    troops: START_TROOPS,
+    level: 1, cell: [],
   }));
 
   computeCells(towers, W, H);
   recenterCastles(towers, W, H);
 
-  return {
-    towers,
-    perPlayer: ENDLESS_PLAYER_BUILDINGS,
-    neutrals: towers.filter((t) => t.owner === NEUTRAL).length,
-  };
+  return { towers, perPlayer: ENDLESS_BUILDINGS, neutrals: 0 };
 }
 
 // ================= Sound =================
@@ -3167,10 +3155,13 @@ function TowerConquest() {
 
   // The buildings a phase is coming for: 1, 2 or 3 of yours, drawn at random when
   // the phase opens and fixed for its duration. Capped by ENDLESS_MAX_TARGETS and
-  // by how many buildings you actually hold. If you've been pushed off the board
-  // entirely they fall back to anything the swarm doesn't own (i.e. neutrals), so
-  // a wave still has somewhere to be while your last troops are marching to
-  // retake something.
+  // by how many buildings you actually hold — the whole board starts as yours, so
+  // that second clamp only bites once the swarm has taken some off you. The
+  // fallback (anything the swarm doesn't own) can only find something if a
+  // neutral exists, which the endless map never generates — so once every
+  // building on the board is the swarm's, a wave has nowhere to go and the group
+  // simply stands down. You've already lost at that point; see the elimination
+  // sweep, which ends the match as soon as your last unit and order are gone too.
   function endlessTargets(g, want) {
     let pool = g.towers.filter((t) => t.owner === 0);
     if (!pool.length) pool = g.towers.filter((t) => t.owner !== ENDLESS_SWARM);
@@ -4449,10 +4440,20 @@ function TowerConquest() {
           totalPop[g.teams[u.owner]] += 1; // each marching soldier is 1 troop of population, regardless of any Rolling Stones/Rage combat-strength multiplier — those affect damage, not headcount
         }
         for (const t of g.towers) {
+          // Endless: YOUR buildings have no ceiling of any kind. Neither their
+          // own towerCapacity (they don't stop at 25/35/45/55 — a castle just
+          // keeps filling) nor the shared team population budget applies, so
+          // troops in the field never throttle production at home either. Both
+          // limits exist to keep a conquest match's economy proportional to the
+          // ground you hold; endless has no ground to take and waves that reach
+          // the hundreds, so what's left is a straight race between your regen
+          // and the swarm's growth. Scoped to the player's team — anything the
+          // swarm captures keeps the normal caps, as does every other mode.
+          const uncapped = g.endless && t.owner !== NEUTRAL && g.teams[t.owner] === g.teams[0];
           const cap = towerCapacity(t);
-          if (t.troops >= cap) continue;
-          let room = cap - t.troops; // this building's own capacity still allows this much
-          if (t.owner !== NEUTRAL) {
+          if (!uncapped && t.troops >= cap) continue;
+          let room = uncapped ? Infinity : cap - t.troops; // this building's own capacity still allows this much
+          if (t.owner !== NEUTRAL && !uncapped) {
             const team = g.teams[t.owner];
             room = Math.min(room, Math.max(0, budgetCapacity[team] - totalPop[team]));
           }
@@ -6928,7 +6929,7 @@ function TowerConquest() {
                     <li>Double-tap a full building to upgrade it (costs half its troops).</li>
                     <li>Pick a <b style={{ color: "#1F2A44" }}>hero</b> before deploying — each one gives you 3 specials to use in battle.</li>
                     <li>Everyone starts even. Capture every rival's last building to win.</li>
-                    <li><b style={{ color: "#1F2A44" }}>Endless</b>: you start with 2 buildings. Each phase, one massed wave storms in from the map's edges at up to 3 of your buildings at once — bigger every time. There's no winning, only how long you last.</li>
+                    <li><b style={{ color: "#1F2A44" }}>Endless</b>: all 12 buildings start as yours, and they fill without limit. Each phase, one massed wave storms in from the map's edges at up to 3 of them at once — bigger every time. There's no winning, only how long you last.</li>
                   </ul>
                 </div>
               </div>
@@ -6976,8 +6977,8 @@ function TowerConquest() {
                     </div>
                   ) : mode === "endless" ? (
                     <div style={{ fontSize: 12, color: "#6B7684" }}>
-                      hold out against massed waves — 2 buildings to start,
-                      no way to win
+                      hold out against massed waves — all 12 buildings are yours,
+                      no troop cap, no way to win
                     </div>
                   ) : (
                     <div style={{ fontSize: 12, color: "#6B7684" }}>
