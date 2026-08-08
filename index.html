@@ -440,7 +440,7 @@ function remapHudForGuest(hud) {
 }
 
 // ================= Constants =================
-const APP_VERSION = "0.267"; // bump by 0.001 each update
+const APP_VERSION = "0.268"; // bump by 0.001 each update
 const START_TROOPS = 10;     // every castle begins with 10 troops (neutral towers are separate — see towerCapacity, they still start full)
 const BASE_MAX = 10;         // per-level cap step; each level adds 10 (unchanged rate)
 const MAX_LEVEL = 4;         // cap: level 4 → 50-troop upgrade threshold (towerMax)
@@ -807,26 +807,21 @@ const ENDLESS_SWARM = 1;            // the swarm's owner id
 const ENDLESS_BUILDINGS = 12;
 const ENDLESS_PREP = 20;            // seconds of quiet before phase 1 — enough to take a neutral or two first
 const ENDLESS_BREAK = 12;           // seconds between one phase being cleared and the next opening
-// A phase arrives as a MASS, not a drizzle: the whole wave is on the board
-// within a couple of seconds, so what you see is one big block per group
-// converging on its target rather than a steady stream trickling in from
-// everywhere. The rate scales with the wave so a 500-drone phase lands in the
-// same couple of seconds a 30-drone one does; the floor only matters for the
-// small early waves.
-const ENDLESS_BURST_SECONDS = 2;
-const ENDLESS_MIN_SPAWN_RATE = 24;  // drones/sec floor
 // How many of YOUR buildings a single phase goes after: 1, 2 or 3, rolled per
 // phase. Each targeted building gets its own group — one gate, one column, one
-// destination — so the wave concentrates into at most three fists instead of
-// spreading itself thin across the whole map.
+// destination — so the wave concentrates into at most three lines of attack
+// instead of spreading itself thin across the whole map.
 const ENDLESS_MAX_TARGETS = 3;
-// A group's block formation as it comes through its gate: files wide, and how
-// many ranks stack up behind the gate before the pattern repeats. Wider and
-// deeper than an ordinary order's rows of 4 — this is a horde arriving, and it
-// should look like one from the first frame.
-const ENDLESS_RANK_WIDTH = 8;
-const ENDLESS_RANK_DEPTH = 5;
-const ENDLESS_RANK_GAP = 8;         // px between stacked ranks, measured back along the march direction
+// A wave walks in EXACTLY the way troops walk out of one of your buildings: rows
+// of ENDLESS_ROW released at SPAWN_RATE, using the same rank stagger the orders
+// loop uses. That pacing is the whole point of the mode being playable — a rank
+// every 4/SPAWN_RATE seconds means each one is a real stride behind the one in
+// front, so a wave arrives as a column you can meet with troops of your own
+// rather than as a solid block that's already on top of you. The consequence is
+// that a phase takes as long to stream in as its size demands: at 4 per row a
+// 400-strong group is ~25 seconds of marching, and that's intended.
+const ENDLESS_ROW = 4;
+const ENDLESS_RANK_STAGGER = 1;     // px each successive rank starts further back, cycling every 3 — same as the orders loop
 // Wave size by phase (1-based): the first wave is 100, +50 per phase until it
 // reaches 300 (phase 5), then +100 per phase until it reaches 1000 (phase 12),
 // then +200 per phase with no ceiling.
@@ -2843,7 +2838,7 @@ function TowerConquest() {
       //   timer  — seconds left in a "break"
       //   size   — this phase's total wave size (endlessWaveSize)
       //   left   — of that wave, how many are still to walk in
-      //   groups — the 1-3 assault groups: {gate, targetId, left, rank, accum, rate}
+      //   groups — the 1-3 assault groups: {gate, targetId, left, rank, accum}
       //   cleared— highest phase fully survived, for the outcome screen
       endless: endless
         ? { phase: 0, state: "break", timer: ENDLESS_PREP, size: 0, left: 0, groups: [], cleared: 0 }
@@ -3189,19 +3184,19 @@ function TowerConquest() {
       gate: endlessEdgePoint(g, base + k / targets.length + (g.rng() - 0.5) * (0.5 / targets.length)),
       targetId: t.id,
       left: k === 0 ? size - share * (targets.length - 1) : share,
-      rank: 0,     // how many ranks this group has already pushed through, for the block stagger
+      rank: 0,     // how many rows this group has already released, for the rank stagger
       accum: 0,
-      rate: 0,
     }));
   }
 
-  // One rank of a group's block, walking in through its gate: ENDLESS_RANK_WIDTH
-  // files across, with successive ranks stacked ENDLESS_RANK_GAP px further back
-  // along the march direction (cycling after ENDLESS_RANK_DEPTH so a huge group
-  // doesn't trail off the map). Because a phase's whole wave lands within
-  // ENDLESS_BURST_SECONDS, what this actually produces on screen is a solid block
-  // of drones pushing in from one point — not a stream. Returns how many spawned.
-  function endlessSpawnRank(g, group, n) {
+  // One row of a group, walking in through its gate: ENDLESS_ROW files across,
+  // with successive rows starting a hair further back and catching up as they
+  // march — deliberately identical to how the orders loop releases troops out of
+  // a building's gate. The real gap between rows comes from the TIME between
+  // releases (SPAWN_RATE), not from that offset: at 4 per row and 16/sec that's a
+  // row every 0.25s, which at marching speed is about 16px of clear ground
+  // between ranks. Returns how many spawned.
+  function endlessSpawnRow(g, group, n) {
     const target = g.towers[group.targetId];
     // The group's building changed hands mid-phase (you lost it, or you retook
     // one the swarm had). Re-draw a target rather than marching the rest of the
@@ -3212,14 +3207,13 @@ function TowerConquest() {
     const gate = group.gate;
     const ang = Math.atan2(dst.y - gate.y, dst.x - gate.x);
     const px = -Math.sin(ang), py = Math.cos(ang);       // perpendicular to the march direction
-    const back = (group.rank % ENDLESS_RANK_DEPTH) * ENDLESS_RANK_GAP;
+    const back = (group.rank % 3) * ENDLESS_RANK_STAGGER; // cycles every 3 rows, as the orders loop does
     const bx = -Math.cos(ang) * back, by = -Math.sin(ang) * back;
-    const rankPhase = g.rng() * Math.PI * 2;             // one shared sway phase per rank, as the orders loop does
+    const rankPhase = g.rng() * Math.PI * 2;             // one shared sway phase per row, as the orders loop does
     group.rank++;
-    // The block spreads sideways and backwards from the gate, which can push its
-    // outer files past the visible boundary the gate itself was placed just
-    // inside of — clamp them back in so the whole formation is on screen from its
-    // first frame.
+    // The row spreads sideways from the gate, which can push its outer files past
+    // the visible boundary the gate itself was placed just inside of — clamp them
+    // back in so the whole row is on screen from its first frame.
     const half = visibleHalfWidthAt(g.W, g.H, gate.y) - 2;
     for (let c = 0; c < n; c++) {
       const lateral = (c - (n - 1) / 2) * 9;
@@ -3240,9 +3234,10 @@ function TowerConquest() {
   // The phase clock, one sim tick at a time. Three states, cycling forever:
   //   "break"    — counting down to the next phase (ENDLESS_PREP before the
   //                first one, ENDLESS_BREAK between the rest)
-  //   "spawning" — this phase's groups are pushing their blocks onto the board
+  //   "spawning" — this phase's groups are still marching rows out of their gates
   //   "holding"  — the wave is fully committed; the phase ends when the last
-  //                drone is off the field, killed or spent arriving somewhere
+  //                drone is off the field, killed or spent arriving somewhere,
+  //                and only THEN does the break clock for the next phase start
   // Nothing here can end the match: the loss check lives with the normal
   // elimination sweep, and endless has no win condition at all.
   function runEndlessPhases(g, dt) {
@@ -3253,27 +3248,24 @@ function TowerConquest() {
       e.phase++;
       e.size = endlessWaveSize(e.phase);
       e.groups = endlessGroups(g, e.phase, e.size);
-      // Every group empties within ENDLESS_BURST_SECONDS regardless of how big it
-      // is, so a 500-drone phase lands as fast as a 30-drone one — that's what
-      // makes a wave read as one mass hitting you rather than a long drip. The
-      // floor only matters for the small early waves.
-      for (const grp of e.groups) grp.rate = Math.max(ENDLESS_MIN_SPAWN_RATE, grp.left / ENDLESS_BURST_SECONDS);
       e.left = e.groups.reduce((s, grp) => s + grp.left, 0);
       e.state = "spawning";
       SoundEngine.barrage(0.7); // wave horn
       return;
     }
     if (e.state === "spawning") {
-      // Each group runs its own accumulator, so the groups pour in SIMULTANEOUSLY
-      // rather than taking turns — all of the wave, from all of its gates, inside
-      // the same couple of seconds.
+      // Each group runs its own accumulator at SPAWN_RATE — the same rate a
+      // building releases troops — so the groups march out side by side rather
+      // than taking turns, but each one is a steady column rather than a dump. A
+      // big phase therefore takes a real while to finish streaming in, which is
+      // exactly the window you use to answer it.
       for (const grp of e.groups) {
         if (grp.left <= 0) continue;
-        grp.accum += grp.rate * dt;
+        grp.accum += SPAWN_RATE * dt;
         let guard = 0;
-        while (grp.accum >= ENDLESS_RANK_WIDTH && grp.left > 0 && guard++ < 64) {
-          grp.accum -= ENDLESS_RANK_WIDTH; // always a full rank's worth, even for a smaller final rank
-          const spawned = endlessSpawnRank(g, grp, Math.min(ENDLESS_RANK_WIDTH, grp.left));
+        while (grp.accum >= ENDLESS_ROW && grp.left > 0 && guard++ < 16) {
+          grp.accum -= ENDLESS_ROW; // always a full row's worth, even for a smaller final row
+          const spawned = endlessSpawnRow(g, grp, Math.min(ENDLESS_ROW, grp.left));
           if (!spawned) { grp.left = 0; break; } // nothing on the board left to attack — the match is already decided
           grp.left -= spawned;
         }
@@ -6563,8 +6555,13 @@ function TowerConquest() {
                       fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, fontWeight: 700,
                       color: "rgba(232,235,242,0.7)", whiteSpace: "nowrap",
                     }}>
+                      {/* The break clock only starts once the last drone of the
+                          previous phase is off the board (see runEndlessPhases'
+                          "holding" state), so this countdown is genuinely "how
+                          long you have to rebuild", not a timer running behind
+                          a fight that's still going. */}
                       {endlessHud.state === "break"
-                        ? `incoming in ${endlessHud.timer}s`
+                        ? `next wave in ${endlessHud.timer}s`
                         : `${endlessHud.remaining} / ${endlessHud.size} left`}
                     </div>
                   </div>
